@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+#
+# consult — ask for a read-only opinion without letting the advisor edit the answer into place.
+#
+#   consult think <slug>             attack .handoff/think/<slug>/position.md
+#   consult debug <slug>             explain .handoff/debug/<slug>/symptom.md
+#   consult {think|debug} <slug> --again
+#                                      reconsider the same session using rebuttal.md
+#
+# Config: .handoff/config.sh in the target repo (see templates/config.sh)
+# Env:    HANDOFF_PROVIDER, HANDOFF_MODEL, HANDOFF_EFFORT
+
+set -euo pipefail
+
+LANE="${1:-}"
+SLUG="${2:-}"
+ROUND="${3:-}"
+
+usage() {
+    echo "usage: consult {think|debug} <slug> [--again]" >&2
+}
+
+if [[ -z "$LANE" || -z "$SLUG" || $# -gt 3 ]]; then
+    usage
+    exit 64
+fi
+
+case "$LANE" in
+think)
+    INPUT_NAME="position.md"
+    OUTPUT_NAME="verdict.json"
+    ;;
+debug)
+    INPUT_NAME="symptom.md"
+    OUTPUT_NAME="hypotheses.json"
+    ;;
+*)
+    echo "unknown lane: $LANE (expected think|debug)" >&2
+    usage
+    exit 64
+    ;;
+esac
+
+if [[ -n "$ROUND" && "$ROUND" != "--again" ]]; then
+    echo "unknown option: $ROUND (expected --again)" >&2
+    usage
+    exit 64
+fi
+
+HANDOFF_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+# Load repository-local provider settings before enforcing the advisory boundary. Without this,
+# consultation can silently use different model settings from the implementation lane.
+# shellcheck disable=SC1091
+[[ -f "$REPO_ROOT/.handoff/config.sh" ]] && source "$REPO_ROOT/.handoff/config.sh"
+
+# A writable value inherited from the caller or config defeats the lane's only hard guarantee.
+# Replace it outright so adapter defaults cannot silently make consultation edit.
+HANDOFF_SANDBOX="read-only"
+export HANDOFF_SANDBOX
+
+RUN_DIR="$REPO_ROOT/.handoff/$LANE/$SLUG"
+INPUT_FILE="$RUN_DIR/$INPUT_NAME"
+OUTPUT_FILE="$RUN_DIR/$OUTPUT_NAME"
+REBUTTAL_FILE="$RUN_DIR/rebuttal.md"
+SCHEMA="$HANDOFF_HOME/schemas/$LANE.schema.json"
+
+[[ -f "$INPUT_FILE" ]] || { echo "input not found: $INPUT_FILE" >&2; exit 1; }
+
+if [[ "$ROUND" == "--again" ]]; then
+    [[ -s "$RUN_DIR/session-id" ]] || {
+        echo "no session id for '$LANE/$SLUG' — the first consult run must happen before --again" >&2
+        exit 1
+    }
+    [[ -f "$REBUTTAL_FILE" ]] || {
+        echo "rebuttal not found: $REBUTTAL_FILE" >&2
+        exit 1
+    }
+    SESSION_ID="$(cat "$RUN_DIR/session-id")"
+fi
+
+PROVIDER="${HANDOFF_PROVIDER:-}"
+if [[ -z "$PROVIDER" ]]; then
+    PROVIDER_FILES=("$HANDOFF_HOME"/providers/*.sh)
+    [[ ${#PROVIDER_FILES[@]} -eq 1 && -f "${PROVIDER_FILES[0]}" ]] || {
+        echo "HANDOFF_PROVIDER is required when there is not exactly one provider" >&2
+        exit 64
+    }
+    PROVIDER_FILE="${PROVIDER_FILES[0]}"
+    PROVIDER="${PROVIDER_FILE##*/}"
+    PROVIDER="${PROVIDER%.sh}"
+else
+    PROVIDER_FILE="$HANDOFF_HOME/providers/${PROVIDER}.sh"
+    [[ -f "$PROVIDER_FILE" ]] || { echo "unknown provider: $PROVIDER" >&2; exit 64; }
+fi
+# shellcheck disable=SC1090
+source "$PROVIDER_FILE"
+provider_preflight || exit 1
+
+# Snapshot the whole working tree (tracked + untracked, honouring .gitignore) into a git tree
+# object, using a throwaway index so the real index is never touched. Comparing before/after
+# trees catches a broken sandbox without blaming pre-existing dirty work on the advisor.
+snapshot_tree() {
+    local idx
+    idx="$(mktemp)"
+    # A fresh repo with no commits has no .git/index. Copying it fails, and mktemp's zero-byte
+    # file is not a valid index — git aborts with "index file smaller than expected". Remove the
+    # placeholder so git creates a real index at that path instead.
+    if ! cp -f "$(git rev-parse --git-dir)/index" "$idx" 2>/dev/null; then
+        rm -f "$idx"
+    fi
+    GIT_INDEX_FILE="$idx" git add -A
+    GIT_INDEX_FILE="$idx" git write-tree
+    rm -f "$idx"
+}
+
+RUN_REL="${RUN_DIR#"$REPO_ROOT"/}"
+# Reports, logs, and the pinned session are the driver's intended writes. Excluding only those
+# paths prevents the safety check from warning about itself while still exposing other writes.
+DIFF_EXCLUDES=(
+    ":(exclude)$RUN_REL/$OUTPUT_NAME"
+    ":(exclude)$RUN_REL/stdout.log"
+    ":(exclude)$RUN_REL/session-id"
+)
+
+ADVISOR_INSTRUCTIONS="You are the read-only advisor in a two-model workflow. Inspect the repository and return the requested structured opinion, but never modify, create, or delete repository files. The sandbox is a hard boundary, not permission to suggest edits through tool calls. Report only conclusions supported by the supplied material and code you actually read."
+
+INPUT_REL="${INPUT_FILE#"$REPO_ROOT"/}"
+if [[ "$ROUND" == "--again" ]]; then
+    REBUTTAL_REL="${REBUTTAL_FILE#"$REPO_ROOT"/}"
+    PROMPT="Reconsider your previous $LANE analysis in the same session. Read $REBUTTAL_REL in full, verify its claims against the repository, and return a revised structured opinion using the required schema. Do not modify any files."
+elif [[ "$LANE" == "think" ]]; then
+    PROMPT="Read $INPUT_REL in full and adversarially evaluate the design position against the actual repository. Find concrete failure modes, acknowledge what is sound, and return the structured verdict required by the schema. Do not modify any files."
+else
+    PROMPT="Read $INPUT_REL in full, inspect the actual repository, and generate genuinely competing explanations for the observed symptom. Separate evidence from inference and return the structured hypotheses required by the schema. Do not modify any files."
+fi
+
+# Degrade loudly, never silently. A prompt-and-validate JSON round is not the same guarantee as
+# a schema-enforced one, and the difference has to be visible in the log.
+while IFS='=' read -r cap level; do
+    [[ "$level" == "native" ]] || echo "==> NOTE: $PROVIDER $cap is '$level', not native"
+done < <(provider_capabilities)
+
+echo "==> consult $LANE '$SLUG'${ROUND:+ again}  provider=$PROVIDER model=${HANDOFF_MODEL:-default} sandbox=$HANDOFF_SANDBOX"
+
+TREE_BEFORE="$(snapshot_tree)"
+
+set +e
+if [[ "$ROUND" == "--again" ]]; then
+    provider_resume "$SESSION_ID" "$SCHEMA" "$OUTPUT_FILE" "$RUN_DIR/stdout.log" "$ADVISOR_INSTRUCTIONS" "$PROMPT"
+else
+    provider_run "$REPO_ROOT" "$SCHEMA" "$OUTPUT_FILE" "$RUN_DIR/stdout.log" "$ADVISOR_INSTRUCTIONS" "$PROMPT"
+fi
+STATUS=$?
+set -e
+
+# Only overwrite on a successful parse; a failed grep must not wipe a good id from an earlier run.
+if SID="$(provider_parse_session_id "$RUN_DIR/stdout.log")" && [[ -n "$SID" ]]; then
+    printf '%s\n' "$SID" >"$RUN_DIR/session-id"
+fi
+
+TREE_AFTER="$(snapshot_tree)"
+TREE_CHANGES="$(git diff-tree -r --name-status "$TREE_BEFORE" "$TREE_AFTER" -- "${DIFF_EXCLUDES[@]}" || true)"
+
+# Read-only is a security claim, so a boundary failure must be impossible to miss. Preserve the
+# provider status because the warning is evidence about the run, not a replacement result.
+if [[ -n "$TREE_CHANGES" ]]; then
+    echo >&2
+    echo "==> WARNING: READ-ONLY CONSULT CHANGED THE WORKING TREE" >&2
+    printf '%s\n' "$TREE_CHANGES" >&2
+fi
+
+echo
+echo "==> exit=$STATUS"
+echo "==> consult report: $OUTPUT_FILE"
+
+exit "$STATUS"
