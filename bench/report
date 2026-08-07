@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+#
+# bench/report — render preserved benchmark artifacts as per-run Markdown.
+#
+# The raw files remain authoritative. Rendering every attempt separately keeps variation visible;
+# combining repetitions would hide the behaviour this protocol is meant to expose.
+
+set -euo pipefail
+
+BENCH_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(git -C "$BENCH_HOME" rev-parse --show-toplevel)"
+RESULTS_ROOT="$BENCH_HOME/results"
+
+metric_value() {
+    local file="$1" key="$2"
+    awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$file"
+}
+
+render_report() {
+    echo "# Benchmark evidence"
+    echo
+    echo "Each row is one preserved run under the protocol in bench/METHODOLOGY.md. Raw values are"
+    echo "shown individually, and a null rounds_to_green value means resume work requires manual review."
+
+    if [[ ! -d "$RESULTS_ROOT" ]] ||
+        ! find "$RESULTS_ROOT" -mindepth 4 -maxdepth 4 -type f -name metrics -print -quit |
+            grep -q .; then
+        echo
+        echo "No run artifacts are available."
+        return
+    fi
+
+    while IFS= read -r plan_dir; do
+        PLAN="${plan_dir##*/}"
+        RUN_COUNT="$(find "$plan_dir" -mindepth 3 -maxdepth 3 -type f -name metrics | wc -l | tr -d ' ')"
+        [[ "$RUN_COUNT" -gt 0 ]] || continue
+
+        echo
+        echo "## $PLAN"
+        echo
+        if [[ "$RUN_COUNT" -eq 1 ]]; then
+            echo "Sample: one run."
+        else
+            echo "Sample: $RUN_COUNT runs."
+        fi
+        echo
+        echo "| Provider | Run | Status | Criteria | Scope violations | Deviations | Blockers | Rounds to green | Seconds | Exit |"
+        echo "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+
+        while IFS= read -r metrics; do
+            RUN_DIR="${metrics%/metrics}"
+            RELATIVE="${RUN_DIR#"$plan_dir"/}"
+            PROVIDER="${RELATIVE%%/*}"
+            REPETITION="${RELATIVE##*/}"
+            STATUS="$(metric_value "$metrics" status)"
+            CRITERIA_TOTAL="$(metric_value "$metrics" criteria_total)"
+            CRITERIA_MET="$(metric_value "$metrics" criteria_met)"
+            SCOPE="$(metric_value "$metrics" scope_violations)"
+            DEVIATIONS="$(metric_value "$metrics" deviations)"
+            BLOCKERS="$(metric_value "$metrics" blockers)"
+            ROUNDS="$(metric_value "$metrics" rounds_to_green)"
+            SECONDS="$(metric_value "$metrics" wall_clock_seconds)"
+            EXIT_CODE="$(metric_value "$metrics" exit_code)"
+
+            printf '| %s | %s | %s | %s/%s | %s | %s | %s | %s | %s | %s |\n' \
+                "$PROVIDER" "$REPETITION" "$STATUS" "$CRITERIA_MET" "$CRITERIA_TOTAL" \
+                "$SCOPE" "$DEVIATIONS" "$BLOCKERS" "$ROUNDS" "$SECONDS" "$EXIT_CODE"
+        done < <(find "$plan_dir" -mindepth 3 -maxdepth 3 -type f -name metrics | sort)
+
+        while IFS= read -r metrics; do
+            RUN_DIR="${metrics%/metrics}"
+            RELATIVE="${RUN_DIR#"$plan_dir"/}"
+            PROVIDER="${RELATIVE%%/*}"
+            REPETITION="${RELATIVE##*/}"
+
+            echo
+            echo "### $PROVIDER / run $REPETITION"
+            echo
+            echo "Artifacts: ${RUN_DIR#"$REPO_ROOT"/}/"
+
+            if [[ -s "$RUN_DIR/note.txt" ]]; then
+                while IFS= read -r note; do
+                    printf '> Note: %s\n' "$note"
+                done <"$RUN_DIR/note.txt"
+            fi
+
+            if [[ -s "$RUN_DIR/deviations.txt" ]]; then
+                while IFS= read -r deviation; do
+                    printf '> Reported deviation: "%s"\n' "$deviation"
+                done <"$RUN_DIR/deviations.txt"
+            fi
+
+            if [[ -s "$RUN_DIR/scope-violations.txt" ]]; then
+                echo
+                echo "Files outside the plan's table:"
+                while IFS= read -r path; do
+                    printf -- '- `%s`\n' "$path"
+                done <"$RUN_DIR/scope-violations.txt"
+            fi
+        done < <(find "$plan_dir" -mindepth 3 -maxdepth 3 -type f -name metrics | sort)
+    done < <(find "$RESULTS_ROOT" -mindepth 1 -maxdepth 1 -type d | sort)
+}
+
+# Render before writing stdout so a short reader cannot interrupt the traversal and produce a
+# misleading partial diagnostic. The final stream is a plain file read and is safe to truncate.
+REPORT_FILE="$(mktemp)"
+trap 'rm -f "$REPORT_FILE"' EXIT
+render_report >"$REPORT_FILE"
+cat "$REPORT_FILE"

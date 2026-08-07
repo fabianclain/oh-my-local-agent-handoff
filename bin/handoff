@@ -25,17 +25,21 @@ HANDOFF_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
 
+# Project-specific conventions and verification commands. Without this the implementer has no
+# idea how the project builds, tests, or formats — the single biggest source of avoidable churn.
+#
+# Sourced BEFORE the paths below are resolved. An earlier version computed them first, so the
+# HANDOFF_PLANS_DIR override that templates/config.sh documents silently did nothing and the
+# driver reported "plan not found" for a plan that existed.
+PROJECT_RULES="(no project rules configured — create .handoff/config.sh)"
+# shellcheck disable=SC1091
+[[ -f "$REPO_ROOT/.handoff/config.sh" ]] && source "$REPO_ROOT/.handoff/config.sh"
+
 PLANS_DIR="${HANDOFF_PLANS_DIR:-$REPO_ROOT/.handoff/plans}"
 RUNS_DIR="${HANDOFF_RUNS_DIR:-$REPO_ROOT/.handoff/runs}"
 PLAN_FILE="$PLANS_DIR/${SLUG}.md"
 RUN_DIR="$RUNS_DIR/$SLUG"
 SCHEMA="$HANDOFF_HOME/schemas/handoff.schema.json"
-
-# Project-specific conventions and verification commands. Without this the implementer has no
-# idea how the project builds, tests, or formats — the single biggest source of avoidable churn.
-PROJECT_RULES="(no project rules configured — create .handoff/config.sh)"
-# shellcheck disable=SC1091
-[[ -f "$REPO_ROOT/.handoff/config.sh" ]] && source "$REPO_ROOT/.handoff/config.sh"
 
 PROVIDER="${HANDOFF_PROVIDER:-codex}"
 PROVIDER_FILE="$HANDOFF_HOME/providers/${PROVIDER}.sh"

@@ -1,0 +1,509 @@
+#!/usr/bin/env bash
+#
+# bench/run — execute one plan across providers without sharing their work.
+#
+#   bench/run --plan <slug> --providers <name,...> [--repeat <n>] [--force]
+#
+# Every attempt starts from the same commit in a detached worktree. Reusing a tree would let a
+# later provider inherit an earlier provider's edits, turning isolation into a cosmetic claim.
+
+set -euo pipefail
+
+usage() {
+    echo "usage: bench/run --plan <slug> --providers <name,...> [--repeat <n>] [--force]" >&2
+}
+
+PLAN=""
+PROVIDERS=""
+REPEAT=3
+FORCE=0
+
+while (( $# > 0 )); do
+    case "$1" in
+    --plan)
+        [[ $# -ge 2 ]] || { echo "--plan requires a slug" >&2; usage; exit 64; }
+        PLAN="$2"
+        shift 2
+        ;;
+    --plan=*)
+        PLAN="${1#*=}"
+        shift
+        ;;
+    --providers)
+        [[ $# -ge 2 ]] || { echo "--providers requires a comma-separated list" >&2; usage; exit 64; }
+        PROVIDERS="$2"
+        shift 2
+        ;;
+    --providers=*)
+        PROVIDERS="${1#*=}"
+        shift
+        ;;
+    --repeat)
+        [[ $# -ge 2 ]] || { echo "--repeat requires a positive integer" >&2; usage; exit 64; }
+        REPEAT="$2"
+        shift 2
+        ;;
+    --repeat=*)
+        REPEAT="${1#*=}"
+        shift
+        ;;
+    --force)
+        FORCE=1
+        shift
+        ;;
+    *)
+        echo "unknown argument: $1" >&2
+        usage
+        exit 64
+        ;;
+    esac
+done
+
+[[ -n "$PLAN" ]] || { echo "--plan is required" >&2; usage; exit 64; }
+[[ -n "$PROVIDERS" ]] || { echo "--providers is required" >&2; usage; exit 64; }
+[[ "$PROVIDERS" != ,* && "$PROVIDERS" != *, && "$PROVIDERS" != *,,* ]] || {
+    echo "--providers contains an empty name" >&2
+    exit 64
+}
+[[ "$PLAN" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || {
+    echo "invalid plan slug: $PLAN" >&2
+    exit 64
+}
+[[ "$REPEAT" =~ ^[1-9][0-9]*$ ]] || {
+    echo "--repeat must be a positive integer" >&2
+    exit 64
+}
+
+BENCH_TIMEOUT_SECONDS="${BENCH_TIMEOUT_SECONDS:-3600}"
+BENCH_VERIFY_TIMEOUT_SECONDS="${BENCH_VERIFY_TIMEOUT_SECONDS:-120}"
+[[ "$BENCH_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || {
+    echo "BENCH_TIMEOUT_SECONDS must be a positive integer" >&2
+    exit 64
+}
+[[ "$BENCH_VERIFY_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || {
+    echo "BENCH_VERIFY_TIMEOUT_SECONDS must be a positive integer" >&2
+    exit 64
+}
+
+BENCH_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(git -C "$BENCH_HOME" rev-parse --show-toplevel)"
+PLAN_FILE="$BENCH_HOME/plans/$PLAN.md"
+RESULTS_DIR="$BENCH_HOME/results/$PLAN"
+WORK_DIR="$BENCH_HOME/.work"
+BASE_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+
+[[ -f "$PLAN_FILE" ]] || { echo "plan not found: bench/plans/$PLAN.md" >&2; exit 1; }
+
+# An incomplete old directory is still evidence from an earlier attempt. Refusing all existing
+# paths prevents a rerun from quietly mixing new artifacts with a partial prior matrix.
+if [[ -e "$RESULTS_DIR" ]]; then
+    [[ "$FORCE" -eq 1 ]] || {
+        echo "results already exist for '$PLAN'; use --force to replace them" >&2
+        exit 1
+    }
+    rm -rf -- "$RESULTS_DIR"
+fi
+
+mkdir -p "$RESULTS_DIR" "$WORK_DIR"
+
+CRITERIA_FILE="$(mktemp)"
+VERIFICATION_FILE="$(mktemp)"
+ALLOWED_FILE="$(mktemp)"
+ACTIVE_WORKTREE=""
+
+cleanup() {
+    rm -f "$CRITERIA_FILE" "$VERIFICATION_FILE" "$ALLOWED_FILE"
+    if [[ -n "$ACTIVE_WORKTREE" && -d "$ACTIVE_WORKTREE" ]]; then
+        # A dead provider must not leave a registered tree that poisons the next invocation.
+        git -C "$REPO_ROOT" worktree remove --force "$ACTIVE_WORKTREE" >/dev/null 2>&1 || true
+    fi
+}
+trap cleanup EXIT
+
+grep -E '^- \[ \]' "$PLAN_FILE" >"$CRITERIA_FILE" || true
+CRITERIA_TOTAL="$(wc -l <"$CRITERIA_FILE" | tr -d ' ')"
+
+# Verification commands are executable plan data. Restrict extraction to the fenced block under
+# its heading so examples elsewhere in a plan can never be run by accident.
+awk '
+    /^## Verification[[:space:]]*$/ { in_section=1; next }
+    in_section && /^```/ {
+        if (in_block) exit
+        in_block=1
+        next
+    }
+    in_block && NF { print }
+' "$PLAN_FILE" >"$VERIFICATION_FILE"
+
+# The first table column is the scope contract. Reading only that section prevents unrelated
+# Markdown tables from granting edits the plan never authorised.
+awk '
+    /^## Files to touch[[:space:]]*$/ { in_section=1; next }
+    in_section && /^## / { exit }
+    in_section && /^\|/ {
+        split($0, cells, "|")
+        path=cells[2]
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", path)
+        gsub(/`/, "", path)
+        if (path != "Path" && path !~ /^-+$/ && path != "") print path
+    }
+' "$PLAN_FILE" >"$ALLOWED_FILE"
+
+[[ "$CRITERIA_TOTAL" -gt 0 ]] || { echo "plan has no checklist criteria: bench/plans/$PLAN.md" >&2; exit 1; }
+[[ -s "$VERIFICATION_FILE" ]] || { echo "plan has no verification commands: bench/plans/$PLAN.md" >&2; exit 1; }
+[[ -s "$ALLOWED_FILE" ]] || { echo "plan has no Files to touch entries: bench/plans/$PLAN.md" >&2; exit 1; }
+
+json_balanced() {
+    awk '
+        { data=data $0 "\n" }
+        END {
+            braces=0; brackets=0; string=0; escaped=0; seen=0
+            for (i=1; i<=length(data); i++) {
+                c=substr(data,i,1)
+                if (string) {
+                    if (escaped) { escaped=0; continue }
+                    if (c == "\\") { escaped=1; continue }
+                    if (c == "\"") string=0
+                    continue
+                }
+                if (c == "\"") { string=1; seen=1; continue }
+                if (c == "{") { braces++; seen=1 }
+                else if (c == "}") { braces--; if (braces < 0) exit 1 }
+                else if (c == "[") brackets++
+                else if (c == "]") { brackets--; if (brackets < 0) exit 1 }
+            }
+            exit !(seen && !string && braces == 0 && brackets == 0)
+        }
+    ' "$1"
+}
+
+json_array_count() {
+    local file="$1" key="$2"
+    awk -v key="$key" '
+        { data=data $0 "\n" }
+        END {
+            pattern="\"" key "\"[[:space:]]*:[[:space:]]*\\["
+            if (!match(data, pattern)) exit 2
+            start=RSTART+RLENGTH-1
+            arrays=1; objects=0; string=0; escaped=0; seen=0; commas=0
+            for (i=start+1; i<=length(data); i++) {
+                c=substr(data,i,1)
+                if (string) {
+                    if (escaped) { escaped=0; continue }
+                    if (c == "\\") { escaped=1; continue }
+                    if (c == "\"") string=0
+                    continue
+                }
+                if (c == "\"") { string=1; seen=1; continue }
+                if (c == "[") { arrays++; seen=1; continue }
+                if (c == "]") {
+                    arrays--
+                    if (arrays == 0) { print seen ? commas+1 : 0; exit }
+                    continue
+                }
+                if (c == "{") { objects++; seen=1; continue }
+                if (c == "}") { objects--; continue }
+                if (c == "," && arrays == 1 && objects == 0) { commas++; continue }
+                if (c !~ /[[:space:]]/) seen=1
+            }
+            exit 3
+        }
+    ' "$file"
+}
+
+extract_deviations() {
+    awk '
+        { data=data $0 "\n" }
+        END {
+            for (i=1; i<=length(data); i++) {
+                if (substr(data,i,1) != "\"") continue
+                token=""; escaped=0
+                for (j=i+1; j<=length(data); j++) {
+                    c=substr(data,j,1)
+                    if (escaped) { token=token "\\" c; escaped=0; continue }
+                    if (c == "\\") { escaped=1; continue }
+                    if (c == "\"") break
+                    token=token c
+                }
+                k=j+1
+                while (substr(data,k,1) ~ /[[:space:]]/) k++
+                if (token == "what" && substr(data,k,1) == ":") {
+                    k++
+                    while (substr(data,k,1) ~ /[[:space:]]/) k++
+                    if (substr(data,k,1) != "\"") exit 2
+                    value=""; escaped=0
+                    for (j=k+1; j<=length(data); j++) {
+                        c=substr(data,j,1)
+                        if (escaped) { value=value "\\" c; escaped=0; continue }
+                        if (c == "\\") { escaped=1; continue }
+                        if (c == "\"") break
+                        value=value c
+                    }
+                    if (j > length(data)) exit 3
+                    print value
+                    i=j
+                    continue
+                }
+                i=j
+            }
+        }
+    ' "$1"
+}
+
+report_status() {
+    tr -d '\n\r' <"$1" |
+        sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+}
+
+report_has_required_fields() {
+    local file="$1" field
+    for field in status summary files_changed tests_run deviations blockers follow_ups; do
+        grep -Eq "\"$field\"[[:space:]]*:" "$file" || return 1
+    done
+}
+
+write_metrics() {
+    local dir="$1" status="$2" criteria_met="$3" scope="$4" deviations="$5"
+    local blockers="$6" rounds="$7" elapsed="$8" exit_code="$9"
+    printf '%s\n' \
+        "status=$status" \
+        "criteria_total=$CRITERIA_TOTAL" \
+        "criteria_met=$criteria_met" \
+        "scope_violations=$scope" \
+        "deviations=$deviations" \
+        "blockers=$blockers" \
+        "rounds_to_green=$rounds" \
+        "wall_clock_seconds=$elapsed" \
+        "exit_code=$exit_code" >"$dir/metrics"
+}
+
+capture_tree_artifacts() {
+    local tree="$1" run_dir="$2" result_dir="$3"
+    local before="$run_dir/tree-before" after="$run_dir/tree-after"
+    local excludes=(
+        ':(exclude).handoff/runs/**'
+        ':(exclude).omc/**'
+        ':(exclude)storage/logs/**'
+        ':(exclude)storage/framework/**'
+        ':(exclude)node_modules/**'
+        ':(exclude)vendor/**'
+    )
+
+    if [[ -s "$before" && -s "$after" ]] &&
+        git -C "$tree" cat-file -e "$(cat "$before")^{tree}" 2>/dev/null &&
+        git -C "$tree" cat-file -e "$(cat "$after")^{tree}" 2>/dev/null; then
+        cp "$before" "$result_dir/tree-before"
+        cp "$after" "$result_dir/tree-after"
+        git -C "$tree" diff-tree -r -p --binary "$(cat "$before")" "$(cat "$after")" -- \
+            . "${excludes[@]}" >"$result_dir/tree.diff"
+        git -C "$tree" diff-tree -r --name-only "$(cat "$before")" "$(cat "$after")" -- \
+            . "${excludes[@]}" | sort -u >"$result_dir/tree-files.txt"
+        return
+    fi
+
+    # A timeout can stop the driver before its after-snapshot. The worktree began clean and the
+    # staged plan is known, so this fallback preserves inspectable evidence instead of losing it.
+    git -C "$tree" diff --binary "$BASE_COMMIT" -- . \
+        ':(exclude).handoff/runs/**' \
+        ":(exclude).handoff/plans/$PLAN.md" >"$result_dir/tree.diff"
+    {
+        git -C "$tree" diff --name-only "$BASE_COMMIT" -- . \
+            ':(exclude).handoff/runs/**' \
+            ":(exclude).handoff/plans/$PLAN.md"
+        git -C "$tree" ls-files --others --exclude-standard |
+            awk -v plan=".handoff/plans/$PLAN.md" '
+                $0 != plan && $0 !~ /^\.handoff\/runs\// { print }
+            '
+    } | sort -u >"$result_dir/tree-files.txt"
+
+    while IFS= read -r file; do
+        [[ -n "$file" ]] || continue
+        if git -C "$tree" ls-files --error-unmatch -- "$file" >/dev/null 2>&1; then
+            continue
+        fi
+        set +e
+        ( cd "$tree" && git diff --no-index --binary /dev/null "$file" ) >>"$result_dir/tree.diff"
+        local diff_status=$?
+        set -e
+        [[ "$diff_status" -eq 1 ]] || {
+            echo "could not capture untracked file in tree diff: $file" >&2
+            return 1
+        }
+    done <"$result_dir/tree-files.txt"
+}
+
+remove_active_worktree() {
+    local result_dir="$1" label="$2"
+    if ! git -C "$REPO_ROOT" worktree remove --force "$ACTIVE_WORKTREE" \
+        >>"$result_dir/worktree.log" 2>&1; then
+        echo "could not remove worktree for $label" >&2
+        return 1
+    fi
+    ACTIVE_WORKTREE=""
+}
+
+IFS=',' read -r -a PROVIDER_LIST <<<"$PROVIDERS"
+(( ${#PROVIDER_LIST[@]} > 0 )) || { echo "--providers list is empty" >&2; exit 64; }
+
+for provider in "${PROVIDER_LIST[@]}"; do
+    [[ "$provider" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || {
+        echo "invalid provider name: $provider" >&2
+        exit 64
+    }
+
+    for (( repetition=1; repetition<=REPEAT; repetition++ )); do
+        RESULT_DIR="$RESULTS_DIR/$provider/$repetition"
+        mkdir -p "$RESULT_DIR"
+
+        ACTIVE_WORKTREE="$WORK_DIR/$PLAN-$provider-$repetition"
+        [[ ! -e "$ACTIVE_WORKTREE" ]] || {
+            echo "worktree path already exists: ${ACTIVE_WORKTREE#"$REPO_ROOT"/}" >&2
+            exit 1
+        }
+
+        if ! git -C "$REPO_ROOT" worktree add --detach "$ACTIVE_WORKTREE" "$BASE_COMMIT" \
+            >"$RESULT_DIR/worktree.log" 2>&1; then
+            echo "could not create worktree for $PLAN/$provider/$repetition" >&2
+            sed -n '1,20p' "$RESULT_DIR/worktree.log" >&2
+            exit 1
+        fi
+
+        # Preflight comes from the isolated commit, not the control checkout. Otherwise an
+        # uncommitted adapter edit could make the availability check disagree with the run.
+        PROVIDER_FILE="$ACTIVE_WORKTREE/providers/$provider.sh"
+        if [[ ! -f "$PROVIDER_FILE" ]]; then
+            printf 'provider adapter not found: providers/%s.sh\n' "$provider" >"$RESULT_DIR/note.txt"
+            : >"$RESULT_DIR/preflight.log"
+            write_metrics "$RESULT_DIR" skipped 0 0 0 0 null 0 null
+            remove_active_worktree "$RESULT_DIR" "$PLAN/$provider/$repetition"
+            continue
+        fi
+
+        set +e
+        ( source "$PROVIDER_FILE"; provider_preflight ) >"$RESULT_DIR/preflight.log" 2>&1
+        PREFLIGHT_STATUS=$?
+        set -e
+        if [[ "$PREFLIGHT_STATUS" -ne 0 ]]; then
+            awk 'NF { print; exit }' "$RESULT_DIR/preflight.log" >"$RESULT_DIR/note.txt"
+            [[ -s "$RESULT_DIR/note.txt" ]] || echo "provider preflight failed" >"$RESULT_DIR/note.txt"
+            write_metrics "$RESULT_DIR" skipped 0 0 0 0 null 0 null
+            remove_active_worktree "$RESULT_DIR" "$PLAN/$provider/$repetition"
+            continue
+        fi
+
+        mkdir -p "$ACTIVE_WORKTREE/.handoff/plans"
+        cp "$PLAN_FILE" "$ACTIVE_WORKTREE/.handoff/plans/$PLAN.md"
+        RUN_DIR="$ACTIVE_WORKTREE/.handoff/runs/$PLAN"
+        STARTED_AT="$(date +%s)"
+
+        set +e
+        (
+            cd "$ACTIVE_WORKTREE"
+            HANDOFF_PROVIDER="$provider" timeout --foreground "$BENCH_TIMEOUT_SECONDS" \
+                ./bin/handoff do "$PLAN"
+        ) >"$RESULT_DIR/driver.log" 2>&1
+        DRIVER_STATUS=$?
+        set -e
+
+        FINISHED_AT="$(date +%s)"
+        ELAPSED=$(( FINISHED_AT - STARTED_AT ))
+        printf 'started_epoch=%s\nfinished_epoch=%s\nwall_clock_seconds=%s\n' \
+            "$STARTED_AT" "$FINISHED_AT" "$ELAPSED" >"$RESULT_DIR/timing"
+
+        [[ ! -f "$RUN_DIR/result.json" ]] || cp "$RUN_DIR/result.json" "$RESULT_DIR/handoff-report.json"
+        [[ ! -f "$RUN_DIR/stdout.log" ]] || cp "$RUN_DIR/stdout.log" "$RESULT_DIR/provider.log"
+        [[ ! -f "$RUN_DIR/session-id" ]] || cp "$RUN_DIR/session-id" "$RESULT_DIR/session-id"
+
+        capture_tree_artifacts "$ACTIVE_WORKTREE" "$RUN_DIR" "$RESULT_DIR"
+
+        CRITERIA_MET=0
+        COMMAND_NUMBER=0
+        : >"$RESULT_DIR/verification.log"
+        while IFS= read -r command; do
+            COMMAND_NUMBER=$(( COMMAND_NUMBER + 1 ))
+            printf 'command %s: %s\n' "$COMMAND_NUMBER" "$command" >>"$RESULT_DIR/verification.log"
+            set +e
+            (
+                cd "$ACTIVE_WORKTREE"
+                timeout --foreground "$BENCH_VERIFY_TIMEOUT_SECONDS" bash -o pipefail -c "$command"
+            ) >>"$RESULT_DIR/verification.log" 2>&1
+            COMMAND_STATUS=$?
+            set -e
+            printf 'exit_code: %s\n\n' "$COMMAND_STATUS" >>"$RESULT_DIR/verification.log"
+            [[ "$COMMAND_STATUS" -ne 0 ]] || CRITERIA_MET=$(( CRITERIA_MET + 1 ))
+        done <"$VERIFICATION_FILE"
+        (( CRITERIA_MET <= CRITERIA_TOTAL )) || CRITERIA_MET="$CRITERIA_TOTAL"
+
+        SCOPE_VIOLATIONS=0
+        : >"$RESULT_DIR/scope-violations.txt"
+        while IFS= read -r changed; do
+            [[ -n "$changed" ]] || continue
+            if ! grep -Fqx -- "$changed" "$ALLOWED_FILE"; then
+                echo "$changed" >>"$RESULT_DIR/scope-violations.txt"
+                SCOPE_VIOLATIONS=$(( SCOPE_VIOLATIONS + 1 ))
+            fi
+        done <"$RESULT_DIR/tree-files.txt"
+
+        STATUS=""
+        DEVIATIONS=0
+        BLOCKERS=0
+        : >"$RESULT_DIR/deviations.txt"
+        if [[ "$DRIVER_STATUS" -eq 124 ]]; then
+            STATUS=timeout
+            printf 'run exceeded %s seconds; resume rounds are manual follow-up\n' \
+                "$BENCH_TIMEOUT_SECONDS" >"$RESULT_DIR/note.txt"
+        elif [[ ! -s "$RESULT_DIR/handoff-report.json" ]]; then
+            STATUS=report-missing
+            echo "handoff report was not written" >"$RESULT_DIR/note.txt"
+        elif ! json_balanced "$RESULT_DIR/handoff-report.json"; then
+            STATUS=report-unparseable
+            echo "handoff report has unbalanced JSON structure" >"$RESULT_DIR/note.txt"
+        elif ! report_has_required_fields "$RESULT_DIR/handoff-report.json"; then
+            STATUS=report-unparseable
+            echo "handoff report is missing required fields" >"$RESULT_DIR/note.txt"
+        else
+            STATUS="$(report_status "$RESULT_DIR/handoff-report.json")"
+            set +e
+            DEVIATIONS="$(json_array_count "$RESULT_DIR/handoff-report.json" deviations)"
+            DEVIATION_STATUS=$?
+            BLOCKERS="$(json_array_count "$RESULT_DIR/handoff-report.json" blockers)"
+            BLOCKER_STATUS=$?
+            set -e
+            if [[ ! "$STATUS" =~ ^(complete|partial|blocked)$ ||
+                  "$DEVIATION_STATUS" -ne 0 || "$BLOCKER_STATUS" -ne 0 ]]; then
+                STATUS=report-unparseable
+                DEVIATIONS=0
+                BLOCKERS=0
+                echo "handoff report is missing required metric fields" >"$RESULT_DIR/note.txt"
+            else
+                set +e
+                extract_deviations "$RESULT_DIR/handoff-report.json" >"$RESULT_DIR/deviations.txt"
+                EXTRACT_STATUS=$?
+                set -e
+                if [[ "$EXTRACT_STATUS" -ne 0 ||
+                      "$(wc -l <"$RESULT_DIR/deviations.txt" | tr -d ' ')" -ne "$DEVIATIONS" ]]; then
+                    STATUS=report-unparseable
+                    DEVIATIONS=0
+                    BLOCKERS=0
+                    : >"$RESULT_DIR/deviations.txt"
+                    echo "handoff report deviations could not be read" >"$RESULT_DIR/note.txt"
+                fi
+            fi
+        fi
+
+        ROUNDS=null
+        if [[ "$STATUS" == complete && "$CRITERIA_MET" -eq "$CRITERIA_TOTAL" &&
+              "$SCOPE_VIOLATIONS" -eq 0 && "$BLOCKERS" -eq 0 ]]; then
+            ROUNDS=1
+        elif [[ ! -f "$RESULT_DIR/note.txt" ]]; then
+            echo "resume rounds are a manual follow-up" >"$RESULT_DIR/note.txt"
+        fi
+
+        write_metrics "$RESULT_DIR" "$STATUS" "$CRITERIA_MET" "$SCOPE_VIOLATIONS" \
+            "$DEVIATIONS" "$BLOCKERS" "$ROUNDS" "$ELAPSED" "$DRIVER_STATUS"
+
+        remove_active_worktree "$RESULT_DIR" "$PLAN/$provider/$repetition"
+    done
+done
+
+echo "benchmark artifacts: ${RESULTS_DIR#"$REPO_ROOT"/}"

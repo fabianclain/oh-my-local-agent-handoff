@@ -98,6 +98,12 @@ of review churn.
 
 Copy `commands/*.md` into `.claude/commands/` if you drive this from Claude Code.
 
+## Benchmark harness
+
+`bench/` runs the same self-contained plan in isolated worktrees and preserves raw per-run
+evidence. Its methodology and commands are documented in `bench/METHODOLOGY.md`; no comparison
+results are published yet.
+
 ## Providers
 
 A provider is `(binary, env block, capabilities)`, not just a binary. Adapters declare what they
