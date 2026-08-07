@@ -1,0 +1,66 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "verdict",
+    "strongest_objection",
+    "objections",
+    "missed_considerations",
+    "what_it_gets_right",
+    "recommended_change"
+  ],
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "enum": ["agree", "agree_with_reservations", "disagree"],
+      "description": "Your overall position. Do not default to agreement to be agreeable — if the proposal is sound, say agree and keep the objections list short and honest."
+    },
+    "strongest_objection": {
+      "type": "string",
+      "description": "The single most damaging problem with the proposal, stated in one or two sentences. If there genuinely isn't one, say so explicitly rather than inventing a weak one."
+    },
+    "objections": {
+      "type": "array",
+      "description": "Specific, concrete problems. Ordered most to least severe. Empty array is a valid and honest answer.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["claim", "why_wrong", "severity", "confidence"],
+        "properties": {
+          "claim": {
+            "type": "string",
+            "description": "The specific assertion or design decision in the proposal you are attacking. Quote or name it precisely."
+          },
+          "why_wrong": {
+            "type": "string",
+            "description": "The concrete failure this causes — an input, a state, a scale, or a future change that breaks it. Not a generic principle."
+          },
+          "severity": {
+            "type": "string",
+            "enum": ["fatal", "major", "minor"],
+            "description": "fatal = the design cannot work as proposed. major = it works but will cause real pain. minor = a nit worth mentioning."
+          },
+          "confidence": {
+            "type": "string",
+            "enum": ["high", "medium", "low"],
+            "description": "How sure you are. Low-confidence objections are welcome; flag them honestly rather than overstating."
+          }
+        }
+      }
+    },
+    "missed_considerations": {
+      "type": "array",
+      "description": "Things the proposal does not address at all — not wrong, just absent. Failure modes, operational concerns, migration paths, second-order effects.",
+      "items": { "type": "string" }
+    },
+    "what_it_gets_right": {
+      "type": "array",
+      "description": "Parts that are genuinely well-judged and should survive any revision. This is not politeness — it tells the author what not to throw away.",
+      "items": { "type": "string" }
+    },
+    "recommended_change": {
+      "type": "string",
+      "description": "The single highest-value change you would make. Concrete and actionable. If you would change nothing, say that."
+    }
+  }
+}

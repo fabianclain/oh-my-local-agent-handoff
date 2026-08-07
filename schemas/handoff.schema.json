@@ -1,0 +1,98 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "summary",
+    "files_changed",
+    "tests_run",
+    "deviations",
+    "blockers",
+    "follow_ups"
+  ],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["complete", "partial", "blocked"],
+      "description": "complete = every acceptance criterion in the plan is met and verified. partial = some criteria met, rest listed in blockers/follow_ups. blocked = could not make meaningful progress."
+    },
+    "summary": {
+      "type": "string",
+      "description": "Two to four sentences describing what was actually implemented. No preamble, no restating the plan."
+    },
+    "files_changed": {
+      "type": "array",
+      "description": "Every file created, modified, or deleted. Must be exhaustive.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "change", "why"],
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Repo-relative path."
+          },
+          "change": {
+            "type": "string",
+            "enum": ["created", "modified", "deleted"]
+          },
+          "why": {
+            "type": "string",
+            "description": "One sentence tying this file to a specific acceptance criterion or plan step."
+          }
+        }
+      }
+    },
+    "tests_run": {
+      "type": "array",
+      "description": "Every verification command actually executed. Empty array if none were run.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["command", "passed", "detail"],
+        "properties": {
+          "command": {
+            "type": "string",
+            "description": "The exact command line executed."
+          },
+          "passed": {
+            "type": "boolean"
+          },
+          "detail": {
+            "type": "string",
+            "description": "Pass/fail counts, or the failure output if it did not pass. Never claim a pass that did not happen."
+          }
+        }
+      }
+    },
+    "deviations": {
+      "type": "array",
+      "description": "Anywhere the implementation departs from the plan as written. Empty array if none.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["what", "why"],
+        "properties": {
+          "what": {
+            "type": "string",
+            "description": "The plan step or constraint that was not followed literally."
+          },
+          "why": {
+            "type": "string",
+            "description": "The reason the departure was necessary."
+          }
+        }
+      }
+    },
+    "blockers": {
+      "type": "array",
+      "description": "Things that stopped work: missing context, ambiguous requirements, sandbox or network limits, failing tests that could not be fixed within scope.",
+      "items": { "type": "string" }
+    },
+    "follow_ups": {
+      "type": "array",
+      "description": "Deliberately out-of-scope work noticed along the way. Do not implement these; just report them.",
+      "items": { "type": "string" }
+    }
+  }
+}

@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+#
+# handoff — one model plans and verifies, another implements.
+#
+#   handoff do <slug>       fresh run against <plans>/<slug>.md
+#   handoff resume <slug>   continue the same session using runs/<slug>/feedback.md
+#   handoff diff <slug>     exactly what the implementer changed during the run
+#
+# The implementer never commits. The reviewer owns the commit.
+#
+# Config: .handoff/config.sh in the target repo (see templates/config.sh)
+# Env:    HANDOFF_PROVIDER (default codex), HANDOFF_MODEL, HANDOFF_EFFORT, HANDOFF_SANDBOX
+
+set -euo pipefail
+
+MODE="${1:-}"
+SLUG="${2:-}"
+
+if [[ -z "$MODE" || -z "$SLUG" ]]; then
+    echo "usage: handoff {do|resume|diff} <slug>" >&2
+    exit 64
+fi
+
+HANDOFF_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+PLANS_DIR="${HANDOFF_PLANS_DIR:-$REPO_ROOT/.handoff/plans}"
+RUNS_DIR="${HANDOFF_RUNS_DIR:-$REPO_ROOT/.handoff/runs}"
+PLAN_FILE="$PLANS_DIR/${SLUG}.md"
+RUN_DIR="$RUNS_DIR/$SLUG"
+SCHEMA="$HANDOFF_HOME/schemas/handoff.schema.json"
+
+# Project-specific conventions and verification commands. Without this the implementer has no
+# idea how the project builds, tests, or formats — the single biggest source of avoidable churn.
+PROJECT_RULES="(no project rules configured — create .handoff/config.sh)"
+# shellcheck disable=SC1091
+[[ -f "$REPO_ROOT/.handoff/config.sh" ]] && source "$REPO_ROOT/.handoff/config.sh"
+
+PROVIDER="${HANDOFF_PROVIDER:-codex}"
+PROVIDER_FILE="$HANDOFF_HOME/providers/${PROVIDER}.sh"
+[[ -f "$PROVIDER_FILE" ]] || { echo "unknown provider: $PROVIDER" >&2; exit 64; }
+# shellcheck disable=SC1090
+source "$PROVIDER_FILE"
+provider_preflight || exit 1
+
+# Harness scratch state churns on its own during a run and is not the implementer's doing.
+# Excluding it keeps the changed-file list honest for review.
+DIFF_EXCLUDES=(
+    ':(exclude).handoff/runs/**'
+    ':(exclude).omc/**'
+    ':(exclude)storage/logs/**'
+    ':(exclude)storage/framework/**'
+    ':(exclude)node_modules/**'
+    ':(exclude)vendor/**'
+)
+
+# Snapshot the whole working tree (tracked + untracked, honouring .gitignore) into a git tree
+# object, using a throwaway index so the real index is never touched. Comparing before/after
+# trees yields exactly what the implementer changed, with pre-existing dirty state filtered out.
+# Plain `git diff` is useless in a repo that already has uncommitted work.
+snapshot_tree() {
+    local idx
+    idx="$(mktemp)"
+    # A fresh repo with no commits has no .git/index. Copying it fails, and mktemp's zero-byte
+    # file is not a valid index — git aborts with "index file smaller than expected". Remove the
+    # placeholder so git creates a real index at that path instead.
+    if ! cp -f "$(git rev-parse --git-dir)/index" "$idx" 2>/dev/null; then
+        rm -f "$idx"
+    fi
+    GIT_INDEX_FILE="$idx" git add -A
+    GIT_INDEX_FILE="$idx" git write-tree
+    rm -f "$idx"
+}
+
+DEV_INSTRUCTIONS="You are the implementer in a two-model workflow. Another model wrote the plan and will review your work; you write the code. The plan file is the complete specification — implement exactly what it says, nothing more. Do not create git commits, do not amend, do not stash, do not run git checkout or git reset. Leave every change uncommitted in the working tree. Do not modify files listed as out of scope. If the plan is wrong or ambiguous, implement your best reading and record it under deviations rather than stopping. Report honestly: never claim a test passed unless you ran it and saw it pass."
+
+case "$MODE" in
+diff)
+    if [[ ! -f "$RUN_DIR/tree-before" || ! -f "$RUN_DIR/tree-after" ]]; then
+        echo "no completed run recorded for '$SLUG'" >&2
+        exit 1
+    fi
+    git diff-tree -r --name-status \
+        "$(cat "$RUN_DIR/tree-before")" "$(cat "$RUN_DIR/tree-after")" -- "${DIFF_EXCLUDES[@]}"
+    exit 0
+    ;;
+
+do)
+    [[ -f "$PLAN_FILE" ]] || {
+        echo "plan not found: $PLAN_FILE" >&2
+        echo "write it first — see $HANDOFF_HOME/templates/plan.md" >&2
+        exit 1
+    }
+    mkdir -p "$RUN_DIR"
+    snapshot_tree >"$RUN_DIR/tree-before"
+    PROMPT="Implement the plan in the file ${PLAN_FILE#"$REPO_ROOT"/} relative to the repository root.
+
+Read that file first, in full. It is the complete specification: implement every step and satisfy every acceptance criterion, and do not do anything it does not ask for.
+
+${PROJECT_RULES}
+
+When you are done, run the verification commands listed in the plan and report the real results. Leave all changes uncommitted in the working tree — the reviewer reads the diff and owns the commit."
+    ;;
+
+resume)
+    [[ -f "$RUN_DIR/feedback.md" ]] || { echo "no feedback at $RUN_DIR/feedback.md" >&2; exit 1; }
+    [[ -s "$RUN_DIR/session-id" ]] || { echo "no session id for '$SLUG' — run 'handoff do' first" >&2; exit 1; }
+    SESSION_ID="$(cat "$RUN_DIR/session-id")"
+    PROMPT="Review feedback on your implementation. Address every point, then re-run the verification commands.
+
+$(cat "$RUN_DIR/feedback.md")
+
+${PROJECT_RULES}
+
+Leave all changes uncommitted."
+    ;;
+
+*)
+    echo "unknown mode: $MODE (expected do|resume|diff)" >&2
+    exit 64
+    ;;
+esac
+
+# Degrade loudly, never silently. A prompt-and-validate JSON round is not the same guarantee as
+# a schema-enforced one, and the difference has to be visible in the log.
+while IFS='=' read -r cap level; do
+    [[ "$level" == "native" ]] || echo "==> NOTE: $PROVIDER $cap is '$level', not native"
+done < <(provider_capabilities)
+
+echo "==> handoff $MODE '$SLUG'  provider=$PROVIDER model=${HANDOFF_MODEL:-default} sandbox=${HANDOFF_SANDBOX:-workspace-write}"
+
+set +e
+if [[ "$MODE" == "resume" ]]; then
+    provider_resume "$SESSION_ID" "$SCHEMA" "$RUN_DIR/result.json" "$RUN_DIR/stdout.log" "$DEV_INSTRUCTIONS" "$PROMPT"
+else
+    provider_run "$REPO_ROOT" "$SCHEMA" "$RUN_DIR/result.json" "$RUN_DIR/stdout.log" "$DEV_INSTRUCTIONS" "$PROMPT"
+fi
+STATUS=$?
+set -e
+
+# Only overwrite on a successful parse; a failed grep must not wipe a good id from an earlier run.
+if SID="$(provider_parse_session_id "$RUN_DIR/stdout.log")" && [[ -n "$SID" ]]; then
+    printf '%s\n' "$SID" >"$RUN_DIR/session-id"
+fi
+
+snapshot_tree >"$RUN_DIR/tree-after"
+
+echo
+echo "==> exit=$STATUS"
+echo "==> handoff report: $RUN_DIR/result.json"
+echo "==> changed by this run:"
+git diff-tree -r --name-status \
+    "$(cat "$RUN_DIR/tree-before")" "$(cat "$RUN_DIR/tree-after")" -- "${DIFF_EXCLUDES[@]}" || true
+
+exit "$STATUS"

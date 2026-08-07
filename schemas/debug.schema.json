@@ -1,0 +1,83 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "hypotheses",
+    "most_likely",
+    "cheapest_decisive_test",
+    "ruled_out",
+    "missing_evidence"
+  ],
+  "properties": {
+    "hypotheses": {
+      "type": "array",
+      "description": "Independent candidate explanations, ordered by likelihood. Produce at least two genuinely different ones — the point of this exercise is breadth, not confirming the first idea. Do not include variations of a single theory dressed up as alternatives.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "theory",
+          "mechanism",
+          "evidence_for",
+          "evidence_against",
+          "confidence",
+          "discriminating_test"
+        ],
+        "properties": {
+          "theory": {
+            "type": "string",
+            "description": "One sentence naming the root cause."
+          },
+          "mechanism": {
+            "type": "string",
+            "description": "The precise causal chain from root cause to observed symptom. Name real files, functions, and lines you actually read. A mechanism you cannot trace concretely is a guess — mark its confidence low."
+          },
+          "evidence_for": {
+            "type": "array",
+            "description": "Observations from the codebase or the symptom report that this theory explains.",
+            "items": { "type": "string" }
+          },
+          "evidence_against": {
+            "type": "array",
+            "description": "Observations this theory fails to explain, or facts that argue against it. Be rigorous here — a hypothesis with no listed counter-evidence usually means you did not look.",
+            "items": { "type": "string" }
+          },
+          "confidence": {
+            "type": "string",
+            "enum": ["high", "medium", "low"]
+          },
+          "discriminating_test": {
+            "type": "string",
+            "description": "A concrete check whose outcome distinguishes THIS theory from the others. 'Add logging and see' is not discriminating. State what result would confirm and what would refute."
+          }
+        }
+      }
+    },
+    "most_likely": {
+      "type": "string",
+      "description": "Which hypothesis you would bet on, and why it beats the runner-up specifically."
+    },
+    "cheapest_decisive_test": {
+      "type": "string",
+      "description": "The single fastest check that eliminates the largest number of hypotheses at once. Prefer one that splits the space roughly in half over one that confirms your favourite."
+    },
+    "ruled_out": {
+      "type": "array",
+      "description": "Explanations you considered and eliminated, with the reason. Prevents the next investigator re-treading them.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["theory", "why_ruled_out"],
+        "properties": {
+          "theory": { "type": "string" },
+          "why_ruled_out": { "type": "string" }
+        }
+      }
+    },
+    "missing_evidence": {
+      "type": "array",
+      "description": "What you would need to see — a log, a repro, a value at runtime — to make real progress. Empty if the report was sufficient.",
+      "items": { "type": "string" }
+    }
+  }
+}

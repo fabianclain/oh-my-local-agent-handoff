@@ -1,0 +1,15 @@
+# Run artifacts: prompts, provider logs, session ids, tree snapshots.
+# These contain your source, your plans, and provider transcripts — never commit them.
+.handoff/runs/
+.handoff/think/
+.handoff/debug/
+
+# Agent-harness scratch state. Contains absolute paths, session ids, and usage/cost data.
+.omc/
+.claude/
+
+# Local config may name internal systems or private conventions.
+.handoff/config.sh
+
+*.log
+.DS_Store
