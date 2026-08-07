@@ -107,6 +107,7 @@ same guarantee as a schema-enforced one, and the difference is printed rather th
 | | structured output | session resume | sandbox |
 | --- | --- | --- | --- |
 | `codex` | native | native | native |
+| `opencode` | prompt-validate | native | none |
 
 Adding one means implementing five functions in `providers/<name>.sh`. Nothing above the adapter
 is provider-specific.
