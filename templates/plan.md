@@ -52,6 +52,24 @@ passed twelve tests against hand-authored HTML while being unable to parse a sin
 If no real sample is available, say so and mark the tests as unproven rather than implying
 coverage.
 
+## Output discipline
+
+Keep this section. It costs a capable model nothing and changes what a weak one produces.
+
+The files you write are deliverables, not scratchpads. Work out the approach first, then write
+the finished version once.
+
+- **One implementation only.** Never leave an earlier attempt beside a later one.
+- **No commentary on your own process** — nothing of the form "the above is wrong", "re-writing
+  this properly", "actually, the rule is". If an approach turns out to be wrong, delete it and
+  write the correct one rather than narrating the correction in the file.
+- **No alternatives** kept "in case", commented out or otherwise.
+- The only comments in the finished file are ones this plan asks for, or that explain something
+  genuinely non-obvious to the next reader.
+
+Before finishing, read back each file you changed and confirm it contains exactly one
+implementation and no trace of how you got there.
+
 ## Acceptance criteria
 
 Each item must be objectively checkable. Codex reports `complete` only when every box is true.
