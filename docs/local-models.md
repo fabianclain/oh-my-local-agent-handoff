@@ -157,6 +157,36 @@ unrelated model, carrying content from a *different task*. Code quality was high
 discipline was not. An allow-list check in the gate is cheap insurance, and a plan should say
 plainly that touching an unlisted file fails the round.
 
+
+## Context hygiene: the model's memory is already clean, the tree is not
+
+A natural worry is that a local model carries context between tasks. Checked, and it does not:
+`opencode session list` shows a distinct session per round, and nothing in opencode's storage
+referenced the file that appeared to be contaminated.
+
+The state that actually carries over is the **working tree**. A file left dirty by a previous
+failed round is:
+
+1. read by the next round as though it were intended, and
+2. surfaced in that round's diff, which makes it look as though this round touched a file it
+   never opened.
+
+That misattribution is not academic — it produced a confident, wrong claim that a clean round had
+made an out-of-scope edit. The edit was real; the attribution was not.
+
+**Fix:** refuse to start a round on a dirty tree. Commit, revert or deliberately stash first.
+This is cheap and removes a whole class of confusion, including the temptation to "fix" the model
+for something the harness did.
+
+A related trap: `git stash push -u` followed by `git stash apply` **restores the broken state you
+were trying to escape**. It happened twice here, reintroducing an unparseable migration and a
+damaged service. If you stash for safety, archive it with `git stash show -p > file.patch` and
+then *drop* it, rather than leaving a landmine that any later `apply` will step on.
+
+**And a syntax sweep is not a contamination check.** Two contaminated files parsed perfectly —
+one carried a `(int) ($x ?? 0)` that silently turned "not reported" into "zero". `php -l` says
+nothing about whether a change belongs. `git status` is the check that catches it.
+
 ## Model selection
 
 Check `ollama show <model>` for `tools` under Capabilities before anything else. Without tool
