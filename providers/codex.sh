@@ -56,13 +56,19 @@ _codex_common_args() {
         -c "developer_instructions=\"$(printf '%s' "$dev_instructions" | sed 's/"/\\"/g')\""
 }
 
+# stdin is closed on both entry points below. The prompt travels as a positional argument, but
+# `codex exec` also appends piped stdin when stdin is not a TTY — so in a background shell, CI job
+# or nohup'd run it blocks forever on "Reading additional input from stdin..." and the round
+# produces nothing. Seen as a run sitting at 39 bytes of log after twelve minutes with no child
+# processes, which is indistinguishable from a slow model until you go looking for children.
+#
 # provider_run <repo_root> <schema> <result_file> <log_file> <dev_instructions> <prompt>
 provider_run() {
     local root="$1" schema="$2" result="$3" log="$4" dev="$5" prompt="$6"
     local args=(); mapfile -t args < <(_codex_common_args "$schema" "$result" "$dev")
     codex exec "${args[@]}" \
         --cd "$root" --sandbox "${HANDOFF_SANDBOX:-workspace-write}" --color never \
-        "$prompt" 2>&1 | tee "$log"
+        "$prompt" </dev/null 2>&1 | tee "$log"
     return "${PIPESTATUS[0]}"
 }
 
@@ -73,7 +79,7 @@ provider_run() {
 provider_resume() {
     local session="$1" schema="$2" result="$3" log="$4" dev="$5" prompt="$6"
     local args=(); mapfile -t args < <(_codex_common_args "$schema" "$result" "$dev")
-    codex exec resume "$session" "${args[@]}" "$prompt" 2>&1 | tee -a "$log"
+    codex exec resume "$session" "${args[@]}" "$prompt" </dev/null 2>&1 | tee -a "$log"
     return "${PIPESTATUS[0]}"
 }
 
