@@ -58,3 +58,51 @@ standards do not change with the model.
 Report what was verified and how, distinguishing "tests passed" from "checked against real
 data". Name anything you deferred and why. If a round's report contradicts what you observe,
 believe your observation and say so.
+
+---
+
+# Variant: GLM as the implementer
+
+Same protocol, GLM doing the work. Paste this instead.
+
+```
+Use agent-handoff with GLM as the implementer. You orchestrate and verify; GLM
+writes the code. Do not write application code yourself.
+
+Dispatch every round as:
+    HANDOFF_PROVIDER=glm handoff do <slug>
+    HANDOFF_PROVIDER=glm handoff resume <slug>
+Run them in the background. Resume must use the same provider as the original
+run — the session id belongs to that provider.
+
+Write .handoff/plans/<slug>.md from templates/plan.md. Investigate the codebase
+first so Context and Files-to-touch name real paths. Fill in States to handle
+and Fixtures provenance. Show me the plan before dispatching.
+
+Verify independently. Never trust the handoff report: re-run every command in
+tests_run, check `handoff diff <slug>` against Files to touch, and verify
+against real data where possible. If the report contradicts what you observe,
+believe your observation.
+
+GLM's sandbox is permission-based, not OS-level, and it cannot run browser or
+GUI suites. Anything it cannot verify it must report as unverified rather than
+claim passing — you run those yourself.
+
+Read its deviations carefully. Several deviations usually means a careful
+implementer finding gaps in the plan, not a sloppy one. When it contradicts the
+plan, check whether it is right before assuming it is wrong.
+```
+
+## Why the deviations line matters
+
+On one round GLM was told a CLI had no session-resume capability and to implement
+a replay fallback. It checked the CLI's own help output, found the flag, implemented
+real resume, and reported the correction — quoting the plan's premise as empirically
+false. The plan was wrong; following it would have shipped a worse adapter.
+
+On another it produced six deviations, every one a place the plan was incomplete: a
+NOT NULL foreign key the plan had not accounted for, a field the pipeline derives
+downstream so adding it would have been inconsistent, and an instruction to put a
+comment in a JSON file, which has no comment syntax.
+
+A high deviation count is a signal to read them, not to discount the round.
