@@ -14,6 +14,7 @@ not to collect impressions.
 | Short single-word plan slug | false "plan not found" blocker | round proceeds |
 | stdin closed on the opencode invocation | 31 min stall, 0-byte log | round runs |
 | Collapse detection added to the gate | 410 working lines silently lost | round blocked |
+| Round restricted to creating NEW files only | service class destroyed | **clean, correct output** |
 
 For comparison on the same plan, codex scored 5/5 in 104s. A guided Gemma beat it on wall clock.
 
@@ -120,6 +121,41 @@ together resolve it, and `.handoff/bin/watch-local` checks both:
 
 A wall-clock timeout alone is the wrong instrument: it eventually catches a stall, but only after
 wasting the whole budget. Stall detection catches it in minutes.
+
+
+## The rule that came out of this: greenfield for the local model, edits for the hosted one
+
+The single most effective change was not a prompt tweak. It was changing **what kind of work the
+round is allowed to do**.
+
+Given a plan that says *create these two files, modify nothing*, Gemma produced a migration and
+an Eloquent model that needed no correction: right namespace, right imports, `casts()` as a
+method matching the surrounding convention, cascade delete on the foreign key, indexes as
+specified, and PHPDoc generics on the relation. It ran the migration itself and reported it
+honestly.
+
+The same model, on a plan that mixed *create a model* with *edit an existing service*, wrote the
+model code into the service and destroyed 421 lines.
+
+The asymmetry makes sense: creating a file has one obvious destination, while editing requires
+holding a file's existing contents in mind and returning them unchanged apart from the edit.
+A 12B appears to regenerate rather than patch, and regeneration of a file it has not fully
+represented loses everything it did not reproduce.
+
+**Practical split:**
+
+- **Local model:** new migrations, new models, new services, new views, new tests — anything
+  where the deliverable is a file that does not exist yet.
+- **Hosted model:** edits to existing files, especially large ones; anything touching several
+  files at once; anything where being wrong is silent.
+
+This is a much larger share of a typical backlog than it sounds. Most feature work begins with
+new files.
+
+**Caveat, measured on the same successful round:** it still made one out-of-scope edit to an
+unrelated model, carrying content from a *different task*. Code quality was high; scope
+discipline was not. An allow-list check in the gate is cheap insurance, and a plan should say
+plainly that touching an unlisted file fails the round.
 
 ## Model selection
 
