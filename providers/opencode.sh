@@ -252,11 +252,16 @@ _opencode_prompt_validate() {
 
     local base_prompt; base_prompt="$(_opencode_build_prompt "$dev" "$prompt" "$schema")"
     local raw err_file
+    # stdin is closed on both attempts. The prompt travels as a positional argument, but
+    # `opencode run` reads stdin when it is not a TTY, so in a background shell, cron job or
+    # nohup'd run it blocks forever waiting for input that never arrives. Observed as a round
+    # sitting 31 minutes with a 0-byte log, 5% GPU and an empty `ollama ps` — the model had
+    # long since unloaded and nothing was happening at all. Identical to the codex adapter's bug.
     raw="$(mktemp)"; err_file="$(mktemp)"
 
     # Attempt 1.
     ( cd "$root" && opencode run --format json --dangerously-skip-permissions \
-        "${model_args[@]}" "${resume_args[@]}" -- "$base_prompt" ) >"$raw" 2>>"$log"
+        "${model_args[@]}" "${resume_args[@]}" -- "$base_prompt" ) </dev/null >"$raw" 2>>"$log"
     local status=$?
     cat "$raw" >>"$log"
 
@@ -273,7 +278,7 @@ _opencode_prompt_validate() {
     [[ -n "$retry_session" ]] && retry_args=(-s "$retry_session")
     local retry_prompt; retry_prompt="$(_opencode_retry_prompt "$dev" "$prompt" "$schema" "$(cat "$err_file")")"
     ( cd "$root" && opencode run --format json --dangerously-skip-permissions \
-        "${model_args[@]}" "${retry_args[@]}" -- "$retry_prompt" ) >"$raw" 2>>"$log"
+        "${model_args[@]}" "${retry_args[@]}" -- "$retry_prompt" ) </dev/null >"$raw" 2>>"$log"
     status=$?
     cat "$raw" >>"$log"
 
