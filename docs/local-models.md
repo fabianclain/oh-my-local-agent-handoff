@@ -13,6 +13,7 @@ not to collect impressions.
 | Output-discipline section added to the plan | 2/5 criteria | **5/5**, and faster (90s → 77s) |
 | Short single-word plan slug | false "plan not found" blocker | round proceeds |
 | stdin closed on the opencode invocation | 31 min stall, 0-byte log | round runs |
+| Collapse detection added to the gate | 410 working lines silently lost | round blocked |
 
 For comparison on the same plan, codex scored 5/5 in 104s. A guided Gemma beat it on wall clock.
 
@@ -63,6 +64,34 @@ there is nobody to notice.
 Compare with a hosted model on the same pipeline: codex returned `partial` with a blocker
 correctly naming a file **it did not own** as the cause of a failing test. That is the behaviour
 you want and cannot assume.
+
+### 5. It replaces whole files, and can write content into the wrong one
+
+The worst failure seen, and the one that changed the tooling.
+
+Asked to add a `links()` relation to `Page.php` and extend `PageProfiler.php`, it wrote the
+Eloquent relation — `return $this->hasMany(PageLink::class)` — into **PageProfiler.php**, a
+service class, and in doing so replaced the entire file:
+
+```
+PageProfiler.php   421 lines  ->  11 lines
+```
+
+410 lines of working code gone, replaced by a fragment belonging to a different class.
+
+This one happened to be a parse error, so the syntax gate caught it. **That was luck.** A
+fragment carrying its own `class` declaration would have been valid PHP, passed the gate, and
+silently deleted the service. Valid code in the wrong file is worse than broken code, because
+nothing downstream complains.
+
+**Fix:** the gate now also checks for collapse — a tracked file losing more than half its lines
+fails the round regardless of whether it parses. On this round: 97% loss, blocked.
+
+The deeper lesson is that a local model of this size appears to regenerate a file wholesale
+rather than edit it in place, and its sense of which file it is writing is weaker than its sense
+of what to write. The code it produced was not wrong; its destination was. Plans should therefore
+name, per file, exactly what belongs there — and the harness must not trust the model to keep
+that straight.
 
 ### 4. Escaped newlines in written files
 
