@@ -111,8 +111,13 @@ BASE_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 # including on kill -9, so a crashed run cannot leave the bench permanently locked.
 BENCH_LOCK="${TMPDIR:-/tmp}/agent-handoff-bench.lock"
 exec 9>"$BENCH_LOCK"
-if ! flock -n 9; then
-    echo "another benchmark is already running (lock: $BENCH_LOCK)" >&2
+# Wait rather than fail. A sequential loop starts the next provider seconds after the previous
+# one returns, while that run is still tearing down its worktree and still holding the lock --
+# so `flock -n` rejected a legitimate queued run and left a stale result from an earlier round
+# sitting in the report as though it were current. Waiting is right for the common case; the
+# bound stops a genuinely wedged run from blocking forever.
+if ! flock -w "${BENCH_LOCK_WAIT:-600}" 9; then
+    echo "another benchmark held the lock for ${BENCH_LOCK_WAIT:-600}s (lock: $BENCH_LOCK)" >&2
     echo "concurrent runs share the GPU and measure contention, not the model" >&2
     exit 75
 fi
