@@ -114,9 +114,37 @@ same guarantee as a schema-enforced one, and the difference is printed rather th
 | --- | --- | --- | --- |
 | `codex` | native | native | native |
 | `opencode` | prompt-validate | native | none |
+| `cline` | prompt-validate | none | none |
+| `lcpp` (Cline → llama.cpp) | prompt-validate | none | none |
 
 Adding one means implementing five functions in `providers/<name>.sh`. Nothing above the adapter
 is provider-specific.
+
+## Running the implementer locally
+
+A local model can do real work here, within limits that are measured rather than assumed. The full
+record is in [docs/local-models.md](docs/local-models.md); the short version:
+
+**Recommended stack — gpt-oss 20B served by llama.cpp, driven by Cline.**
+
+```bash
+tools/llamacpp-serve start gpt-oss-20b 65536
+HANDOFF_PROVIDER=lcgptossl handoff do <slug>
+```
+
+On a four-file architectural task with a semantic trap, that stack scored **15/15**, every run
+first-attempt, on a 16 GB card.
+
+**Use llama.cpp, not ollama, for gpt-oss.** Same weights, same tool schema, same conversation:
+ollama returns HTTP 500 for tool calls its own model generated — 2/5 malformed against 8/8, and
+1/3 correct patches against 4/4. Throughput is identical, so the choice costs nothing.
+`tools/repro-ollama-toolcall-500.py` reproduces it with no client involved. Ollama remains fine for
+models it handles cleanly; gemma runs well through it.
+
+Three things gate a local model, and each has produced a wrong verdict when skipped: **which
+engine serves it**, whether it emits native tool calls, and whether the window you want keeps it
+100% GPU-resident. Read the chat template and the stop list before concluding anything about
+capability — three models tested here were blocked by packaging, not ability.
 
 ## Licence
 

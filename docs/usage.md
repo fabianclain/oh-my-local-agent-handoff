@@ -16,6 +16,33 @@ You need at least one implementer CLI installed and authenticated.
 **Codex** — install per [openai/codex](https://github.com/openai/codex) and log in. Nothing else
 to configure; `codex` is the default provider.
 
+**A local model** — free to run, and good enough for well-specified work. Install
+[Cline](https://github.com/cline/cline) (`npm i -g cline`) and a llama.cpp build, then:
+
+```bash
+# weights from Hugging Face — ollama's blobs declare a non-standard architecture and will not load
+mkdir -p ~/.cache/agent-handoff/models
+curl -fL -o ~/.cache/agent-handoff/models/gpt-oss-20b-MXFP4.gguf \
+  "https://huggingface.co/ggml-org/gpt-oss-20b-GGUF/resolve/main/gpt-oss-20b-MXFP4.gguf"
+
+tools/llamacpp-serve start gpt-oss-20b 65536      # pins the stack; one model at a time
+
+cline auth -p openai-compatible -m gpt-oss-20b \
+  -b http://127.0.0.1:8071/v1 -k dummy --config ~/.cline-llamacpp
+
+HANDOFF_PROVIDER=lcgptossl handoff do <slug>
+```
+
+Serve it with **llama.cpp rather than ollama**. On identical weights and tool schemas, ollama
+returns HTTP 500 for tool calls its own model generated: 2/5 malformed against 8/8, and 1/3
+correct patches against 4/4. Throughput is the same either way, so there is nothing to trade off.
+Ollama is still fine for models it handles cleanly — gemma runs well through it — and its
+`ollama show --template/--parameters` remain the quickest way to inspect a package.
+
+Read [docs/local-models.md](local-models.md) before trusting output from any local model. Its
+defects are quiet: patches that pass every functional test while deleting the declaration beside
+the insertion point, and reports of success over an untouched tree.
+
 **GLM** — no separate CLI exists. Zhipu's ZCode is a desktop app, not scriptable. GLM runs
 through the Claude Code binary pointed at z.ai's Anthropic-compatible endpoint, which is the
 path z.ai documents. Install Claude Code, get a key from the z.ai platform, then:

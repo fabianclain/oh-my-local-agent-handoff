@@ -671,6 +671,54 @@ report at all, under both gemma and gpt-oss. It is the single most common non-mo
 
 ## 10. Setup checklist for a new model
 
+### Serve it with llama.cpp — this is the recommended path
+
+Ollama is documented below because most of this project's history ran on it, and because its
+tooling for inspecting a package is genuinely useful. It is no longer the recommended way to serve
+a model for real work.
+
+The reason is measured, not stylistic. Same official gpt-oss weights, same tool schema, same
+conversation:
+
+| | ollama | llama.cpp |
+| --- | ---: | ---: |
+| Tool calls valid at the API | 2/5 malformed, HTTP 500 | **8/8** |
+| Correct patch through the client | 1/3 | **4/4** |
+| Four-file architectural task | not reached | **15/15 at 9/9** |
+| Generation throughput | 61 tok/s | 60 tok/s |
+
+Throughput is a wash. What llama.cpp buys is a tool-call path that works.
+
+```bash
+# 1. get a GGUF that llama.cpp can actually load — from Hugging Face, not from ollama's blob store
+curl -fL -o ~/.cache/agent-handoff/models/<model>.gguf \
+  "https://huggingface.co/<org>/<repo>/resolve/main/<file>.gguf"
+
+# 2. serve it, pinned
+tools/llamacpp-serve start <model> 65536
+tools/llamacpp-serve status
+
+# 3. point the client at it
+cline auth -p openai-compatible -m <model> -b http://127.0.0.1:8071/v1 -k dummy \
+  --config ~/.cline-llamacpp
+
+# 4. probe before benchmarking: a real tool call, after a tool result, with a large argument
+python3 tools/repro-ollama-toolcall-500.py <model> 10   # engine-neutral; expect 0 failures
+```
+
+> **Ollama's blobs are not portable.** Its `gpt-oss:20b` declares model architecture `gptoss`, and
+> llama.cpp rejects it with `unknown model architecture`. The Hugging Face build declares
+> `gpt-oss` and loads. Download the weights again rather than reusing the blob store.
+
+Pick the largest window that stays **100% GPU-resident**, and verify it — for gpt-oss on a 16 GB
+card that is 64k, which also clears the ~36k a multi-file plan actually consumes. 128k buys
+nothing this workload uses and costs about a third of throughput.
+
+### Serving with ollama
+
+Still the quickest way to *inspect* a package, and fine for models whose tool calls it handles —
+gemma works well through it.
+
 ```bash
 ollama show <model> | grep -A6 Capabilities     # 'tools' present? necessary, not sufficient
 ollama show --template <model>                  # read it — corruption here looks like incapacity
@@ -682,6 +730,13 @@ ollama ps                                        # demand 100% GPU
 
 Register the same context in the client's config as well as baking it. Then benchmark — and only
 then.
+
+Two ollama-specific hazards worth knowing before you attribute anything to a model:
+
+- **Cline overrides the baked context**, sending `num_ctx: 32768` regardless. `tools/ollama-ctx-proxy.py`
+  rewrites it per model.
+- **gpt-oss tool calls are corrupted** on this path, returning HTTP 500 for the model's own valid
+  output. See §7b; this is why llama.cpp is recommended.
 
 **Read the template and the stop list before concluding anything.** Three of the models tested
 here were blocked by packaging rather than capability, and each looked like a different kind of
