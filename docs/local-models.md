@@ -187,6 +187,47 @@ then *drop* it, rather than leaving a landmine that any later `apply` will step 
 one carried a `(int) ($x ?? 0)` that silently turned "not reported" into "zero". `php -l` says
 nothing about whether a change belongs. `git status` is the check that catches it.
 
+
+## Devstral Small 2 24B: better code, worse outcome — and why
+
+Tested on the same two bench plans. The result is instructive precisely because it does not fit
+the "bigger model is better" story.
+
+| Plan | Model | Criteria | Status |
+| --- | --- | ---: | --- |
+| mechanical | devstral 24B | 0/5 | report never written |
+| mechanical-guided | devstral 24B | **5/5** | report never written |
+| mechanical-guided | gemma 12B | 5/5 | complete |
+
+Devstral wrote the **best code of any model tested**, hosted ones included — a single-pass
+`sed -E 's/[^a-z0-9]+/-/g'` where Gemma needed two steps through a space intermediary. And the
+output-discipline section moved it 0/5 → 5/5, the same lever that worked on Gemma.
+
+But it never produced a report. Its output ends mid-sentence — *"Let me check what test files
+exist in the mechanical directory:"* — 805 bytes, no JSON anywhere, and `truncated` in the
+provider log.
+
+**The cause is a chain that starts at VRAM:**
+
+```
+24B at Q4  ->  ~15 GB weights  ->  will not fit a 16 GB card
+           ->  context capped at 16k to limit the footprint
+           ->  agent loop runs out of room mid-task
+           ->  work completed, report never written
+```
+
+Gemma at 12B fits with room for a **128k** context and finishes its loop. Devstral at 24B is the
+better coder and loses anyway.
+
+**The rule:** for local agentic work, context headroom is a first-class constraint, not a
+tuning knob. An agent loop spends context on file reads, tool results and its own reasoning
+before it ever writes the deliverable — and a model that runs out mid-loop produces work you
+cannot see or verify. **A smaller model with room to work beats a better model that is starved.**
+
+Practical consequence on a 16 GB card: prefer a quantisation that leaves at least 2-3 GB free
+after weights. For a 24B that means Q3 rather than Q4. Check `ollama ps` for `100% GPU` — a
+`31%/69% CPU/GPU` split is both slow and a signal that context has been squeezed to make it fit.
+
 ## Model selection
 
 Check `ollama show <model>` for `tools` under Capabilities before anything else. Without tool
