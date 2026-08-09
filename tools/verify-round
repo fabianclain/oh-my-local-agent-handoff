@@ -1,0 +1,293 @@
+#!/usr/bin/env bash
+#
+# verify-round — decide whether a round is acceptable, from the tree, and prove it.
+#
+#   tools/verify-round <worktree> <plan.md> <base-commit> [out-dir]
+#
+# The implementer's report is not evidence. Three runs in this project reported `status: complete`
+# over a tree they had never touched, one with invented file paths; another claimed a migration ran
+# when the file was a single line of literal \n characters. So nothing here reads the report. Every
+# claim below is produced by running a command and recording what it actually returned.
+#
+# What it exists to prevent, in order of how badly each has burned us:
+#
+#   1. fabricated success  — the report says done, the tree says otherwise
+#   2. plausible-but-wrong — code that parses and computes the wrong number
+#   3. collateral damage   — a correct change that quietly breaks an untouched region
+#   4. littering           — files the plan never named, including ones cleaned up afterwards
+#   5. silent non-coverage — a check that was never run being read as a check that passed
+#
+# The last one is why every gate reports `skipped` explicitly rather than being omitted. A verifier
+# that quietly runs fewer checks than you think is worse than no verifier, because it converts
+# absence of evidence into apparent evidence of absence.
+#
+# Output: <out-dir>/evidence.json (machine) and <out-dir>/evidence.md (for a reviewing model).
+# Exit status is 0 only when every executed gate passed and none were inconclusive.
+
+set -uo pipefail
+
+WORKTREE="${1:?usage: verify-round <worktree> <plan.md> <base-commit> [out-dir]}"
+PLAN_FILE="${2:?plan file required}"
+BASE_COMMIT="${3:?base commit required}"
+OUT_DIR="${4:-$WORKTREE/.handoff/evidence}"
+
+# The verifier must not appear in its own results.
+#
+# Writing evidence into the worktree makes those files show up as changed, so the scope gate
+# reports them as invented and the plan's own "exactly N files changed" command counts them. The
+# first run of this tool rejected a correct solution for exactly that reason.
+#
+# .handoff is safe because plans already exclude it from their file counts; anywhere else inside
+# the worktree is not, and is refused rather than silently skewing the result.
+#
+# Checked before anything is created. An earlier version made the directory first and refused
+# afterwards, so the rejected run left an evidence file behind that the *next* run then reported
+# as an invented file. A guard that has already caused the side effect it guards against is not
+# a guard.
+WORKTREE_ABS="$(cd "$WORKTREE" && pwd)"
+OUT_ABS="$(cd "$(dirname "$OUT_DIR")" && pwd)/$(basename "$OUT_DIR")"
+OUT_REL=""
+case "$OUT_ABS/" in
+"$WORKTREE_ABS/"*)
+    OUT_REL="${OUT_ABS#"$WORKTREE_ABS"/}"
+    case "$OUT_REL" in
+    .handoff/*) ;;
+    *)
+        echo "refusing to write evidence to '$OUT_REL' inside the worktree." >&2
+        echo "It would be counted as a change by the very gates it is meant to report." >&2
+        echo "Use a path outside the worktree, or under .handoff/." >&2
+        exit 2
+        ;;
+    esac
+    ;;
+esac
+
+mkdir -p "$OUT_DIR"
+EVIDENCE="$OUT_DIR/evidence.jsonl"
+: >"$EVIDENCE"
+
+# Record one gate. Output is captured in full to disk and excerpted here: a reviewer needs enough
+# to judge without being handed a megabyte of test log, and the full text stays on disk for when
+# the excerpt is not enough.
+record() {
+    local gate="$1" status="$2" detail="$3" command="${4:-}" output_file="${5:-}"
+    python3 - "$gate" "$status" "$detail" "$command" "$output_file" "$EVIDENCE" <<'PY'
+import hashlib, json, sys
+gate, status, detail, command, output_file, evidence = sys.argv[1:7]
+excerpt = digest = None
+if output_file:
+    try:
+        raw = open(output_file, "rb").read()
+        digest = "sha256:" + hashlib.sha256(raw).hexdigest()[:16]
+        text = raw.decode("utf-8", "replace").strip()
+        excerpt = text if len(text) <= 600 else text[:300] + "\n…\n" + text[-300:]
+    except Exception:
+        pass
+with open(evidence, "a") as handle:
+    handle.write(json.dumps({
+        "gate": gate, "status": status, "detail": detail,
+        "command": command or None, "output_excerpt": excerpt, "output_sha256": digest,
+    }) + "\n")
+PY
+}
+
+cd "$WORKTREE" || { echo "worktree not found: $WORKTREE" >&2; exit 2; }
+
+# --- what changed, including anything created and then removed ------------------------------
+CHANGED="$OUT_DIR/changed-files.txt"
+# Harness-owned paths only. The driver stages the plan into .handoff/plans and writes its own
+# bookkeeping under .handoff/runs, so counting those as the model's work blames it for the
+# harness's footprint — which is how this project has misjudged models repeatedly.
+#
+# Deliberately NOT excluding .handoff wholesale: a model once wrote three verification scripts
+# straight into .handoff/, and that is real littering that must still be caught.
+EXCLUDES=(
+    ':(exclude).handoff/runs/**'
+    ':(exclude).handoff/evidence/**'
+    ':(exclude).handoff/plans/**'
+)
+[[ -z "$OUT_REL" ]] || EXCLUDES+=(":(exclude)$OUT_REL/**")
+{
+    git diff --name-only "$BASE_COMMIT" -- . "${EXCLUDES[@]}"
+    git ls-files --others --exclude-standard -- . "${EXCLUDES[@]}"
+} 2>/dev/null | sort -u >"$CHANGED"
+
+if [[ ! -s "$CHANGED" ]]; then
+    record "tree-changed" "fail" "the working tree is unchanged; nothing was implemented"
+else
+    record "tree-changed" "pass" "$(wc -l <"$CHANGED" | tr -d ' ') file(s) changed"
+fi
+
+# --- syntax ---------------------------------------------------------------------------------
+if command -v php >/dev/null 2>&1; then
+    SYNTAX_OUT="$OUT_DIR/syntax.log"; : >"$SYNTAX_OUT"; SYNTAX_BAD=0
+    while IFS= read -r file; do
+        [[ "$file" == *.php && -f "$file" ]] || continue
+        php -l "$file" >>"$SYNTAX_OUT" 2>&1 || SYNTAX_BAD=$(( SYNTAX_BAD + 1 ))
+    done <"$CHANGED"
+    if [[ "$SYNTAX_BAD" -gt 0 ]]; then
+        record "syntax" "fail" "$SYNTAX_BAD changed PHP file(s) do not parse" "php -l" "$SYNTAX_OUT"
+    else
+        record "syntax" "pass" "every changed PHP file parses" "php -l" "$SYNTAX_OUT"
+    fi
+else
+    record "syntax" "skipped" "php not on PATH"
+fi
+
+# --- the plan's own acceptance commands -------------------------------------------------------
+VERIFY_CMDS="$OUT_DIR/commands.txt"
+awk '
+    /^## Verification[[:space:]]*$/ { in_section=1; next }
+    in_section && /^```/ { if (in_block) exit; in_block=1; next }
+    in_block && NF { print }
+' "$PLAN_FILE" >"$VERIFY_CMDS"
+
+if [[ -s "$VERIFY_CMDS" ]]; then
+    IDX=0; PASSED=0; TOTAL=0
+    while IFS= read -r command; do
+        IDX=$(( IDX + 1 )); TOTAL=$(( TOTAL + 1 ))
+        OUT="$OUT_DIR/acceptance-$IDX.log"
+        timeout 120 bash -o pipefail -c "$command" >"$OUT" 2>&1
+        if [[ $? -eq 0 ]]; then
+            PASSED=$(( PASSED + 1 ))
+            record "acceptance-$IDX" "pass" "exit 0" "$command" "$OUT"
+        else
+            record "acceptance-$IDX" "fail" "non-zero exit" "$command" "$OUT"
+        fi
+    done <"$VERIFY_CMDS"
+    record "acceptance" "$([[ "$PASSED" -eq "$TOTAL" ]] && echo pass || echo fail)" \
+        "$PASSED of $TOTAL acceptance commands passed"
+else
+    record "acceptance" "skipped" "the plan declares no verification commands"
+fi
+
+# --- scope and litter -------------------------------------------------------------------------
+ALLOWED="$OUT_DIR/allowed.txt"
+awk '
+    /^## Files to touch[[:space:]]*$/ { in_section=1; next }
+    in_section && /^## / { exit }
+    in_section && /^\|/ {
+        split($0, cells, "|"); path=cells[2]
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", path); gsub(/`/, "", path)
+        if (path != "Path" && path !~ /^-+$/ && path != "") print path
+    }
+' "$PLAN_FILE" >"$ALLOWED"
+
+if [[ -s "$ALLOWED" ]]; then
+    SCOPE_OUT="$OUT_DIR/scope.log"; : >"$SCOPE_OUT"; OUT_OF_SCOPE=0; LITTER=0
+    while IFS= read -r file; do
+        [[ -n "$file" ]] || continue
+        grep -Fqx -- "$file" "$ALLOWED" && continue
+        OUT_OF_SCOPE=$(( OUT_OF_SCOPE + 1 ))
+        if git cat-file -e "$BASE_COMMIT:$file" 2>/dev/null; then
+            echo "modified out of scope: $file" >>"$SCOPE_OUT"
+        else
+            LITTER=$(( LITTER + 1 ))
+            echo "invented: $file" >>"$SCOPE_OUT"
+        fi
+    done <"$CHANGED"
+    if [[ "$OUT_OF_SCOPE" -gt 0 ]]; then
+        record "scope" "fail" "$OUT_OF_SCOPE file(s) outside the plan, $LITTER of them invented" \
+            "" "$SCOPE_OUT"
+    else
+        record "scope" "pass" "every changed file is named by the plan"
+    fi
+else
+    record "scope" "skipped" "the plan declares no Files to touch table"
+fi
+
+# --- regeneration rather than patching ---------------------------------------------------------
+REWRITE_OUT="$OUT_DIR/rewrite.log"; : >"$REWRITE_OUT"; REWRITES=0
+while IFS= read -r file; do
+    [[ -n "$file" ]] || continue
+    git cat-file -e "$BASE_COMMIT:$file" 2>/dev/null || continue
+    BEFORE=$(git show "$BASE_COMMIT:$file" 2>/dev/null | wc -l)
+    [[ "$BEFORE" -gt 0 ]] || continue
+    [[ -f "$file" ]] && AFTER=$(wc -l <"$file") || AFTER=0
+    REMOVED=$(git diff --numstat "$BASE_COMMIT" -- "$file" | awk '{ print $2 + 0 }')
+    if (( AFTER * 2 < BEFORE )) || (( ${REMOVED:-0} >= BEFORE )); then
+        echo "$file: $BEFORE lines -> $AFTER, ${REMOVED:-0} removed" >>"$REWRITE_OUT"
+        REWRITES=$(( REWRITES + 1 ))
+    fi
+done <"$CHANGED"
+if [[ "$REWRITES" -gt 0 ]]; then
+    record "patch-only" "fail" "$REWRITES file(s) regenerated rather than patched" "" "$REWRITE_OUT"
+else
+    record "patch-only" "pass" "existing files were patched, not regenerated"
+fi
+
+# --- project static analysis, only when the project already has it -----------------------------
+# Never installed on the fly. A verifier that changes the project to verify it is not a verifier.
+if [[ -x vendor/bin/pint ]]; then
+    PINT_OUT="$OUT_DIR/pint.log"
+    vendor/bin/pint --test >"$PINT_OUT" 2>&1 &&
+        record "style" "pass" "pint reports no style violations" "vendor/bin/pint --test" "$PINT_OUT" ||
+        record "style" "fail" "pint reports style violations" "vendor/bin/pint --test" "$PINT_OUT"
+else
+    record "style" "skipped" "vendor/bin/pint not present in this tree"
+fi
+
+if [[ -x vendor/bin/phpstan ]]; then
+    STAN_OUT="$OUT_DIR/phpstan.log"
+    vendor/bin/phpstan analyse --no-progress >"$STAN_OUT" 2>&1 &&
+        record "static-analysis" "pass" "phpstan clean" "vendor/bin/phpstan analyse" "$STAN_OUT" ||
+        record "static-analysis" "fail" "phpstan reported problems" "vendor/bin/phpstan analyse" "$STAN_OUT"
+else
+    record "static-analysis" "skipped" "vendor/bin/phpstan not present in this tree"
+fi
+
+# --- the project's existing suite, to catch damage the plan never thought to check --------------
+if [[ -x vendor/bin/pest ]]; then
+    TEST_OUT="$OUT_DIR/tests.log"
+    timeout 900 vendor/bin/pest --compact >"$TEST_OUT" 2>&1 &&
+        record "test-suite" "pass" "existing suite green" "vendor/bin/pest --compact" "$TEST_OUT" ||
+        record "test-suite" "fail" "existing suite has failures" "vendor/bin/pest --compact" "$TEST_OUT"
+else
+    record "test-suite" "skipped" "no vendor/bin/pest in this tree"
+fi
+
+# --- render -------------------------------------------------------------------------------------
+python3 - "$EVIDENCE" "$OUT_DIR" <<'PY'
+import json, sys
+evidence_path, out_dir = sys.argv[1], sys.argv[2]
+rows = [json.loads(line) for line in open(evidence_path) if line.strip()]
+
+failed = [r for r in rows if r["status"] == "fail"]
+skipped = [r for r in rows if r["status"] == "skipped"]
+passed = [r for r in rows if r["status"] == "pass"]
+
+verdict = "REJECT" if failed else "ACCEPT"
+json.dump({"verdict": verdict, "passed": len(passed), "failed": len(failed),
+           "skipped": len(skipped), "gates": rows},
+          open(f"{out_dir}/evidence.json", "w"), indent=2)
+
+lines = [f"# Verification evidence — {verdict}", "",
+         f"{len(passed)} passed, {len(failed)} failed, {len(skipped)} not run.", "",
+         "Produced by running commands against the working tree. The implementer's own report was",
+         "not consulted and is not evidence.", ""]
+
+if failed:
+    lines += ["## Failed", ""]
+    for row in failed:
+        lines.append(f"- **{row['gate']}** — {row['detail']}")
+        if row.get("command"):
+            lines.append(f"  - `{row['command']}`")
+        if row.get("output_excerpt"):
+            lines += ["  ```", *(f"  {l}" for l in row["output_excerpt"].splitlines()[:12]), "  ```"]
+    lines.append("")
+
+lines += ["## Passed", ""]
+for row in passed:
+    proof = f" (`{row['output_sha256']}`)" if row.get("output_sha256") else ""
+    lines.append(f"- {row['gate']} — {row['detail']}{proof}")
+
+if skipped:
+    lines += ["", "## Not checked", "",
+              "These gates did not run. Absence of a failure here is not evidence of correctness.", ""]
+    for row in skipped:
+        lines.append(f"- {row['gate']} — {row['detail']}")
+
+open(f"{out_dir}/evidence.md", "w").write("\n".join(lines) + "\n")
+print("\n".join(lines))
+sys.exit(1 if failed else 0)
+PY
