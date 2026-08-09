@@ -1,327 +1,272 @@
-# Driving a local model as the implementer
+# Local models as implementation agents
 
-Notes from running Gemma 4 12B (Q4_K_M, 128k context, RTX 5060 Ti) against real plans in a
-Laravel repository. Every claim here was measured; where a number is quoted it came from a run.
+Everything measured while driving local models through this harness against a real Laravel
+codebase. Hardware: RTX 5060 Ti, 16 GB, ~14.4 GB usable after the desktop.
 
-Update this file after each round. The point is to find what actually moves the success rate,
-not to collect impressions.
+Nothing here is inferred from model cards or benchmarks published elsewhere. Every claim comes
+from a run, and the ones that were wrong are marked as such, because most of the value is in
+which confident conclusions turned out to be harness bugs.
 
-## What is measured so far
+---
 
-| Change | Before | After |
-| --- | --- | --- |
-| Output-discipline section added to the plan | 2/5 criteria | **5/5**, and faster (90s → 77s) |
-| Short single-word plan slug | false "plan not found" blocker | round proceeds |
-| stdin closed on the opencode invocation | 31 min stall, 0-byte log | round runs |
-| Collapse detection added to the gate | 410 working lines silently lost | round blocked |
-| Round restricted to creating NEW files only | service class destroyed | **clean, correct output** |
+## The short version
 
-For comparison on the same plan, codex scored 5/5 in 104s. A guided Gemma beat it on wall clock.
+A local model **can** do real work in this pipeline, within a narrow band:
 
-## The failures, and what each one taught
+- **Creating new files** — migrations, models, factories, plain services. Gemma 4 12B: 2 for 2,
+  needing no correction.
+- **Not editing existing files.** Same model, 0 for 5. It regenerates rather than patches, and
+  what it does not reproduce is lost.
+- **Not anything statistical.** Aggregate SQL, ratios, anything where a plausible answer and a
+  correct answer look identical on review.
 
-### 1. It writes its reasoning into the deliverable
+Three things gate usability, in this order. Each is cheap and each has produced a wrong verdict
+when skipped:
 
-First real artifact contained three successive implementations in one file, each commenting on
-the last: *"Correction: the above is wrong"*, *"Re-writing logic properly"*, *"Actually, the rule
-is..."*. Syntactically valid, semantically three half-finished drafts.
+1. **Does it emit native tool calls?** Not "does `ollama show` list `tools`" — actually probe it.
+2. **Is it 100% resident on the GPU?** Below that, treat as unusable rather than slow.
+3. **Does it have context headroom?** An agent loop spends context on file reads and tool
+   results before it writes anything you can verify.
 
-**Fix that worked:** an explicit *Output discipline* section — one implementation, no
-self-commentary, no alternatives, read the file back before finishing. Took the same model from
-2/5 to 5/5 on an unchanged task. This is now in `templates/plan.md`.
+---
 
-**What did NOT need fixing:** task size. The plan was already one 30-line file with five explicit
-criteria and exact input-to-output examples. "Make the task smaller and more specific" would have
-changed nothing, because ambiguity was never the problem.
+## 1. Tool-call format — the gate that invalidates everything else
 
-### 2. It mis-transcribes long hyphenated identifiers
+`ollama show` listing `tools` means the template *claims* tool support. It does not mean the
+emitted format is one your client parses.
 
-Given `search-log-persist-total-results`, it looked for `search_log_persist_total_results`,
-failed, and reported the plan as missing rather than listing the directory. Renaming the plan to
-`totals.md` made the same round proceed.
+Probed with a file on disk and a prompt to read it:
 
-**Fix:** keep plan slugs short and ideally one word. Also worth teaching it to `ls` before
-concluding a file is absent — a model that gives up on a path typo wastes a whole round.
+| Model | Arch | Source | Result |
+| --- | --- | --- | --- |
+| gemma4:12b-128k | gemma4 | ollama library | **native tool calls** |
+| devstral-small-2:24b | mistral3 | ollama library | **native** |
+| Devstral Q3_K_S / UD-Q3_K_XL | mistral3 | HF GGUF | **native** |
+| qwen2.5-coder:14b | qwen2 | ollama library | text |
+| JanusCoder-14B | qwen3 | HF GGUF | text |
+| gemma-4-12B-coder-fable5 | gemma4 | HF GGUF | text |
 
-### 3. It reports success it did not achieve
+A failing model returns something like:
 
-The most dangerous failure seen. A round returned `status: complete`, **zero deviations, zero
-blockers**, and claimed *"Migration executed successfully"*, *"All search-related tests passed"*
-and *"Updated the UI"*. In reality:
-
-- the migration was a **single line of literal `\n` characters** — a PHP parse error, so it never
-  ran and the column was never created
-- it also broke a production file (`EntryIngestor.php`) with a mangled array close
-- the UI file was untouched
-- no tests were written
-- `(int) ($x ?? 0)` turned a legitimate null into `0`, silently corrupting a "not reported" value
-  into "zero results"
-
-**Fix:** treat the report as untrusted metadata and check the tree first. `.handoff/bin/gemma-round`
-runs `php -l` over every changed file **before** anyone reads the report, and reverts the round if
-anything fails to parse. A syntactically broken file blocks every later round, and unattended
-there is nobody to notice.
-
-Compare with a hosted model on the same pipeline: codex returned `partial` with a blocker
-correctly naming a file **it did not own** as the cause of a failing test. That is the behaviour
-you want and cannot assume.
-
-### 5. It replaces whole files, and can write content into the wrong one
-
-The worst failure seen, and the one that changed the tooling.
-
-Asked to add a `links()` relation to `Page.php` and extend `PageProfiler.php`, it wrote the
-Eloquent relation — `return $this->hasMany(PageLink::class)` — into **PageProfiler.php**, a
-service class, and in doing so replaced the entire file:
-
-```
-PageProfiler.php   421 lines  ->  11 lines
+```json
+{ "name": "read", "arguments": { "filePath": ".handoff/plans/probe.md" } }
 ```
 
-410 lines of working code gone, replaced by a fragment belonging to a different class.
+wrapped in a markdown fence, as plain text. The client never executes it, no file contents come
+back, and the model then reports — accurately — that it cannot see the file.
 
-This one happened to be a parse error, so the syntax gate caught it. **That was luck.** A
-fragment carrying its own `class` declaration would have been valid PHP, passed the gate, and
-silently deleted the service. Valid code in the wrong file is worse than broken code, because
-nothing downstream complains.
+**This produced the single worst misjudgement in these notes.** qwen2.5-coder was recorded twice
+as fabricating a blocker to look diligent, described as the most dangerous failure mode observed.
+It was telling the truth.
 
-**Fix:** the gate now also checks for collapse — a tracked file losing more than half its lines
-fails the round regardless of whether it parses. On this round: 97% loss, blocked.
+**The pattern is per-build.** Not per-architecture: one gemma4 model works and another does not.
+Not per-source: HF GGUFs work for Devstral and fail for JanusCoder. It is decided by whichever
+chat template that specific package ships, and it is not predictable from the model card.
 
-The deeper lesson is that a local model of this size appears to regenerate a file wholesale
-rather than edit it in place, and its sense of which file it is writing is weaker than its sense
-of what to write. The code it produced was not wrong; its destination was. Plans should therefore
-name, per file, exactly what belongs there — and the harness must not trust the model to keep
-that straight.
+**Neither engine change fixes it.** Ollama was already current (0.32.6). llama.cpp's Vulkan build
+with `--jinja`, given JanusCoder's own HF GGUF with the template embedded, produced the same
+fenced JSON with `tool_calls` absent. The format is the model's.
 
-### 4. Escaped newlines in written files
+> Trap: ollama stores the chat template as a **separate layer outside the GGUF**. Pointing
+> llama.cpp at an ollama blob tests a template-stripped model and tells you nothing.
 
-Related to 3 but distinct and worth naming in the plan text itself: the tool-call path can emit
-`\n` as two characters. Plans now say **write real newlines, then run `php -l` and confirm it
-parses**. A file that does not parse is not progress.
+---
 
+## 2. Residency — below 100% GPU, treat it as unusable
 
-### 6. The escaped-newline bug also lands in filenames
-
-Same defect as (4), different target. A round created:
-
-```
-$'app/Domains/SearchConsole/Services/OpportunityReport.php\n'
-```
-
-— a real file whose *name* ends in a newline character. It evaded a `*.php` gate check, was
-invisible to `ls path/to/OpportunityReport.php`, and printed across two lines in `find`, which
-made it look like two separate entries.
-
-**Fix:** the gate rejects any changed path containing a control character. Worth doing generally:
-a filename a later glob cannot match is a defect regardless of which model produced it.
-
-### 7. It writes SQL that is plausible and silently wrong
-
-The most dangerous output seen after the false-success report, because it passes every syntax and
-structural check. Asked for aggregate reports over per-date rows, it produced:
-
-```php
-->whereBetween('position', [11, 20])          // filters raw rows, not AVG(position)
-->where('impressions', '>=', $minImpressions) // filters raw rows, not SUM(impressions)
-->groupBy('site_url', 'query')
-->selectRaw('CAST(SUM(clicks) AS decimal(6,4)) as ctr')  // click count labelled as a ratio
-```
-
-`WHERE` runs before `GROUP BY`, so both filters test a single day rather than the aggregate. And
-the CTR column is not a ratio at all — it is the click count with a misleading alias.
-
-Nothing about this fails to parse, fails a test that does not exist yet, or looks wrong on
-review at a glance. It would have produced a report full of confident, incorrect numbers.
-
-**What this says about task selection:** the greenfield rule (creating files rather than editing)
-is necessary but not sufficient. It protects the *codebase* from destruction; it does not protect
-the *output* from being wrong. Work whose correctness lives in semantics rather than structure —
-aggregate SQL, ratios, anything where a plausible answer and a right answer look identical —
-should go to a hosted model regardless of whether the files are new.
-
-The failure was already anticipated in the plan, which stated the SUM/SUM rule explicitly. It
-still shipped the wrong version. **Stating a constraint in the plan is not the same as the model
-honouring it**, and a constraint that only a test can enforce needs a test, not a sentence.
-
-## Failures that were NOT the model's fault
-
-Worth separating, because blaming the model for harness bugs leads to the wrong fixes.
-
-- **A 31-minute stall with a 0-byte log.** `opencode run` reads stdin when stdin is not a TTY, so
-  in a background shell it waited forever. The model had loaded, gone idle, hit its keep_alive
-  timeout and unloaded. Fixed by closing stdin. The codex adapter had the identical bug.
-- **"Plan file not found" from qwen2.5-coder:14b**, twice, in 18 seconds. The harness copies the
-  plan into the worktree before every run and Gemma read it through the same adapter. A
-  fabricated blocker, not a harness problem — but it looks like one until you check.
-
-## Telling a working round from a hung one
-
-From outside they are identical: process alive, no exit code, log not growing. Two signals
-together resolve it, and `.handoff/bin/watch-local` checks both:
-
-- **GPU busy + log flat** → normal, it is generating
-- **no model in `ollama ps` + log flat** → dead; kill it
-
-A wall-clock timeout alone is the wrong instrument: it eventually catches a stall, but only after
-wasting the whole budget. Stall detection catches it in minutes.
-
-
-## The rule that came out of this: greenfield for the local model, edits for the hosted one
-
-The single most effective change was not a prompt tweak. It was changing **what kind of work the
-round is allowed to do**.
-
-Given a plan that says *create these two files, modify nothing*, Gemma produced a migration and
-an Eloquent model that needed no correction: right namespace, right imports, `casts()` as a
-method matching the surrounding convention, cascade delete on the foreign key, indexes as
-specified, and PHPDoc generics on the relation. It ran the migration itself and reported it
-honestly.
-
-The same model, on a plan that mixed *create a model* with *edit an existing service*, wrote the
-model code into the service and destroyed 421 lines.
-
-The asymmetry makes sense: creating a file has one obvious destination, while editing requires
-holding a file's existing contents in mind and returning them unchanged apart from the edit.
-A 12B appears to regenerate rather than patch, and regeneration of a file it has not fully
-represented loses everything it did not reproduce.
-
-**Practical split:**
-
-- **Local model:** new migrations, new models, new services, new views, new tests — anything
-  where the deliverable is a file that does not exist yet.
-- **Hosted model:** edits to existing files, especially large ones; anything touching several
-  files at once; anything where being wrong is silent.
-
-This is a much larger share of a typical backlog than it sounds. Most feature work begins with
-new files.
-
-**Caveat, measured on the same successful round:** it still made one out-of-scope edit to an
-unrelated model, carrying content from a *different task*. Code quality was high; scope
-discipline was not. An allow-list check in the gate is cheap insurance, and a plan should say
-plainly that touching an unlisted file fails the round.
-
-
-## Context hygiene: the model's memory is already clean, the tree is not
-
-A natural worry is that a local model carries context between tasks. Checked, and it does not:
-`opencode session list` shows a distinct session per round, and nothing in opencode's storage
-referenced the file that appeared to be contaminated.
-
-The state that actually carries over is the **working tree**. A file left dirty by a previous
-failed round is:
-
-1. read by the next round as though it were intended, and
-2. surfaced in that round's diff, which makes it look as though this round touched a file it
-   never opened.
-
-That misattribution is not academic — it produced a confident, wrong claim that a clean round had
-made an out-of-scope edit. The edit was real; the attribution was not.
-
-**Fix:** refuse to start a round on a dirty tree. Commit, revert or deliberately stash first.
-This is cheap and removes a whole class of confusion, including the temptation to "fix" the model
-for something the harness did.
-
-A related trap: `git stash push -u` followed by `git stash apply` **restores the broken state you
-were trying to escape**. It happened twice here, reintroducing an unparseable migration and a
-damaged service. If you stash for safety, archive it with `git stash show -p > file.patch` and
-then *drop* it, rather than leaving a landmine that any later `apply` will step on.
-
-**And a syntax sweep is not a contamination check.** Two contaminated files parsed perfectly —
-one carried a `(int) ($x ?? 0)` that silently turned "not reported" into "zero". `php -l` says
-nothing about whether a change belongs. `git status` is the check that catches it.
-
-
-## Devstral Small 2 24B: better code, worse outcome — and why
-
-Tested on the same two bench plans. The result is instructive precisely because it does not fit
-the "bigger model is better" story.
-
-| Plan | Model | Criteria | Status |
-| --- | --- | ---: | --- |
-| mechanical | devstral 24B | 0/5 | report never written |
-| mechanical-guided | devstral 24B | **5/5** | report never written |
-| mechanical-guided | gemma 12B | 5/5 | complete |
-
-Devstral wrote the **best code of any model tested**, hosted ones included — a single-pass
-`sed -E 's/[^a-z0-9]+/-/g'` where Gemma needed two steps through a space intermediary. And the
-output-discipline section moved it 0/5 → 5/5, the same lever that worked on Gemma.
-
-But it never produced a report. Its output ends mid-sentence — *"Let me check what test files
-exist in the mechanical directory:"* — 805 bytes, no JSON anywhere, and `truncated` in the
-provider log.
-
-**The cause is a chain that starts at VRAM:**
-
-```
-24B at Q4  ->  ~15 GB weights  ->  will not fit a 16 GB card
-           ->  context capped at 16k to limit the footprint
-           ->  agent loop runs out of room mid-task
-           ->  work completed, report never written
-```
-
-Gemma at 12B fits with room for a **128k** context and finishes its loop. Devstral at 24B is the
-better coder and loses anyway.
-
-**The rule:** for local agentic work, context headroom is a first-class constraint, not a
-tuning knob. An agent loop spends context on file reads, tool results and its own reasoning
-before it ever writes the deliverable — and a model that runs out mid-loop produces work you
-cannot see or verify. **A smaller model with room to work beats a better model that is starved.**
-
-Practical consequence on a 16 GB card: prefer a quantisation that leaves at least 2-3 GB free
-after weights. For a 24B that means Q3 rather than Q4. Check `ollama ps` for `100% GPU` — a
-`31%/69% CPU/GPU` split is both slow and a signal that context has been squeezed to make it fit.
-
-
-## Partial GPU offload is not a mild compromise — measured
-
-Devstral Small 24B was tried at two quantisations on a 16 GB card (14.4 GB usable after the
-desktop). Both "work" in the sense that they load and answer. Neither is usable.
+Not "slower". Unusable.
 
 | Build | Weights | Context | Residency | Outcome |
 | --- | ---: | ---: | --- | --- |
-| Q4_K_M | 15 GB | 16k | 31%/69% CPU/GPU | correct code, truncated before writing a report |
-| UD-Q3_K_XL | 12 GB | 32k | 28%/72% | 17 GB footprint — KV alone is ~5 GB |
-| UD-Q3_K_XL | 12 GB | 16k | 15%/85% | trivial bench task: 15 min and still running (Q4 did it in 5) |
-| UD-Q3_K_XL | 12 GB | 16k | 15%/85% | **real edit task: 101 minutes, zero files written** |
+| Devstral Q4_K_M | 15 GB | 16k | 69% GPU | correct code, truncated before its report |
+| Devstral UD-Q3_K_XL | 12 GB | 32k | 72% | 17 GB footprint |
+| Devstral UD-Q3_K_XL | 12 GB | 16k | 85% | **101 minutes, zero files written** |
+| gemma4:12b | 7.6 GB | 32k | **100%** | completes in 77–149s |
 
-The last row is the one that settles it. A 15% *layer* offload did not cost 15% of throughput or
-even the 3x the bench suggested — on a task that first has to read several existing files, it
-produced nothing in an hour and forty. `llama-server` sat at 550% CPU throughout, so it was
-computing, not hung. Every token waits on the CPU-resident layers, and an editing task pays that
-cost across a far larger prompt than a greenfield one.
+The 101-minute row is the important one. `llama-server` sat at 550% CPU throughout — computing,
+not hung. A **15% layer offload** did not cost 15% of throughput; on a task that must read
+existing files before editing them, it cost everything. Every token waits on the CPU-resident
+layers, and editing pays that across a far larger prompt than greenfield work.
 
-**Rules that follow:**
+Distinguishing a working run from a hung one from outside is otherwise impossible — both show a
+live process and a flat log. Two signals resolve it:
 
-- Treat anything short of `100% GPU` in `ollama ps` as unusable for agentic work, not as
-  "slower". The relationship between offload share and wall-clock is wildly non-linear.
-- Budget KV cache seriously. For this 24B it cost roughly **5 GB at 32k** — far more than the
-  1-2 GB assumed. Weights that "fit" with 2 GB spare do not fit.
-- On a 16 GB card, a 24B is out unless the KV cache is quantised
-  (`OLLAMA_FLASH_ATTENTION=1` + `OLLAMA_KV_CACHE_TYPE=q8_0`), which would take 32k KV from ~5 GB
-  to ~2.5 GB and is the only remaining path to full residency.
-- A 12B with room beats a 24B without it, by a margin large enough that code quality is
-  irrelevant. Devstral wrote the best code of anything tested here and delivered nothing.
+- **GPU busy + log flat** → generating, be patient
+- **no model in `ollama ps` + log flat** → dead, kill it
 
-## Model selection
+---
 
-Check `ollama show <model>` for `tools` under Capabilities before anything else. Without tool
-calling the model cannot edit a file or run a command through opencode — it will produce prose
-and change nothing, scoring zero for a reason that says nothing about its coding ability.
+## 3. Context — headroom beats model quality
 
-Observed: `deepseek-coder-v2:16b` and a third-party lite quant both advertise only
-`completion` (+`insert`). Unusable as implementers regardless of how good the weights are.
+KV cache is far more expensive than it looks. For a 24B at 32k it cost roughly **5 GB**, not the
+1–2 GB assumed. Weights that "fit with 2 GB spare" do not fit.
 
-Context must be **baked into a derived model** with `PARAMETER num_ctx`. Ollama defaults `num_ctx`
-to 4096 regardless of a model's advertised ceiling, so a 262k-capable model silently truncates at
-4k. Declaring the window in opencode's model entry is not enough on its own.
+`OLLAMA_FLASH_ATTENTION=1` with `OLLAMA_KV_CACHE_TYPE=q8_0` roughly halves it — UD-Q3_K_XL's
+footprint fell from 17 GB to 15 GB at 32k. Worth setting, with one caveat below.
 
-## Open questions, to test next
+Ollama defaults `num_ctx` to **4096** regardless of a model's advertised ceiling, so a
+393k-capable model silently truncates at 4k. Declaring the window in the client's config is not
+enough; bake it into a derived model with `PARAMETER num_ctx`. A model served at 4k fails in ways
+that look like dishonesty.
 
-- Does splitting a genuinely multi-file task into sequential single-file rounds help, or does the
-  loss of context hurt more than the focus helps? Untested — the one real multi-file attempt was
-  destroyed by the stdin bug before it produced anything.
-- Does a lower temperature reduce the draft-in-file behaviour beyond what the prompt already
-  fixed?
-- Do explicit per-file instructions ("create exactly this file, with exactly these methods") beat
-  a descriptive plan for a 12B?
+**The trade-off that decides model choice:** Devstral 24B wrote the best code of anything tested,
+hosted models included — a single-pass `sed -E 's/[^a-z0-9]+/-/g'` where Gemma needed two steps.
+It delivered nothing, because 15 GB of weights forced context down until the agent loop ran out
+of room. **A smaller model with room to work beats a better model that is starved.**
+
+> Unresolved: gemma scored 5/5 in 77s before KV quantisation and a context cut, then 4/5 in 149s
+> after. Two variables changed at once — a design mistake. Quantised KV plausibly costs output
+> fidelity, and structured output is where precision loss would show first, but that is untested.
+
+---
+
+## 4. Failure modes, with evidence
+
+### It reports success it did not achieve
+
+The one to fear. A round returned `status: complete`, **zero deviations, zero blockers**, and
+claimed the migration ran, the tests passed and the UI was updated. In fact the migration was a
+**single line of literal `\n` characters** — a parse error, never executed, column never created;
+a production file was left unparseable; the UI file was untouched; no tests were written.
+
+**Treat the report as untrusted metadata. Check the tree first.**
+
+### It replaces whole files, and picks the wrong one
+
+Asked to add a relation to a model and extend a service, it wrote the relation **into the
+service** and replaced the file: `PageProfiler.php` went 421 lines → 11. The code was correct;
+its destination was not.
+
+That one happened to be a parse error, so a syntax gate caught it. **Luck.** A fragment carrying
+its own `class` declaration would have been valid PHP and silently deleted 410 working lines.
+Valid code in the wrong file is worse than broken code, because nothing complains.
+
+### It writes plausible, silently wrong SQL
+
+Asked for aggregate reports over per-date rows:
+
+```php
+->whereBetween('position', [11, 20])          // filters raw rows, not AVG(position)
+->groupBy('site_url', 'query')
+->selectRaw('CAST(SUM(clicks) AS decimal(6,4)) as ctr')  // a click count labelled as a ratio
+```
+
+`WHERE` runs before `GROUP BY`, so both filters test a single day. The CTR column is not a ratio
+at all. Nothing fails to parse; the report would simply be full of confident wrong numbers.
+
+**The plan stated the `SUM(clicks)/SUM(impressions)` rule explicitly and it shipped the wrong
+version anyway.** Stating a constraint is not the same as honouring it — a constraint only a test
+can enforce needs a test, not a sentence.
+
+### Escaped newlines, in contents and in paths
+
+Files written as one line containing the two characters `\` and `n`. It also happens to
+**filenames**: a real file named `OpportunityReport.php` with a trailing newline, invisible to
+`ls`, evading a `*.php` check, printing across two lines in `find`.
+
+### It mis-transcribes long identifiers
+
+Given `search-log-persist-total-results`, it looked for `search_log_persist_total_results`,
+failed, and reported the plan missing rather than listing the directory. Renaming to `totals.md`
+made the same round proceed. **Keep plan slugs short, ideally one word.**
+
+### It writes its reasoning into the deliverable
+
+The first artifact contained three successive implementations in one file, each commenting on the
+last: *"Correction: the above is wrong"*, *"Actually, the rule is..."*.
+
+**Fixed by rules about output, not about the task** — see below. This is the single most
+effective prompt change measured.
+
+---
+
+## 5. What actually improves results
+
+### Output discipline — 2/5 → 5/5, unchanged task
+
+Adding this section took Gemma from 2/5 to 5/5 on identical task text, *faster* than before, and
+took Devstral from 0/5 to 5/5:
+
+> The files you write are deliverables, not scratchpads. One implementation only — never leave an
+> earlier attempt beside a later one. No commentary about your own process. No alternatives kept
+> "in case". Write real newlines. Run `php -l` on each file and confirm it parses. Never report a
+> command as passing unless you ran it and saw it pass. Read each file back before finishing.
+
+Note what did **not** help: making the task smaller or more specific. The failing plan was
+already one 30-line file with five explicit criteria and exact input-to-output examples. There
+was no ambiguity left to remove. The model understood the task; it could not stop narrating.
+
+### Greenfield for the local model, edits for the hosted one
+
+Creating a file has one obvious destination. Editing requires holding a file's existing contents
+in mind and returning them unchanged apart from the edit — and a model that regenerates rather
+than patches loses everything it did not reproduce.
+
+- **Local:** new migrations, models, factories, services, views, tests.
+- **Hosted:** edits to existing files, anything touching several files at once, anything
+  statistical, anything where being wrong is silent.
+
+Greenfield is necessary but **not sufficient**: it protects the codebase from destruction, not
+the output from being wrong. The bad SQL above was in a brand-new file.
+
+---
+
+## 6. What the harness must do
+
+Every item below was added after a specific failure.
+
+**Gate the tree before reading the report.** For each changed file: does it parse; has a tracked
+file lost more than half its lines; does the path contain control characters. Revert the round if
+any fail.
+
+**Refuse to start on a dirty tree.** The model's context is already clean — each round gets a
+fresh session. The shared state is the *working tree*, and a file left dirty by a previous failed
+round is read as intended and appears in the next round's diff, framing an innocent round for
+damage it did not do. That produced a confident, wrong attribution here.
+
+**Close stdin.** `codex exec` and `opencode run` both append piped stdin when stdin is not a TTY,
+so in a background shell they block forever. Observed as a round sitting 31 minutes with a 0-byte
+log — indistinguishable from a slow model until you look for child processes.
+
+**Never `git stash push -u` then `git stash apply` as a safety net.** It restores the broken state
+you were escaping. It reintroduced an unparseable migration twice here. Archive with
+`git stash show -p > file.patch` and drop the stash.
+
+**A syntax sweep is not a contamination check.** Two contaminated files parsed perfectly; one
+silently converted a null into a zero. `git status` catches what `php -l` cannot.
+
+---
+
+## 7. Benchmarking method
+
+**A run blocked by the harness, the adapter, the config or the machine is void.** Not a model
+result, not scored, re-run after fixing the cause. Counting harness faults as model faults
+produces confident wrong conclusions, and every one here would have been: a model recorded as
+fabricating a blocker (served 4k context), one recorded as stalling (adapter blocked on stdin),
+and a whole round lost (`--force` deleting every provider's results rather than the one rerun).
+
+The test: *could a different harness, config or machine have produced a different outcome for the
+same model and prompt?* If yes, void it.
+
+A result still counts when the cause is real and outside the harness — a model exhausting context
+because the hardware cannot hold more is a **configuration result**, labelled as such, and it
+changes when the configuration does.
+
+**Isolate every attempt in its own worktree** from the same commit, or one provider inherits
+another's edits. **Run one benchmark at a time**; concurrent runs share the GPU and, with
+`OLLAMA_MAX_LOADED_MODELS=1`, evict each other's model continuously, measuring contention rather
+than models.
+
+---
+
+## 8. Setup checklist for a new model
+
+```bash
+ollama show <model> | grep -A6 Capabilities     # 'tools' present? necessary, not sufficient
+# probe: write a file, ask the model to read it, require the marker back
+printf 'FROM <model>\nPARAMETER num_ctx 32768\n' > Modelfile && ollama create <name> -f Modelfile
+ollama ps                                        # demand 100% GPU
+```
+
+Register the same context in the client's config as well as baking it. Then benchmark — and only
+then.
