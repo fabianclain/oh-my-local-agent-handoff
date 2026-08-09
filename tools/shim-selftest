@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+#
+# shim-selftest — check the tool-call shim against the failures it exists to survive.
+#
+#   tools/shim-selftest [model]
+#
+# Each check targets one measured defect rather than "does it broadly work". A guard that has not
+# been run against the exact failure it was written for is an assumption, and several of them in
+# this project turned out to be wrong. Every check below replaces a run that was once scored as a
+# model failure and was not one.
+#
+#   1. concurrency  — a single-threaded server with HTTP/1.1 keep-alive is wedged forever by the
+#                     first idle connection a pooling client leaves open. This is why gemma failed
+#                     through the old shim despite never using the promotion path.
+#   2. multi-call   — a turn carrying an edit *and* the bash command verifying it arrives as two
+#                     consecutive top-level objects. Parsing the blob whole fails on the second
+#                     with "Extra data" and promotes nothing, which the bench scored as a model
+#                     that read the files and then changed nothing.
+#   3. repair vs    — raw newlines and lone backslashes from hand-escaped source are recovered;
+#      refusal        a payload truncated mid-object is refused rather than brace-completed,
+#                     because a partial newString that parsed would silently write a partial file.
+#   4. schema       — ollama-ai-provider-v2 validates every NDJSON line against a zod schema and
+#                     drops a failing line with only a console.warn. Arguments serialised as a
+#                     JSON string (the OpenAI convention) fail it, so the tool call vanished and
+#                     the client saw an empty stream.
+#
+# Checks 2 and 3 need no model. Check 4 validates against the client's real schema, loaded from
+# opencode's own installed copy of zod, rather than a transcription trusted to be faithful.
+
+set -uo pipefail
+
+MODEL="${1:-qw3c-32k}"
+PORT="${SHIM_SELFTEST_PORT:-11511}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORK="$(mktemp -d)"
+FAILURES=0
+
+cleanup() {
+    [[ -z "${SHIM_PID:-}" ]] || kill "$SHIM_PID" 2>/dev/null
+    rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+pass() { echo "    PASS: $1"; }
+fail() { echo "    FAIL: $1"; FAILURES=$(( FAILURES + 1 )); }
+
+python3 "$HERE/toolcall-shim.py" "$PORT" >"$WORK/shim.log" 2>&1 &
+SHIM_PID=$!
+for _ in $(seq 1 20); do
+    curl -fsS --max-time 2 "http://127.0.0.1:$PORT/api/tags" >/dev/null 2>&1 && break
+    sleep 0.5
+done
+curl -fsS --max-time 2 "http://127.0.0.1:$PORT/api/tags" >/dev/null 2>&1 || {
+    echo "shim did not come up on port $PORT" >&2
+    sed -n '1,20p' "$WORK/shim.log" >&2
+    exit 1
+}
+
+echo "==> 1/4 concurrency under an idle keep-alive connection"
+python3 - "$PORT" <<'PY'
+import socket, sys, time
+port = int(sys.argv[1])
+held = socket.create_connection(("127.0.0.1", port), timeout=10)
+held.sendall(b"GET /api/tags HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n")
+time.sleep(1)
+held.recv(65536)
+# The held socket stays open, exactly as a pooling client leaves it.
+try:
+    second = socket.create_connection(("127.0.0.1", port), timeout=8)
+    second.sendall(b"GET /api/tags HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    if not second.recv(64):
+        raise RuntimeError("second connection returned nothing")
+except Exception as exc:
+    print(f"second connection blocked: {type(exc).__name__}: {exc}")
+    sys.exit(1)
+finally:
+    held.close()
+PY
+[[ $? -eq 0 ]] && pass "a second connection is served while one sits idle" \
+               || fail "one idle connection blocks the next — server is not threaded"
+
+echo "==> 2/4 several tool calls in one turn are all promoted"
+# No model needed: this is the exact shape Qwen3-Coder returned -- an edit call and the bash
+# command verifying it, as consecutive top-level objects. Parsing the blob whole fails on the
+# second with "Extra data" and promotes nothing, which the harness scored as a model that changed
+# no files. The braces inside the PHP snippet are the reason the scan must be string-aware.
+python3 - "$HERE/toolcall-shim.py" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("shim", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+payload = (
+    '{"name": "edit", "arguments": {"filePath": "a.php", '
+    '"oldString": "public function f(): int { return 1; }", '
+    '"newString": "public function f(): int { return 2; }"}}\n'
+    '{"name": "bash", "arguments": {"command": "php -l a.php"}}\n'
+)
+calls = m.extract(payload, {"edit", "bash"})
+names = [c["name"] for c in calls]
+if names != ["edit", "bash"]:
+    print(f"  expected ['edit', 'bash'], got {names}")
+    sys.exit(1)
+if not all(isinstance(c["arguments"], dict) for c in calls):
+    print("  arguments were not objects")
+    sys.exit(1)
+PY
+[[ $? -eq 0 ]] && pass "both calls promoted, arguments are objects" \
+               || fail "a multi-call turn loses calls — the round scores as 'changed nothing'"
+
+echo "==> 3/4 malformed JSON is repaired, truncated JSON is refused"
+# Two opposite requirements, and the second is the important one.
+#
+# Repair: a model hand-escaping PHP into a JSON string emits raw newlines and lone backslashes
+# (`Bench\Fixture`). Intent is unambiguous, so those are recovered.
+#
+# Refuse: a payload that simply stops mid-object must NOT be completed by adding braces. A
+# truncated newString that parsed would replace a file with a partial copy — valid code, silently
+# wrong, which is the worst failure class in this project. It has to fail loudly instead.
+python3 - "$HERE/toolcall-shim.py" <<'PY'
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("shim", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+
+ok = True
+
+valid = json.dumps({"name": "edit", "arguments": {
+    "a": "line1\nline2", "b": 'q " here', "c": "tab\there", "d": "back\\slash"}})
+if m.escape_stray_backslashes(valid) != valid or m.loads_tolerant(valid) != json.loads(valid):
+    print("  valid JSON was altered by the repair path"); ok = False
+
+# raw newline in a string, plus a lone backslash — both recoverable
+malformed = ('{"name": "edit", "arguments": {"filePath": "a.php",'
+             ' "oldString": "namespace Bench\\Fixture;\nclass A {}"}}')
+got = m.extract(malformed, {"edit"})
+if len(got) != 1 or "Bench\\Fixture" not in got[0]["arguments"].get("oldString", ""):
+    print(f"  malformed-but-recoverable call was not repaired: {got}"); ok = False
+
+# same payload with the final brace missing — must not be completed
+truncated = malformed[:-1]
+if m.extract(truncated, {"edit"}):
+    print("  a TRUNCATED payload was promoted — partial newString could reach a file"); ok = False
+
+sys.exit(0 if ok else 1)
+PY
+[[ $? -eq 0 ]] && pass "escaping repaired, truncation refused" \
+               || fail "repair/refusal boundary is wrong"
+
+echo "==> 4/4 promoted tool call survives the client's zod schema"
+printf 'MARKER-7Q4X\n' >"$WORK/probe.md"
+curl -s --max-time 900 "http://127.0.0.1:$PORT/api/chat" -H 'Content-Type: application/json' -d "{
+  \"model\": \"$MODEL\", \"stream\": true,
+  \"messages\": [{\"role\": \"user\", \"content\": \"Read the file $WORK/probe.md using the read tool.\"}],
+  \"tools\": [{\"type\": \"function\", \"function\": {\"name\": \"read\",
+    \"description\": \"Read a file\",
+    \"parameters\": {\"type\": \"object\", \"properties\": {\"filePath\": {\"type\": \"string\"}},
+                     \"required\": [\"filePath\"]}}}]
+}" >"$WORK/out.ndjson"
+
+if [[ ! -s "$WORK/out.ndjson" ]]; then
+    fail "shim returned no body for $MODEL"
+elif ! grep -q '"tool_calls"' "$WORK/out.ndjson"; then
+    fail "no tool call was promoted for $MODEL (model may not have emitted one)"
+else
+    ZOD="$HOME/.cache/opencode/packages/ollama-ai-provider-v2/node_modules/zod/v4/index.js"
+    if [[ ! -f "$ZOD" ]]; then
+        fail "opencode's zod not found at $ZOD — cannot validate against the real schema"
+    else
+        cat >"$WORK/validate.js" <<EOF
+const { z } = require("$ZOD");
+EOF
+        cat >>"$WORK/validate.js" <<'EOF'
+const fs = require("fs");
+// baseOllamaResponseSchema2, transcribed from ollama-ai-provider-v2 dist/index.js. This is the
+// schema createNdjsonStreamResponseHandler applies to each line before enqueueing it.
+const S = z.object({
+  model: z.string(), created_at: z.string(), done: z.boolean(),
+  message: z.object({
+    content: z.string(), role: z.string(), thinking: z.string().optional(),
+    tool_calls: z.array(z.object({
+      function: z.object({ name: z.string(), arguments: z.record(z.string(), z.any()) }),
+      id: z.string().optional(),
+    })).optional().nullable(),
+  }),
+  done_reason: z.string().optional(), eval_count: z.number().optional(),
+  eval_duration: z.number().optional(), load_duration: z.number().optional(),
+  prompt_eval_count: z.number().optional(), prompt_eval_duration: z.number().optional(),
+  total_duration: z.number().optional(),
+});
+let bad = 0, withCalls = 0;
+fs.readFileSync(process.argv[2], "utf8").split("\n").filter(l => l.trim()).forEach((l, i) => {
+  const parsed = JSON.parse(l);
+  const r = S.safeParse(parsed);
+  if (parsed?.message?.tool_calls?.length) withCalls++;
+  if (!r.success) { bad++; console.log(`  line ${i + 1} would be DROPPED: ${JSON.stringify(r.error.issues)}`); }
+});
+if (bad > 0) process.exit(1);
+if (withCalls === 0) { console.log("  no line carried a tool call"); process.exit(1); }
+EOF
+        if node "$WORK/validate.js" "$WORK/out.ndjson"; then
+            pass "every line validates and one carries a tool call with object arguments"
+        else
+            fail "the client would drop a line — the tool call never reaches it"
+        fi
+    fi
+fi
+
+echo
+if [[ "$FAILURES" -eq 0 ]]; then
+    echo "shim self-test: all checks passed"
+else
+    echo "shim self-test: $FAILURES check(s) failed"
+fi
+exit "$FAILURES"
