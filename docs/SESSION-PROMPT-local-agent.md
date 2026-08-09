@@ -5,12 +5,12 @@ Paste this to start a session focused only on driving local models through agent
 ---
 
 I want to work on using a **local model as the implementation agent** in agent-handoff, and
-nothing else. Do not touch the monolith application code — the SEO tool work is a separate track.
+nothing else. Do not touch the host application's own code — that is a separate track.
 
 
 ## Read these first
 
-All paths relative to `~/dev/monolith/agent-handoff` unless noted.
+All paths relative to the agent-handoff checkout unless noted.
 
 | File | What it is |
 | --- | --- |
@@ -26,7 +26,7 @@ All paths relative to `~/dev/monolith/agent-handoff` unless noted.
 | `docs/usage.md` | General agent-handoff usage, provider selection |
 | `providers/*.sh` | `ollama.sh` is the base; `gemma.sh`, `dvq3s.sh`, `dvq3xl.sh`, `dvq4.sh`, `qwen.sh`, `devstral.sh` are labels over it |
 
-In the parent repo (`~/dev/monolith`):
+In the host project that agent-handoff drives (its `.handoff/bin/`, if you keep helpers there):
 
 | File | What it is |
 | --- | --- |
@@ -85,7 +85,7 @@ Most "model failures" were these. Worth reading `bench/COMPARISON.md` for the de
 
 ## Where things are
 
-Repo: `~/dev/monolith/agent-handoff` (its own git repo, public, MIT).
+Repo: the agent-handoff checkout (its own git repo, public, MIT).
 Read `docs/local-models.md` first — it is the accumulated findings and it is accurate.
 Then `bench/COMPARISON.md` for the run-by-run record and the method rules.
 
