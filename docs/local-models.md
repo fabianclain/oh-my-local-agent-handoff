@@ -11,22 +11,42 @@ which confident conclusions turned out to be harness bugs.
 
 ## The short version
 
-A local model **can** do real work in this pipeline, within a narrow band:
+> **The serving engine is a gate, not an implementation detail.** gpt-oss through ollama scored
+> 1/3 with malformed tool calls; the same official weights through llama.cpp scored 4/4, and then
+> **4/4 on a nine-criteria multi-file task, every run first-attempt** — a plan gemma scores 0/9 on.
+> Nothing about the model changed. Before concluding anything about a local model, know which
+> engine served it. See §7b.
 
-- **Creating new files** — migrations, models, factories, plain services. Gemma 4 12B: 2 for 2,
-  needing no correction.
-- **Not editing existing files.** Same model, 0 for 5. It regenerates rather than patches, and
-  what it does not reproduce is lost.
-- **Not anything statistical.** Aggregate SQL, ratios, anything where a plausible answer and a
-  correct answer look identical on review.
+Two local models do real work in this pipeline:
 
-Three things gate usability, in this order. Each is cheap and each has produced a wrong verdict
-when skipped:
+- **gpt-oss:20b** writes the best patches measured here — 3 of 5 runs deleted exactly one line,
+  the one being changed. Roughly twice gemma's throughput per token, but it spends a long
+  reasoning channel before acting, so it is slower in wall clock.
+- **gemma4:12b @96–128k** is the most reliable at completing at all, and the least clean: it
+  damages the line next to its insertion point in a majority of runs.
+- **Neither can be trusted without a byte-identical check** on the regions the plan did not name.
+  Their defects pass the functional tests.
+- **Nothing statistical.** Aggregate SQL, ratios, anything where a plausible answer and a correct
+  answer look identical on review.
 
-1. **Does it emit native tool calls?** Not "does `ollama show` list `tools`" — actually probe it.
-2. **Is it 100% resident on the GPU?** Below that, treat as unusable rather than slow.
-3. **Does it have context headroom?** An agent loop spends context on file reads and tool
-   results before it writes anything you can verify.
+> An earlier version of this section said local models create files well and cannot edit them at
+> all. That was superseded by measurement: they patch rather than regenerate, and the real defect
+> is mis-locating the insertion point.
+
+Five things gate usability. Each is cheap, and each has produced a wrong verdict when skipped:
+
+0. **Which engine serves it?** Ollama and llama.cpp are not interchangeable for a model whose
+   tool-call format the engine has to parse. This one was discovered last and should have been
+   checked first.
+
+1. **Does it emit native tool calls?** Not "does `ollama show` list `tools`" — probe it, and probe
+   it more than once. A single blank probe was read as a rejection for a model that works.
+2. **Is the packaging sound?** Read the chat template and the stop list. Three models here were
+   blocked by packaging rather than capability.
+3. **How much residency does the window cost?** Below 100% is a throughput tax of roughly the
+   layers moved, not an automatic cliff — but measure it, because one model did lose everything.
+4. **Which client?** There is no best one. Cline drives its own tool loop and rescues models that
+   cannot emit native calls; it also fails to parse gpt-oss, which opencode handles fine.
 
 ---
 
@@ -42,9 +62,12 @@ Probed with a file on disk and a prompt to read it:
 | gemma4:12b-128k | gemma4 | ollama library | **native tool calls** |
 | devstral-small-2:24b | mistral3 | ollama library | **native** |
 | Devstral Q3_K_S / UD-Q3_K_XL | mistral3 | HF GGUF | **native** |
-| qwen2.5-coder:14b | qwen2 | ollama library | text |
+| qwen2.5-coder:14b | qwen2 | ollama library | text — **native via shim** |
+| Qwen3-Coder-30B-A3B | qwen3 | HF GGUF | text — **native via shim** |
 | JanusCoder-14B | qwen3 | HF GGUF | text |
 | gemma-4-12B-coder-fable5 | gemma4 | HF GGUF | text |
+| gpt-oss-20b-Coding-Distill | gpt-oss | HF GGUF | **native once repackaged** — see below |
+| gpt-oss:20b | gpt-oss | ollama library | **native** |
 
 A failing model returns something like:
 
@@ -98,20 +121,95 @@ call out of `content`, and promotes it into `tool_calls`. It only promotes a cal
 matches a tool the request actually offered, so incidental JSON in prose is untouched. Verified
 with curl for both qwen models: `tool_calls: PRESENT`.
 
-**It does not yet work inside opencode.** Three streaming shapes were tried; the last emits
-NDJSON matching ollama's own format (content chunk with `done:false`, terminator with `done:true`
-and an empty message) and opencode still returns nothing. Decisively, **gemma also fails through
-the shim** while working directly — so the fault is the shim, not the Qwen models.
+**It now works inside opencode.** Qwen3-Coder-30B-A3B returns a real `tool_use` with
+`status: completed` and the file's contents, and gemma — the control that previously failed
+through the shim — works through it too.
 
-Two better routes than reverse-engineering ollama's wire format from the outside: read what
-`ollama-ai-provider-v2` actually parses, or point the client at an OpenAI-compatible endpoint
-(llama.cpp's server offers one) where the contract is specified rather than inferred.
+Getting there needed the route that was recommended over guessing: read what
+`ollama-ai-provider-v2` actually parses. Two independent bugs were found, and the distinction
+matters because both produced the identical symptom of opencode hanging with no error and no
+output.
+
+**Bug 1 — `arguments` must be an object, not a JSON string.** The OpenAI wire format serialises
+tool-call arguments; ollama's does not. The provider validates every NDJSON line against a zod
+schema declaring `arguments: z.record(z.string(), z.any())`, and
+`createNdjsonStreamResponseHandler` *drops* a failing line with nothing but a `console.warn`. The
+shim wrote arguments the OpenAI way, so the line carrying the tool call vanished and the client
+saw a stream containing only its terminator. Confirmed by running the shim's real output through
+that exact schema, loaded from opencode's own installed zod:
+
+```
+line 1: DROPPED -> expected record, received string   (the tool call)
+line 2: VALID                                         (the terminator)
+```
+
+**Bug 2 — the proxy must be threaded.** `HTTPServer` serves one connection at a time and
+`protocol_version = "HTTP/1.1"` keeps connections alive, so a single idle connection — which any
+pooling client leaves open — blocks every later connection indefinitely. Measured against the old
+shim: a second connection opened while the first sat idle received nothing and timed out after 8s.
+
+**This corrects a conclusion recorded here.** "Gemma also fails through the shim, so the fault is
+the shim" was the right verdict reached through the wrong single cause. Gemma emits native tool
+calls and never touches the promotion path at all; it was being felled by bug 2, sitting
+underneath bug 1. Fixing only the visible bug would have left the shim broken and looked like
+proof the approach could not work.
+
+`tools/shim-selftest` checks both, each against the exact failure it targets, rather than asking
+whether the shim broadly works.
+
+
+### gpt-oss-20b-Coding-Distill — two packaging defects, then a real one
+
+`hf.co/mradermacher/gpt-oss-20b-Coding-Distill-i1-GGUF:Q3_K_M` returned an empty string to every
+prompt: no content, no tool call, no thinking, three tokens generated. That is not a model
+verdict, and the void rule says find the cause before recording one.
+
+**Defect 1 — the chat template is corrupted.** It renders the user turn as
+
+```
+{{ if .Prompt }}tart|>user<|message|>{{ .Prompt }}<|end|>{{ end }}
+```
+
+`tart|>` — the leading `<|s` is missing from `<|start|>`. The assistant turn then opens with
+`<|message|>` directly, skipping the `<|channel|>` that harmony requires.
+
+**Defect 2 — the stop list contains `<|message|>`.** Ollama derives stop strings from the
+template, so the corruption propagated: the parameters include both `<|message|>` and the same
+mangled `tart|>user<|message|>`. Generation halts at the first message delimiter, which is why
+nothing ever came back.
+
+Both are repairable. Build from the **raw GGUF blob** with ollama's official harmony template
+harvested from `gpt-oss:20b` — not `FROM` the ollama model, because `PARAMETER stop` appends and
+the broken stops are inherited, whereas building from the blob re-derives them from the correct
+template. After that the model advertises `tools`, generates normally, and is **100% GPU resident
+at 32k** with 1.6 GB spare.
+
+**After the repair it passes the tool-call gate**, emitting a native call:
+
+```json
+{"name": "read", "arguments": {"filePath": "/tmp/probe.md"}}
+```
+
+Official `gpt-oss:20b` behaves the same and is also 100% resident, so it makes a useful control
+for whether the distill fine-tune costs anything.
+
+> **A wrong verdict recorded here, and how it happened.** This model was first written up as
+> failing the tool-call gate "and not from confusion" — its reasoning trace said *"Use the
+> `commentary` channel for tool calls"* and then appeared to stop. That was wrong. The first probe
+> gave the tool a terse one-line description and drew a blank; the follow-up probe actually
+> returned `tool_calls` in the message, and the value was never printed before the reasoning trace
+> was read as the whole story.
+>
+> One probe is not a gate. The probe in `.handoff/bin/setup-local-model` requires a marker to come
+> back through a real tool execution precisely so that a blank cannot be mistaken for a refusal —
+> reading a raw API response by eye bypasses that and is how this went wrong.
 
 ---
 
-## 2. Residency — below 100% GPU, treat it as unusable
+## 2. Residency — a partial offload costs throughput, and sometimes everything
 
-Not "slower". Unusable.
+This section used to read *"below 100% GPU, treat it as unusable — not slower, unusable"*. That was
+too strong, and round 5 disproved it.
 
 | Build | Weights | Context | Residency | Outcome |
 | --- | ---: | ---: | --- | --- |
@@ -119,11 +217,23 @@ Not "slower". Unusable.
 | Devstral UD-Q3_K_XL | 12 GB | 32k | 72% | 17 GB footprint |
 | Devstral UD-Q3_K_XL | 12 GB | 16k | 85% | **101 minutes, zero files written** |
 | gemma4:12b | 7.6 GB | 32k | **100%** | completes in 77–149s |
+| gpt-oss:20b | 13 GB | 128k | **84%** | **7/7 in 60s**, and again 7/7 in 406s |
 
-The 101-minute row is the important one. `llama-server` sat at 550% CPU throughout — computing,
-not hung. A **15% layer offload** did not cost 15% of throughput; on a task that must read
-existing files before editing them, it cost everything. Every token waits on the CPU-resident
-layers, and editing pays that across a far larger prompt than greenfield work.
+The last two rows are the point. At essentially the same offload — 85% and 84% — one model wrote
+nothing for an hour and a half and another produced a byte-perfect patch in a minute.
+
+**What the offload reliably costs is throughput, roughly in proportion to the layers moved.**
+Measured on gpt-oss with everything else held constant: **61 tok/s at 100% GPU, 43 tok/s at 84%**.
+That is a ~30% tax, not a cliff.
+
+So Devstral's collapse was not "15% offload" as a general law. It was that model, that
+quantisation, or the far larger prompt an editing task builds on a 24B — and the evidence never
+separated them. Treat residency as a **cost to price in**, and measure the specific model rather
+than assuming the cliff.
+
+One thing the offload did **not** buy was reliability: 2/5 against 1/5 at n=5 is a single run, and
+the extra context it unlocked was never used (peak 17k of 131k granted). Buy an offload for
+context you will actually consume, not on faith.
 
 Distinguishing a working run from a hung one from outside is otherwise impossible — both show a
 live process and a flat log. Two signals resolve it:
@@ -308,6 +418,29 @@ you were escaping. It reintroduced an unparseable migration twice here. Archive 
 **A syntax sweep is not a contamination check.** Two contaminated files parsed perfectly; one
 silently converted a null into a zero. `git status` catches what `php -l` cannot.
 
+**Score an empty diff as zero.** "The file parses" passes trivially on an unmodified tree, so a
+run that did nothing collected 1/6 rather than 0/6 and sat above the floor in the results table.
+Devstral scored exactly that way six times out of six while changing zero bytes. A criterion a
+do-nothing run can satisfy is not measuring the model. `bench/run` now forces criteria to zero on
+an unchanged tree and reclassifies a `complete` report over an untouched tree as `false-success`,
+so fabrication is counted as fabrication rather than as a weak pass.
+
+**Enforce the patch-only contract in the harness, because the client will not.** A tracked file
+that loses more than half its lines, or whose change removes more lines than the file originally
+had, is treated as regenerated rather than patched and the round is not green.
+
+> Tested and does not work: **opencode's permission config does not block tools in `run` mode.**
+> A project-level `opencode.json` with `"write": "deny"` was ignored — the file was created. So
+> was `"edit": "deny"`. Preventive tool restriction is therefore unavailable in opencode 1.17.4,
+> and patch-only has to be detection-and-reject after the round rather than prevention during it.
+> Worth re-testing on a later version before assuming it still holds.
+
+**Keep three prompt layers apart.** Benchmark findings (this file) are for the maintainer and are
+never shown to a model under test — telling a model which mistakes it is expected to make
+contaminates the measurement. `templates/agent-rules.md` is a short, task-independent operational
+prompt sent as developer instructions. The plan is the task and only the task. Only the rule
+headings from the rules file travel to the model; the rationale table stays behind.
+
 ---
 
 ## 7. Benchmarking method
@@ -332,10 +465,216 @@ than models.
 
 ---
 
-## 8. Setup checklist for a new model
+## 7b. How gpt-oss tool calling actually fails
+
+Worth its own section because four plausible explanations were wrong before the real one turned
+up, and each wrong one was stated confidently.
+
+**The error belongs to ollama, not the client.** `error parsing tool call: raw='{"input":"*** Begin
+Patch..."}]'` is an **HTTP 500 from ollama**, which the client merely relays. Reproduced with a
+plain `urllib` call and no client anywhere in the picture —
+`tools/repro-ollama-toolcall-500.py`. Ollama fails to parse a tool call **its own model just
+generated**.
+
+**What the model emits is array-wrapped.** The payload is `[{"input": "..."}]`; ollama consumes
+the object and then trips on the trailing `]`, hence *"invalid character ']' after top-level
+value"*.
+
+**Three conditions must coincide.** Remove any one and it stops:
+
+1. an `apply_patch`-style tool — one freeform string argument carrying a whole patch,
+2. a conversation already containing an assistant tool call and a substantial tool result,
+3. a long tool description.
+
+**The description is a measurable trigger.** Same model, same conversation, varying only that
+string:
+
+| `apply_patch` description | API-level failures |
+| --- | ---: |
+| Cline's shipped text, 1224 B with worked examples | **2/5** |
+| a 105 B replacement | **0/5** |
+
+End to end through Cline, with the proxy shortening it: **3/4 runs produced a correct patch against
+a 1/3 baseline**. Parse errors still occur; what changes is that the model recovers within the
+client's retry budget instead of giving up. So this is mitigation, not a cure.
+
+**Why opencode is unaffected.** It ships no `apply_patch`. gpt-oss tries it anyway, opencode
+rejects it as unknown, and the model falls back to small `edit` calls of 22–181 B that never hit
+the bug. That is luck of tool inventory, not superior handling.
+
+### llama.cpp does not reproduce it — the engine is the boundary
+
+Same official weights (`ggml-org/gpt-oss-20b-GGUF`, MXFP4), same `apply_patch` schema including the
+1224-byte description, same multi-turn conversation, served by `llama-server` b10331 with `--jinja`:
+
+| | ollama | llama.cpp |
+| --- | ---: | ---: |
+| Tool calls valid at the API | 2/5 malformed, HTTP 500 | **8/8 valid** (incl. 693/717/818 B) |
+| Correct patch through Cline | 1/3 | **4/4** |
+| Multi-file plan, nine criteria | not reached | **4/4 at 9/9, all first attempt** |
+| Generation throughput | 61 tok/s | 60 tok/s (n=94) |
+
+Throughput is a **wash** — an earlier claim of ~20% faster came from two unrepresentative log
+lines and is withdrawn. The engine buys correctness, not speed.
+
+**Consequences, all of which reverse earlier conclusions here:**
+
+- Every gpt-oss result obtained through ollama is **void** as a model measurement, including the
+  offload comparison, which is therefore unresolved again.
+- "gpt-oss is client-fragile" is withdrawn. It is *ollama*-fragile.
+- The proposal to replace freeform `apply_patch` with small targeted edits is **withdrawn**. The
+  identical tool and payload sizes work once the serving layer is correct; changing tool inventory
+  now would add a variable for no measured benefit.
+- The missing piece was a protocol boundary between client and model, and it already exists —
+  llama.cpp provides it. No harmony shim needs writing. The adapter's job is narrow: pin the server
+  configuration, health-check it, keep logs, run a conformance probe, and map provider errors into
+  the result taxonomy.
+
+**Pin the pairing.** "gpt-oss" now names several serving stacks that behave differently, so every
+run records engine, build, model-file digest, context, KV type, GPU layers, client, client version,
+reasoning level and tool-schema identity (`manifest.json` per result). Without that, the next
+provider regression gets attributed to the model — the exact mistake this section undoes.
+
+### Four explanations that were wrong
+
+Each was plausible, each was measured, each failed:
+
+| Hypothesis | How it died |
+| --- | --- |
+| Argument size breaks serialisation | 2,858 B parsed fine; failures happen at 700 B |
+| Tool-list bloat (18 of 25 tools are `team_*`) | Stripped them — 2 of 3 runs still failed |
+| `think: false` on a reasoning model | 1/3 with reasoning on, 1/3 with it off |
+| Cline's response parser | Reproduced against ollama's API with no client present |
+
+The lesson is the project's own rule, applied to a component rather than a run: a symptom seen
+only through a client says nothing about where the defect lives until it is reproduced without one.
+
+---
+
+## 8. What has been tried, and what it was worth
+
+Ranked by measured effect, not by how good the idea sounded.
+
+### Worked
+
+| Change | Effect |
+| --- | --- |
+| **Output-discipline rules in the prompt** | Gemma 2/5 → 5/5 on unchanged task text, and faster. Devstral 0/5 → 5/5. Still the single most effective change measured. |
+| **Turning reasoning off under Cline** | Gemma 0/7 → **7/7**, 801 s → 95 s, three context-limit hits → none. One flag. |
+| **Per-model context sizing** | Gemma 32k → 96k recovered 4/5 → 5/5. Under Cline, forcing 128k past its hardcoded 32k removed the failure entirely. |
+| **Repackaging a broken GGUF** | gpt-oss Coding-Distill returned an empty string to every prompt; rebuilt from the raw blob with a correct template it generates, calls tools and is 100% resident. |
+| **A tool-call shim** | Took the Qwen family from "cannot drive the harness at all" to running. Three separate bugs had to be fixed before it worked. |
+| **Scoring an empty diff as zero** | Turned two fabricated successes from a middling `complete 1/6` into `false-success 0/7`. |
+| **A byte-identical criterion on unnamed regions** | Catches both collateral-damage variants automatically — gemma deleting the adjacent declaration and gpt-oss merging into it — which the functional tests pass straight through. |
+| **Probing before benchmarking** | Rejected three unusable models in about a minute each. |
+
+### Did not work
+
+| Attempt | Outcome |
+| --- | --- |
+| **Updating ollama, and llama.cpp with `--jinja`** | Neither fixes text-format tool calls. The format is the model's. |
+| **Devstral at any quantisation** | Six surgical runs, zero bytes changed, three of them reporting `complete`. |
+| **opencode permission config as patch-only enforcement** | `write: deny` and `edit: deny` in a project-level config were both ignored; the file was created regardless. Preventive tool restriction is unavailable, so patch-only is enforced by detection and rejection instead. |
+| **Cline's `openai-compatible` path** | Avoids the forced `num_ctx`, but qwen and gpt-oss both fail on it. Only gemma survives. |
+| **Cline `--data-dir` for isolation** | Enables a sandbox mode that strips the shell: `ls -la` came back as `Executable not found in $PATH`. Use `--config`. |
+| **Cline `--id` for session resume** | Incompatible with `--json` plus a prompt. Declared native on the strength of the help text; it had never been exercised. |
+| **A global 128k window** | Sound for gemma (100% resident, 5 GB spare), pushes gpt-oss to 83% and qwen to 74% — where qwen's probe fails outright. Context must be per-model. |
+| **Auto-completing truncated tool calls** | Deliberately *not* done. Brace-balancing a truncated payload would turn two failures into passes and let a partial `newString` replace a file with a valid-looking partial copy. |
+
+### Still unresolved
+
+- **Did `q8_0` KV cost quality?** Never varied independently of context.
+- **Why did Devstral Q3_K_S time out at 16k** after completing the same task in 39 s at 32k?
+- **Why does Cline lose the final assistant message** on runs whose patch is perfect? Several
+  rounds produced a byte-perfect tree and no report at all.
+- **Is Qwen3-Coder usable?** It passed the Cline gate once and then failed a trivial file-read
+  probe three times in four. One clean surgical patch, and nothing reproducible around it.
+
+---
+
+## 9. Harness improvements
+
+### Landed
+
+| Change | What it fixed |
+| --- | --- |
+| Empty diff scores zero; `complete` over an untouched tree becomes `false-success` | Two fabricated successes were scoring a middling `complete 1/6` |
+| Patch-only gate — over half a file's lines lost, or more removed than existed | Whole-file regeneration passed silently |
+| Checklist and command counts must match | `surgical-discount` capped every model at 2/6 by construction |
+| Plan asserted readable in the worktree before the run | "Plan file does not exist" has been both true and fabricated |
+| Driver runs in its own process group, killed as a group | An orphaned agent CLI outlived a timeout and competed with the next repetition |
+| Adapter logs stream to disk as they arrive | A timed-out run preserved no provider log at all |
+| Repair loop, capped at 3 attempts, fed the harness's own failing-command list | First-pass success was the only thing measurable |
+| Per-result `manifest.json` — engine, build, model digest, context, KV, client, reasoning | "gpt-oss" names several serving stacks that behave differently |
+| Byte-identical criterion on unnamed regions | Catches collateral damage that functional tests pass straight through |
+
+### Open, roughly by value per hour
+
+**1. A conformance gate for the serving stack.** The highest-value item. Turn
+`tools/repro-ollama-toolcall-500.py` into an engine-neutral probe — first-turn call, a call after
+a substantial tool result, the real `apply_patch` schema, short/medium/~1 KB arguments, streamed
+and non-streamed, a reused connection — and run it whenever the engine build, GGUF, template,
+client version, context or tool-schema hash changes. That converts "llama.cpp works today" into an
+enforced property. Without it, a silent engine regression is indistinguishable from a model
+regression, which is precisely the trap this project just spent a long time in.
+
+**2. A result taxonomy that does not collapse.** Four outcomes are currently flattened toward one:
+
+- protocol failed before execution
+- protocol fine, patch wrong
+- protocol fine, patch correct, **final report missing** ← several perfect trees scored as failures
+- protocol fine, patch correct, reported
+
+The third is a re-ask; the second needs a human. On a cost-to-accepted-patch metric they are
+nothing alike, and today both read as `report-unparseable`.
+
+**3. Cost to an accepted patch.** The metric the project exists to optimise, still not computed.
+Attempts, wall clock, throughput and context are all recorded now; nothing multiplies them.
+
+**4. Criterion 7 cannot see a mis-placed insertion.** It verifies no original line was deleted or
+altered, and gemma once split a method signature from its body by inserting *between* lines —
+which passed. Asserting original lines keep their relative order would close it.
+
+**5. `providers/opencode.sh` still buffers its log** and loses it on timeout, exactly as the Cline
+adapter did before that was fixed.
+
+**6. Raise repetitions to 15+** for a model that survives screening. Most gaps reported at n=5 here
+are one or two runs wide.
+
+**7. A semantic-risk task class** — aggregate SQL, money, dates, permissions, concurrency — where a
+plausible wrong answer is indistinguishable from a right one on review.
+
+**8. Investigate the missing final message.** Several runs produce a byte-perfect tree and no
+report at all, under both gemma and gpt-oss. It is the single most common non-model failure left.
+
+---
+
+## 9b. Model and engine work
+
+- **Does reasoning help once it has room, and what does it cost?** Reasoning off won decisively at
+  32k, but that comparison was confounded by the window, and under ollama it was buried in engine
+  noise. Measurable for the first time now that the tool-call path is clean.
+- **Re-run the residency/offload question.** Its only evidence came through ollama and is void.
+- **Isolate ollama's defect to rendering or parsing** before proposing a patch. Capture the raw
+  generated stream from each engine at the same boundary — llama.cpp with `--skip-chat-parsing`,
+  ollama immediately before `builtinParser.Add`. If only ollama's stream contains the array, the
+  fault is upstream of the parser and an "unwrap arrays" fix would be wrong.
+- **Report the two GGUF packaging bugs upstream.** unsloth's Qwen3-Coder ships a Qwen2.5-era
+  template; mradermacher's gpt-oss Coding-Distill ships a template with a literal typo and a stop
+  list that halts generation after three tokens. Both silently degrade the model for everyone.
+- **Try Qwen3-Coder at a larger quantisation** if the card ever allows it. Q2_K is aggressive and
+  its one clean patch was as good as anything measured.
+- **Test-first delegation** — hosted model writes the acceptance tests, local model iterates to
+  green — remains the most promising token-saving structure and is still untried.
+
+---
+
+## 10. Setup checklist for a new model
 
 ```bash
 ollama show <model> | grep -A6 Capabilities     # 'tools' present? necessary, not sufficient
+ollama show --template <model>                  # read it — corruption here looks like incapacity
+ollama show --parameters <model>                # a stop string that appears mid-turn kills output
 # probe: write a file, ask the model to read it, require the marker back
 printf 'FROM <model>\nPARAMETER num_ctx 32768\n' > Modelfile && ollama create <name> -f Modelfile
 ollama ps                                        # demand 100% GPU
@@ -343,3 +682,27 @@ ollama ps                                        # demand 100% GPU
 
 Register the same context in the client's config as well as baking it. Then benchmark — and only
 then.
+
+**Read the template and the stop list before concluding anything.** Three of the models tested
+here were blocked by packaging rather than capability, and each looked like a different kind of
+model failure from the outside: one emitted correct tool calls as text, one shipped a chat
+template for the wrong model generation, and one shipped a template with a typo plus a stop list
+that halted generation after three tokens.
+
+**Repairing a broken package.** Harvest a known-good template from a correctly packaged build of
+the same architecture and rebuild from the raw GGUF blob:
+
+```bash
+ollama show --template <good-model> > harmony.tmpl
+BLOB=$(python3 -c "import json;print([l['digest'].replace(':','-') for l in \
+  json.load(open('<manifest-path>'))['layers'] if l['mediaType'].endswith('.model')][0])")
+{ echo "FROM /usr/share/ollama/.ollama/models/blobs/$BLOB"
+  echo 'PARAMETER num_ctx 32768'
+  printf 'TEMPLATE """'; cat harmony.tmpl; printf '"""\n'; } > Modelfile
+ollama create <name> -f Modelfile
+```
+
+Build from the **blob**, not `FROM <ollama-model>`. `PARAMETER stop` appends rather than replaces,
+so a derived model inherits the broken stop list and stays broken; building from the blob makes
+ollama re-derive the stops from the template you supplied. Verify with
+`ollama show --parameters <name>` that the bad entries are gone.

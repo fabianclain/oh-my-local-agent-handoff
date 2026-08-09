@@ -27,7 +27,12 @@ Q3_K_S now reaches 93% where nothing above 12 GB of weights previously got past 
 throughput but effectively everything: Devstral at 85% spent 101 minutes on a real edit task and
 wrote zero files, with `llama-server` at 550% CPU throughout. It was computing, not hung. Every
 token waits on the CPU-resident layers, and an editing task pays that across a much larger prompt
-than a greenfield one. Treat anything below 100% as unusable rather than slow.
+than a greenfield one.
+
+**Superseded in round 5.** gpt-oss at 84% residency produced a byte-perfect patch in 60s, so
+this is not a general law. A partial offload costs throughput roughly in proportion to the
+layers moved (61 -> 43 tok/s measured); Devstral's collapse was specific to that model or
+that task shape. See "Residency: the rule was too strong" below.
 
 ## Pipeline changes between rounds
 
@@ -245,17 +250,277 @@ should score an empty diff as zero.
 deletes the declaration adjacent to its insertion point. That is caught by a byte-identical check
 on regions the plan did not name, which is now in the harness.
 
+## Round 4 — the same surgical edit, with the harness gates that round 3 asked for
+
+Four models, five repetitions each, on `surgical-discount`. Two of these models could not be
+benchmarked at all before this round.
+
+### Harness changes since round 3, and why each was made
+
+| Change | Cause |
+| --- | --- |
+| Empty diff forces criteria to zero; `complete` over an untouched tree is recorded as `false-success` | Round 3's "the file parses" gave a do-nothing run 1/6 and put it above the floor |
+| Patch-only gate: a tracked file losing over half its lines, or removing more lines than it had, is `rewrite_violations` | The greenfield/edit split needed a mechanism, not a correlation |
+| A plan whose checklist and verification-command counts disagree is rejected | See below — this one invalidates a number quoted in round 3 |
+| The plan is asserted readable in the worktree immediately before the run | "Plan file does not exist" has been both true and fabricated, and the worktree is deleted afterwards |
+| `templates/agent-rules.md` sent as developer instructions | The owner's EDITING / COMPLETION rules, as a layer separate from the plan |
+| Tool-call shim rewritten | Three defects; see the void section |
+
+### Results
+
+Criteria are shown as *executable* checks passed. `surgical-discount` has six checklist items and
+only two commands, so 2/2 is a full pass — the raw artifacts record it as 2/6.
+
+| Provider | Run | Status | Checks | Diff | Seconds | Collateral damage |
+| --- | ---: | --- | ---: | ---: | ---: | --- |
+| gemma @96k | 1 | complete | 2/2 | 936 B | 64 | deleted `$lines` declaration |
+| gemma | 2 | complete | 2/2 | 698 B | 172 | — |
+| gemma | 3 | complete | 2/2 | 1035 B | 57 | — |
+| gemma | 4 | complete | 2/2 | 936 B | 55 | deleted `$lines` declaration |
+| gemma | 5 | complete | 2/2 | 1075 B | 70 | deleted `$lines` declaration |
+| gptoss:20b @32k | 1 | report-unparseable | 0/2 | 1286 B | 593 | **unmatched `}` — file does not parse** |
+| gptoss | 2 | complete | 2/2 | 1086 B | 151 | merged new property onto the `$lines` line |
+| gptoss | 3 | complete | 2/2 | 1023 B | 144 | — |
+| gptoss | 4 | complete | 2/2 | 882 B | 131 | — |
+| gptoss | 5 | complete | 2/2 | 932 B | 60 | — |
+| qw3c Q2_K @32k | 1 | complete | 2/2 | 1085 B | 73 | — |
+| qw3c | 2 | report-unparseable | 2/2 | 1085 B | 69 | edit correct; looped on a rejected `bash` call |
+| qw3c | 3 | report-unparseable | 0/2 | 0 B | 56 | `edit` call truncated mid-object |
+| qw3c | 4 | blocked | 0/2 | 0 B | 12 | **claimed the plan was missing, zero tool calls** |
+| qw3c | 5 | report-missing | 0/2 | 0 B | 64 | read twice, produced nothing |
+| gptossd (distill) | 1 | false-success | 0/2 | 0 B | 30 | **invented two file paths, zero tool calls** |
+| gptossd | 2 | blocked | 0/2 | 0 B | 19 | read `./handoff` three times, never listed |
+| gptossd | 3 | complete | 1/2 | 525 B | 34 | property added untyped, `subtotal()` never changed |
+| gptossd | 4 | blocked | 0/2 | 0 B | 18 | one `glob`, then gave up |
+| gptossd | 5 | false-success | 0/2 | 0 B | 12 | — |
+
+### The metric that matters: a complete run whose diff is also clean
+
+"Complete" counts a run that damaged an untouched line. Reading every diff by hand:
+
+| Model | Complete | **Clean patch** | Median | Fabrications |
+| --- | ---: | ---: | ---: | ---: |
+| gptoss:20b | 4/5 | **3/5** | 144 s | 0 |
+| gemma4:12b | **5/5** | 2/5 | 64 s | 0 |
+| qw3c 30B-A3B Q2_K | 1/5 | 1/5 | 69 s | 1 |
+| gptossd distill | 1/5 | 0/5 | 30 s | 2 |
+
+**gpt-oss:20b writes the best patches measured in this project.** Three runs deleted exactly one
+line — the line being changed — with correct typing, and it avoided the double-counting trap every
+time. It costs roughly twice gemma's wall-clock, because harmony spends a long analysis channel
+before acting, and it produced one file that did not parse. It never claimed success it had not
+earned: run 1 failed loudly.
+
+**Gemma is the most reliable and the least clean.** Five completions out of five, and the
+neighbouring declaration deleted in three of them. Round 3 recorded that defect as reproducible on
+2 for 2; at n=5 it is 3/5, and the earlier sample could not have told 100% from 60% apart.
+
+**gpt-oss's defect is the same behaviour as gemma's, inverted.** Gemma deletes the adjacent
+declaration; gpt-oss merges the new property onto it. Both treat the neighbouring line as editable
+space, and only a byte-identical check on unnamed regions catches either — the functional tests
+pass in both cases.
+
+**The distill is the outlier, not the architecture.** Same size, same context, same 100%
+residency, and the only differences are the fine-tune and its packaging. Two fabricated successes
+with invented file paths, three runs that never located `.handoff`.
+
+### Void runs, and the shim that caused them
+
+The first `qw3c` batch was discarded entirely. All five failed, three looking exactly like the
+Devstral pattern — no files changed, unparseable report. The model had in fact written a correct
+`edit` call and the `bash` command to verify it, as two consecutive top-level JSON objects. The
+shim ran `json.loads` over the whole blob, hit `Extra data: line 2 column 1`, and promoted
+nothing. Replaying the captured payload through the fixed parser recovers three calls where the
+old code recovered none.
+
+That is the fourth harness fault in this project that would have been recorded as a model verdict.
+`tools/shim-selftest` now covers all of it: threading, multi-call turns, malformed-versus-truncated
+JSON, and the client's real zod schema.
+
+One repair was deliberately **not** made. Two qw3c runs emitted an `edit` whose payload stopped
+mid-object. Brace-completing those would have turned two failures into passes, and would also let
+a truncated `newString` replace a file with a partial copy — valid code, silently wrong. The
+self-test asserts truncated payloads are refused.
+
+### Corrections to earlier conclusions
+
+- **"Gemma cannot edit existing files."** Withdrawn. `rewrite_violations` is 0 on all five runs;
+  it patches. Round 3 had already shown this and the earlier framing outlived it.
+- **"Gemma scores 2/6."** It scores 2/2. `surgical-discount` shipped six checklist items and two
+  commands, making 2/6 unreachable-by-construction. Every model in round 3 was understated, and
+  the gap to Devstral's 1/6 — a free point for parsing an untouched file — was wider than recorded.
+- **"gpt-oss-20b-Coding-Distill fails the tool-call gate."** Wrong, and the error is instructive:
+  a single raw-API probe with a terse tool description came back blank and the reasoning trace was
+  read as the whole story, when the follow-up probe had in fact returned a native `tool_calls`
+  value that was never printed. Both gpt-oss builds emit native tool calls. One probe is not a
+  gate — the marker-round-trip probe in `setup-local-model` exists for this reason.
+- **"The Qwen family is blocked on packaging."** Half right. The upstream template is genuinely
+  wrong, but three shim defects were also in the way. It now runs.
+
+## Round 5 — a second client, and the residency question
+
+Two things at once, both on `surgical` (the seven-criteria replacement for `surgical-discount`):
+does a different client change which models work, and is a deliberate CPU offload worth the
+throughput it costs.
+
+### Results
+
+| Provider | Config | Perfect trees (7/7) | Median | Throughput | Residency |
+| --- | --- | ---: | ---: | ---: | --- |
+| clgemmant | gemma @128k, reasoning off | **3/5** | 95 s | 33 tok/s | 100% GPU |
+| clgptossnt | gpt-oss @32k, reasoning off | 1/5 | 49 s | **61 tok/s** | 100% GPU |
+| clgptoss128nt | gpt-oss @128k, reasoning off | 2/5 | 83 s | 43 tok/s | **84% GPU** |
+
+### The client is a per-model choice, not a global one
+
+| Model | opencode | Cline |
+| --- | --- | --- |
+| gemma4:12b | 2/5 clean | **3/5 clean** |
+| gpt-oss:20b | **4/5 complete** | 1/5 |
+| Qwen3-Coder | 1/5, and only through a shim | passes the gate, unreliable in practice |
+
+Cline rescues Qwen — it drives its own tool loop, so the text-versus-native tool-call problem
+that needed a proxy shim under opencode does not arise. It ruins gpt-oss: four of five runs died
+on `error parsing tool call`, and the single success was the single run with no parse errors. The
+same model scores 4/5 under opencode. There is no best client; there is a best pairing.
+
+### Reasoning is the variable that mattered most
+
+Same model, same plan, same client, one flag:
+
+| | reasoning on | reasoning off |
+| --- | ---: | ---: |
+| Criteria | 0/7 | **7/7** |
+| Wall clock | 801 s | **95 s** |
+| Context-limit hits | 3 | 0 |
+
+Gemma emitted 15,441 reasoning tokens in a single probe. On top of Cline's 25-tool system prompt
+that exhausts a 32k window, and Cline reports the resulting truncation as *"Model reached the
+maximum output token limit"* — which is a misleading message: there is no output cap. Captured
+from the wire, Cline sends **no** `max_tokens`, `max_completion_tokens` or `num_predict` on either
+provider path. It sends `options.num_ctx: 32768`, hardcoded, overriding whatever the model was
+baked with.
+
+### Residency: the rule was too strong
+
+| Config | Residency | Result |
+| --- | --- | --- |
+| Devstral UD-Q3_K_XL @16k (round 1) | 85% | 101 minutes, zero files written |
+| gpt-oss @128k (round 5) | 84% | **7/7 in 60 s**, and again 7/7 in 406 s |
+
+At essentially the same offload, one model wrote nothing for an hour and a half and another
+produced a byte-perfect patch in a minute. So *"below 100% residency, treat as unusable rather
+than slow"* does not generalise. The measured cost of the offload here is throughput: 61 tok/s at
+100% falls to 43 tok/s at 84%, roughly proportional to the layers moved. Devstral's collapse was
+that model, that quantisation, or the far larger prompt an editing task builds on a 24B — not an
+automatic consequence of being 15% off the GPU.
+
+**The offload did not buy reliability, and could not have.** 2/5 against 1/5 is one run at n=5.
+More importantly the extra context was never used: peak prompt was 17,017 tokens of the 131,072
+granted. There was no context pressure to relieve, which is why `multi` exists.
+
+### Context actually consumed, measured at the proxy
+
+| Model | Window granted | Peak prompt | Utilisation |
+| --- | ---: | ---: | ---: |
+| gemma | 131,072 | 15,779 | 12% |
+| gpt-oss @128k | 131,072 | 17,017 | 13% |
+| gpt-oss @32k | 32,768 | 7,400 | 23% |
+
+A single-file surgical edit cannot answer whether 32k is enough for real work. Nothing here came
+close to filling it.
+
+### Harness defects found this round (5 more)
+
+| Defect | Symptom it produced |
+| --- | --- |
+| Shim parsed only one JSON object per turn | A correct `edit` plus its `bash` verification arrived as two consecutive objects; `json.loads` hit "Extra data" and promoted neither, so the round scored as a model that read the files and changed nothing |
+| `timeout --foreground` signals only its direct child | An orphaned Cline outlived a 30-minute timeout and competed with the *next* repetition for the same GPU model; that run's empty diff looked like the model collapsing |
+| Adapter buffered its log and copied it after exit | The one run that most needed diagnosing preserved no provider log at all |
+| `--id` declared as native session resume | Incompatible with `--json` plus a prompt in Cline 3.0.52, so the prompt-validate retry never ran once — every malformed report was unrecoverable, including runs whose patch was perfect |
+| Checklist and command counts allowed to disagree | `surgical-discount` had six criteria and two commands, making 2/6 the maximum achievable score and understating every model in round 3 |
+
+Two near-misses worth recording because they were caught by testing the guard rather than trusting
+it. The first process-group fix killed `-$!`, which is `setsid`'s pid rather than the new session
+leader's, and the grandchild survived. The test that "verified" it then passed *vacuously*: without
+`--wait`, `setsid` detached, the pgid file was never written, and `kill -0 ""` failed into a green
+result. Had that shipped, `bench/run` would have recorded exit 0 instantly and never waited for the
+driver at all.
+
+## Void: every gpt-oss result obtained through ollama
+
+Applying this document's own rule — *could a different harness, configuration or machine have
+produced a different outcome for the same model and prompt?* — to gpt-oss.
+
+It could, and it did. Ollama's harmony path corrupts this model's tool calls and returns HTTP 500
+for output the model generated correctly. Measured on the same official weights, the same
+`apply_patch` schema including its 1224-byte description, and the same multi-turn conversation:
+
+| Serving path | Tool calls valid | Correct patch via Cline |
+| --- | ---: | ---: |
+| ollama | 2/5 malformed, HTTP 500 | 1/3 |
+| llama.cpp | **8/8 valid** | **4/4** |
+
+So the following must not be read as model-quality measurements, and are reclassified:
+
+| Previously recorded as | Now |
+| --- | --- |
+| gpt-oss under Cline: 1/5 clean (round 5) | **void** — provider parse failures, not model failures |
+| gpt-oss @128k offload: 2/5 (round 5) | **void** — same cause; the offload comparison is unresolved |
+| "gpt-oss is client-fragile" | withdrawn — it is *ollama*-fragile |
+
+The gpt-oss numbers obtained through **opencode** stay valid (4/5 complete, 3/5 clean). Opencode
+ships no `apply_patch`, so the model never generates the payload ollama cannot parse — that is
+luck of tool inventory rather than a better path, but the runs themselves are sound.
+
+**The current gpt-oss baseline is llama.cpp**, and it starts from zero repetitions on the old
+plans. What survives from round 5 is the *gemma* data, which used a different serving path.
+
+### A correction about tool inventory
+
+Round 5 concluded that a freeform whole-patch tool was inherently fragile for this model and
+should be replaced with small targeted edits. **That is withdrawn.** The identical tool definition
+and 693–818 byte payloads work repeatedly once the serving layer is correct. Changing the tool set
+now would introduce a variable and make the next comparison less informative; `apply_patch` stays.
+
+### Freeze the pairing, then vary one thing
+
+Because "gpt-oss" now names several subtly different serving stacks, every result should carry the
+stack that produced it: engine and build, model file digest, context, KV type, GPU layers, client
+and version, tool-schema digest, reasoning level, sampling. Without that, a provider regression six
+months from now gets attributed to the model — which is exactly the mistake this section is undoing.
+
 ### Verdict on the model set
+
+Updated after round 4. "Does the work" means a complete run whose diff is also clean, not merely
+a run the harness marked complete.
 
 | Model | Drives the harness | Does the work | Reports honestly |
 | --- | --- | --- | --- |
-| gemma4:12b | yes | yes | yes |
+| **gpt-oss:20b** | yes | **yes — 3/5 clean, the best patches measured** | yes |
+| **gemma4:12b @96k** | yes | yes — 5/5 complete, 2/5 clean | yes |
+| Qwen3-Coder-30B-A3B Q2_K | only through the shim | **1/5** | one fabricated blocker |
 | Devstral (Q4 / Q3_K_S / Q3_K_XL) | yes | **no** | **no** |
-| qwen2.5-coder, JanusCoder, Qwen3-Coder, gemma-4-coder-fable5 | not without a shim | untested | untested |
+| gpt-oss-20b-Coding-Distill | yes, once repackaged | **no — 0/5** | **no — 2 fabricated successes** |
+| qwen2.5-coder, JanusCoder, gemma-4-coder-fable5 | only through the shim | untested | untested |
 
-The Qwen family emits correct tool calls as text rather than as native calls. A shim that
-promotes them works at the API layer for both qwen2.5-coder and Qwen3-Coder, so those models are
-pending rather than rejected — the block is packaging, not capability. Notably, unsloth's
-Qwen3-Coder GGUF ships a Qwen2.5-era template containing `<tool_call>` but neither `<function=`
-nor `<parameter=`, which is Qwen3-Coder's documented format: the model is instructed in a format
-it was not trained to emit.
+Two viable local implementers, with different strengths: **gpt-oss:20b for patch quality, gemma
+for throughput**, at roughly half the wall-clock. Neither can be trusted without the
+byte-identical guard — gemma trips it in three runs of five, gpt-oss in one.
+
+Qwen3-Coder is not rejected but is not competitive as packaged. Its one clean run was as good as
+anything here; the other four were lost to malformed or truncated tool calls, which is what
+hand-escaping source into JSON costs a model that was never meant to emit tool calls as text.
+That points at the client, not the model — a client that reads XML-style tool calls out of the
+text stream, rather than one expecting native calls, would remove the whole failure class.
+
+Two GGUF packaging defects found here are worth reporting upstream, because both silently degrade
+the model for anyone using a native-tool-call client:
+
+- **unsloth/Qwen3-Coder-30B-A3B-Instruct** ships a Qwen2.5-era template containing `<tool_call>`
+  but neither `<function=` nor `<parameter=`, which is Qwen3-Coder's documented format. The model
+  is instructed in a format it was not trained to emit and falls back to bare JSON.
+- **mradermacher/gpt-oss-20b-Coding-Distill-i1** ships a template rendering the user turn as
+  `tart|>user<|message|>` — the leading `<|s` is missing — and ollama derives stop strings from
+  the template, so the stop list contains `<|message|>` and generation halts after three tokens.
+  The model returns an empty string to every prompt until it is repackaged.

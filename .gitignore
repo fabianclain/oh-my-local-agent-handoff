@@ -13,3 +13,7 @@
 
 *.log
 .DS_Store
+
+# Python bytecode from the proxy/shim tools
+__pycache__/
+*.pyc
