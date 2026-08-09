@@ -17,7 +17,7 @@
 # speed comparison against a fully-resident model is then meaningless. Size the context down
 # (a derived model with PARAMETER num_ctx) rather than accepting a CPU spill.
 
-: "${HANDOFF_MODEL:=ollama/devstral-small-2:24b}"
+: "${HANDOFF_MODEL:=ollama/dv-q3-16k}"
 export HANDOFF_MODEL
 
 # shellcheck disable=SC1090
