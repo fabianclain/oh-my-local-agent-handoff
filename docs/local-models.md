@@ -141,6 +141,42 @@ That one happened to be a parse error, so a syntax gate caught it. **Luck.** A f
 its own `class` declaration would have been valid PHP and silently deleted 410 working lines.
 Valid code in the wrong file is worse than broken code, because nothing complains.
 
+
+### It patches correctly — and deletes the line it patched next to
+
+The greenfield/edit split above is real but the **mechanism was wrong**, and this is the more
+useful finding.
+
+Given a surgical task — add a property, a setter, and change one line in a 70-line class —
+Gemma produced genuinely small diffs: **+8/−3** and **+9/−4** lines, one file touched. It does
+not regenerate files. It patches.
+
+But both runs deleted an adjacent line at the insertion point:
+
+```diff
+-    /** @var array<int, array{description: string, quantity: int, unit_price: float}> */
+-    private array $lines = [];
++    private float $discountRate = 0.0;
++
++    public function setDiscountRate(float $rate): void { ... }
+```
+
+The `$lines` declaration was **replaced** rather than added alongside. Reproducible, 2 for 2.
+
+**Why this is worse than a crash.** The functional verification passed on both runs:
+`subtotal()` returned 22.50, `total(0.2)` returned 27.00, exit 0. PHP falls back to a dynamic
+property, so the class still works — with a deprecation notice — and **will break outright in
+PHP 9**. A test suite would be green. Only a byte-identical check on untouched regions catches it.
+
+**And note which half it got right.** The plan contained a semantic trap: `tax()` and `total()`
+already build on `subtotal()`, so applying the discount again in `total()` would double-count it
+and still parse. Gemma avoided that on both runs. It got the *reasoning* right and the
+*mechanical* part wrong — the opposite of the usual assumption about small models.
+
+**Consequence for routing:** "no edits" is too blunt. The requirement is a gate that asserts
+**regions the plan did not name are byte-identical**. With that, surgical edits become viable
+work for a local model. Without it, they silently degrade a codebase in a way tests do not catch.
+
 ### It writes plausible, silently wrong SQL
 
 Asked for aggregate reports over per-date rows:
