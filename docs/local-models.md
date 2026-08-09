@@ -100,6 +100,50 @@ Related to 3 but distinct and worth naming in the plan text itself: the tool-cal
 `\n` as two characters. Plans now say **write real newlines, then run `php -l` and confirm it
 parses**. A file that does not parse is not progress.
 
+
+### 6. The escaped-newline bug also lands in filenames
+
+Same defect as (4), different target. A round created:
+
+```
+$'app/Domains/SearchConsole/Services/OpportunityReport.php\n'
+```
+
+— a real file whose *name* ends in a newline character. It evaded a `*.php` gate check, was
+invisible to `ls path/to/OpportunityReport.php`, and printed across two lines in `find`, which
+made it look like two separate entries.
+
+**Fix:** the gate rejects any changed path containing a control character. Worth doing generally:
+a filename a later glob cannot match is a defect regardless of which model produced it.
+
+### 7. It writes SQL that is plausible and silently wrong
+
+The most dangerous output seen after the false-success report, because it passes every syntax and
+structural check. Asked for aggregate reports over per-date rows, it produced:
+
+```php
+->whereBetween('position', [11, 20])          // filters raw rows, not AVG(position)
+->where('impressions', '>=', $minImpressions) // filters raw rows, not SUM(impressions)
+->groupBy('site_url', 'query')
+->selectRaw('CAST(SUM(clicks) AS decimal(6,4)) as ctr')  // click count labelled as a ratio
+```
+
+`WHERE` runs before `GROUP BY`, so both filters test a single day rather than the aggregate. And
+the CTR column is not a ratio at all — it is the click count with a misleading alias.
+
+Nothing about this fails to parse, fails a test that does not exist yet, or looks wrong on
+review at a glance. It would have produced a report full of confident, incorrect numbers.
+
+**What this says about task selection:** the greenfield rule (creating files rather than editing)
+is necessary but not sufficient. It protects the *codebase* from destruction; it does not protect
+the *output* from being wrong. Work whose correctness lives in semantics rather than structure —
+aggregate SQL, ratios, anything where a plausible answer and a right answer look identical —
+should go to a hosted model regardless of whether the files are new.
+
+The failure was already anticipated in the plan, which stated the SUM/SUM rule explicitly. It
+still shipped the wrong version. **Stating a constraint in the plan is not the same as the model
+honouring it**, and a constraint that only a test can enforce needs a test, not a sentence.
+
 ## Failures that were NOT the model's fault
 
 Worth separating, because blaming the model for harness bugs leads to the wrong fixes.
