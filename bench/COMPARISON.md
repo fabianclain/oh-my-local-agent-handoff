@@ -187,6 +187,22 @@ number is hours per model. Raise to 15+ only for a model that survives screening
 Seven candidates were tested before any one was understood, and three of those turned out to be
 blocked by a harness or template fault rather than by capability.
 
+## A note on provider labels
+
+Several labels named in the results below no longer exist as adapters: the Devstral quantisations
+(`dvq3s`, `dvq3xl`, `dvq4`, `devstral`), the Qwen paths (`qwen`, `qw3c`), the gpt-oss Coding-Distill
+(`gptossd`), and the ollama-served gpt-oss labels (`clgptossnt`, `clgptoss128nt`).
+
+They were removed rather than kept, because each pointed at a model baked locally with
+`ollama create` — `dv-q3s-32k`, `gptoss-128k` and so on — which exists on one machine and nowhere
+else. They were never a reproduction path for anyone but the author, so keeping them made the
+provider directory look like a menu when it was a scrapbook.
+
+The findings they produced are unaffected and stay recorded here: Devstral changing zero bytes six
+times while reporting success, the Qwen family emitting correct tool calls as text, the distill's
+corrupted template. Recreating any of them is a two-line adapter over `providers/ollama.sh` plus
+the matching `ollama create`.
+
 ## Results
 
 ### Round 1 — uniform 32k context, q8_0 KV
