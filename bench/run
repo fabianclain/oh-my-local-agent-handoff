@@ -9,6 +9,24 @@
 
 set -euo pipefail
 
+# Serialise benchmarks before anything else runs.
+#
+# This must sit above argument parsing: the parser consumes "$@" with shift, so a re-exec placed
+# after it passes no arguments and the script fails with "--plan is required".
+#
+# flock --close rather than `exec 9>lock`, because a bare descriptor is inherited by every child
+# and an opencode process outliving a timed-out run then holds the lock after its parent exits.
+# That wedged the bench for a full 600s wait and made a legitimate queued round look like a
+# concurrency violation.
+#
+# Concurrent runs share the GPU and, with OLLAMA_MAX_LOADED_MODELS=1, evict each other's model
+# continuously — so they measure contention rather than the model.
+if [[ -z "${BENCH_LOCK_HELD:-}" ]]; then
+    export BENCH_LOCK_HELD=1
+    BENCH_LOCK="${TMPDIR:-/tmp}/agent-handoff-bench.lock"
+    exec flock --close -w "${BENCH_LOCK_WAIT:-600}" "$BENCH_LOCK" "$0" "$@"
+fi
+
 usage() {
     echo "usage: bench/run --plan <slug> --providers <name,...> [--repeat <n>] [--force]" >&2
 }
@@ -109,21 +127,6 @@ BASE_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 #
 # flock is used rather than a PID file because it releases automatically when the process dies,
 # including on kill -9, so a crashed run cannot leave the bench permanently locked.
-BENCH_LOCK="${TMPDIR:-/tmp}/agent-handoff-bench.lock"
-# Re-exec under flock --close rather than holding a descriptor in this shell.
-#
-# `exec 9>lock` leaks fd 9 into every child, so an opencode process that outlives its parent --
-# which is exactly what happens when a run times out -- keeps holding the lock. That wedged the
-# bench for 600s and made a legitimate round look like a concurrency violation. `--close` closes
-# the descriptor before running the command, so no child can inherit it.
-if [[ -z "${BENCH_LOCK_HELD:-}" ]]; then
-    export BENCH_LOCK_HELD=1
-    exec flock --close -w "${BENCH_LOCK_WAIT:-600}" "$BENCH_LOCK" "$0" "$@" || {
-        echo "another benchmark held the lock for ${BENCH_LOCK_WAIT:-600}s (lock: $BENCH_LOCK)" >&2
-        exit 75
-    }
-fi
-
 # Parsed here rather than at first use further down: the --force scoping below needs it, and a
 # list parsed twice is a list that can disagree with itself.
 IFS=',' read -r -a PROVIDER_LIST <<<"$PROVIDERS"
