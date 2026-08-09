@@ -36,3 +36,21 @@ single row as a general capability claim. Check the raw handoff report, verifica
 diff, and any reported deviation together; the ambiguity fixture in particular is informative
 because acknowledging the contradiction is part of the evidence even when both checks cannot
 pass.
+
+## Void runs
+
+A run blocked by a defect in the harness, the adapter, the configuration or the machine is not a
+model result and is not scored. Re-run it after fixing the cause.
+
+Counting harness faults as model faults yields confident wrong conclusions. In this repository's
+own history, a model was recorded as fabricating a blocker when it had been served a 4,096-token
+context and could not see the plan; another was recorded as stalling when the adapter had blocked
+on stdin; and a whole round vanished because `--force` deleted every provider's results rather
+than the one being re-run.
+
+The test: could a different harness, configuration or machine have produced a different outcome
+for the same model and the same prompt? If yes, the run is void.
+
+A result stays counted when the cause is real and outside the harness — a model that runs out of
+context because the hardware cannot hold more is a configuration result, reported as such, and it
+changes when the configuration does.
