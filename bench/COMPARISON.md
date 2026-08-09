@@ -75,6 +75,35 @@ blocker — when the likeliest explanation is that it honestly could not see the
 **Practical test when a run fails:** could a different harness, config or machine have produced a
 different outcome for the same model and prompt? If yes, void it and fix the harness first.
 
+
+### The qwen2.5-coder result is void — proven, not assumed
+
+Qwen was recorded twice as reporting "the plan file does not exist", and that was written up as
+the most dangerous failure mode observed: a model inventing a blocker. It was neither dishonest
+nor incapable.
+
+Probed directly — a file on disk, a prompt asking it to read that file and echo a marker — it
+replied:
+
+```json
+{
+  "name": "read",
+  "arguments": { "filePath": ".handoff/plans/probe.md" }
+}
+```
+
+wrapped in a markdown code fence, as **plain text**. It knew the tool, the argument name and the
+path. It simply did not emit a native tool call, so opencode never executed it, no file contents
+ever returned, and the model correctly concluded it had no plan. Its report was accurate.
+
+The cause is a template/parser mismatch between ollama's `qwen2.5-coder` chat template and
+opencode's tool-call parsing — squarely a harness fault. All qwen results are void and removed.
+
+`ollama show` listing `tools` is therefore **not sufficient** to establish usability. The
+capability flag says the template claims tool support; it does not say the emitted format is one
+the client can parse. Any new model needs a one-prompt read-a-file probe before it is benchmarked,
+or its failures will be misattributed exactly like this.
+
 ## Results
 
 _Round 1 pending._
