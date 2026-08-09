@@ -133,4 +133,32 @@ that catches them costs about a minute and is the only reliable signal, since al
 
 ## Results
 
-_Round 1 pending._
+### Round 1 — uniform 32k context, q8_0 KV
+
+Plan: `mechanical-guided`. Voids removed (qwen: text-format tool calls).
+
+| Provider | Status | Criteria | Seconds | Residency |
+| --- | --- | ---: | ---: | --- |
+| gemma | complete | **4/5** | 149 | 100% GPU |
+| dvq3xl | report-unparseable | 0/5 | 85 | 85% |
+| dvq3s | complete | 0/5 | 39 | 93% |
+| dvq4 | did not finish | — | — | 69% |
+
+**The result that needs explaining:** gemma scored **5/5 in 77s** on this same plan before the
+KV cache was quantised and before its context was cut from 128k to 32k. It now scores 4/5 in
+149s — slower and slightly worse. Two variables changed at once, which is a design mistake on my
+part; round 2 separates them by restoring gemma's context while leaving KV alone.
+
+Devstral's ordering is the reverse of what the earlier Q4-only run suggested: the *smallest*
+build (Q3_K_S, 93% resident) finished fastest at 39s, and the larger ones did worse. Residency
+continues to predict outcome better than quantisation quality does.
+
+### Round 2 change: context sized per model, not uniform
+
+Uniform 32k wasted headroom on one model and starved another. Measured at 32k, gemma used 8.1 GB
+of 14.4 GB usable while Devstral Q3_K_S sat at 13 GB and 93% residency.
+
+So context is now sized to land near 12–13 GB used, which means **up** for gemma (32k → 96k,
+also restoring the window it had when it scored 5/5) and **down** for the Devstral builds
+(32k → 16k, buying full residency at the cost of window). Given a 15% offload previously cost an
+entire task, trading window for residency is the right direction for them.
