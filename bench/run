@@ -94,15 +94,28 @@ BASE_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 
 [[ -f "$PLAN_FILE" ]] || { echo "plan not found: bench/plans/$PLAN.md" >&2; exit 1; }
 
-# An incomplete old directory is still evidence from an earlier attempt. Refusing all existing
-# paths prevents a rerun from quietly mixing new artifacts with a partial prior matrix.
-if [[ -e "$RESULTS_DIR" ]]; then
+# An incomplete old directory is still evidence from an earlier attempt. Refusing existing paths
+# prevents a rerun from quietly mixing new artifacts with a partial prior matrix.
+#
+# --force clears only the providers being run, never the whole plan. Deleting the plan directory
+# destroys every other provider's baseline, which is unrecoverable and silent: adding a fifth
+# model to a comparison would wipe the four already measured, and the report afterwards looks
+# like a clean single-provider run rather than a loss. Comparing models one at a time is the
+# normal way to use this, so the destructive reading of --force was wrong for the common case.
+# Parsed here rather than at first use further down: the --force scoping below needs it, and a
+# list parsed twice is a list that can disagree with itself.
+IFS=',' read -r -a PROVIDER_LIST <<<"$PROVIDERS"
+(( ${#PROVIDER_LIST[@]} > 0 )) || { echo "--providers list is empty" >&2; exit 64; }
+
+for _provider in "${PROVIDER_LIST[@]}"; do
+    _dir="$RESULTS_DIR/$_provider"
+    [[ -e "$_dir" ]] || continue
     [[ "$FORCE" -eq 1 ]] || {
-        echo "results already exist for '$PLAN'; use --force to replace them" >&2
+        echo "results already exist for '$PLAN/$_provider'; use --force to replace them" >&2
         exit 1
     }
-    rm -rf -- "$RESULTS_DIR"
-fi
+    rm -rf -- "$_dir"
+done
 
 mkdir -p "$RESULTS_DIR" "$WORK_DIR"
 
@@ -341,9 +354,6 @@ remove_active_worktree() {
     fi
     ACTIVE_WORKTREE=""
 }
-
-IFS=',' read -r -a PROVIDER_LIST <<<"$PROVIDERS"
-(( ${#PROVIDER_LIST[@]} > 0 )) || { echo "--providers list is empty" >&2; exit 64; }
 
 for provider in "${PROVIDER_LIST[@]}"; do
     [[ "$provider" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || {
