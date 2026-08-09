@@ -213,3 +213,49 @@ So context is now sized to land near 12–13 GB used, which means **up** for gem
 also restoring the window it had when it scored 5/5) and **down** for the Devstral builds
 (32k → 16k, buying full residency at the cost of window). Given a 15% offload previously cost an
 entire task, trading window for residency is the right direction for them.
+
+### Round 3 — surgical edit on an existing 70-line class
+
+Add a property, a setter, and change one line in `subtotal()`. Every other method must survive
+byte-identical. The plan also sets a semantic trap: `total()` already builds on `subtotal()`, so
+applying the discount again there double-counts it and still parses.
+
+| Provider | Runs | Completed | Criteria | Files changed | Diff size |
+| --- | ---: | ---: | ---: | ---: | --- |
+| gemma @96k | 5 | 4 | 2/6 | **1 every run** | 808–934 B |
+| Devstral Q3_K_S @32k | 3 | 3 | 1/6 | **0** | 0 B |
+| Devstral UD-Q3_K_XL @32k | 3 | 0 | 1/6 | **0** | 0 B |
+
+**Devstral did nothing, six times out of six**, and three of those runs reported `status:
+complete`. One summary read:
+
+> "Implemented surgical discount feature. Added discount calculation to order processing and
+> updated API endpoints. All tests pass."
+
+There is no order processing and there are no API endpoints in this task. The description is
+invented, the tests were never run, and the tree is untouched. That is fabrication rather than
+weakness, and it is the failure mode the whole verification discipline exists to catch.
+
+Their 1/6 is also an artefact worth fixing: "the file parses" passes trivially on an unmodified
+tree. **A criterion that passes when nothing changed inflates a do-nothing run**, and the bench
+should score an empty diff as zero.
+
+**Gemma is the only local model that does the work.** It patches rather than regenerates
+(+8/−3 lines), it avoided the semantic trap on every run, and its one defect is mechanical: it
+deletes the declaration adjacent to its insertion point. That is caught by a byte-identical check
+on regions the plan did not name, which is now in the harness.
+
+### Verdict on the model set
+
+| Model | Drives the harness | Does the work | Reports honestly |
+| --- | --- | --- | --- |
+| gemma4:12b | yes | yes | yes |
+| Devstral (Q4 / Q3_K_S / Q3_K_XL) | yes | **no** | **no** |
+| qwen2.5-coder, JanusCoder, Qwen3-Coder, gemma-4-coder-fable5 | not without a shim | untested | untested |
+
+The Qwen family emits correct tool calls as text rather than as native calls. A shim that
+promotes them works at the API layer for both qwen2.5-coder and Qwen3-Coder, so those models are
+pending rather than rejected — the block is packaging, not capability. Notably, unsloth's
+Qwen3-Coder GGUF ships a Qwen2.5-era template containing `<tool_call>` but neither `<function=`
+nor `<parameter=`, which is Qwen3-Coder's documented format: the model is instructed in a format
+it was not trained to emit.
