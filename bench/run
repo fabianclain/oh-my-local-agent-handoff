@@ -325,9 +325,10 @@ report_has_required_fields() {
 write_metrics() {
     local dir="$1" status="$2" criteria_met="$3" scope="$4" deviations="$5"
     local blockers="$6" rounds="$7" elapsed="$8" exit_code="$9"
-    local rewrites="${10:-0}" empty="${11:-0}" litter="${12:-0}"
+    local rewrites="${10:-0}" empty="${11:-0}" litter="${12:-0}" outcome="${13:-unknown}"
     printf '%s\n' \
         "status=$status" \
+        "outcome=$outcome" \
         "criteria_total=$CRITERIA_TOTAL" \
         "criteria_met=$criteria_met" \
         "scope_violations=$scope" \
@@ -766,6 +767,42 @@ for provider in "${PROVIDER_LIST[@]}"; do
             echo "reported complete having changed nothing" >"$RESULT_DIR/note.txt"
         fi
 
+        # Outcome taxonomy — derived from the tree, never from the report.
+        #
+        # `status` alone collapses outcomes that are nothing alike. Three runs today produced a
+        # byte-perfect tree that satisfied every criterion and were recorded as
+        # `report-unparseable`, identical to runs that changed nothing, because the client returned
+        # no final message. On a cost-to-accepted-patch basis one of those needs a re-ask and the
+        # other needs a human, so flattening them hides the number the project exists to measure.
+        #
+        #   accepted            every gate passed and the model reported it
+        #   patch-ok-no-report  the tree is acceptable; the envelope is missing or malformed
+        #   patch-damaged       the tree changed but a gate rejected it
+        #   fabricated          claimed success over a tree it never touched
+        #   no-op               changed nothing, and said so
+        #   protocol-failed     never got far enough to produce a tree to judge
+        TREE_OK=0
+        if [[ "$DID_NOTHING" -eq 0 && "$CRITERIA_MET" -eq "$CRITERIA_TOTAL" &&
+              "$SCOPE_VIOLATIONS" -eq 0 && "$REWRITES" -eq 0 ]]; then
+            TREE_OK=1
+        fi
+        REPORT_OK=0
+        [[ "$STATUS" =~ ^(complete|partial|blocked)$ ]] && REPORT_OK=1
+
+        if [[ "$STATUS" == timeout || "$STATUS" == skipped ]]; then
+            OUTCOME=protocol-failed
+        elif [[ "$STATUS" == false-success ]]; then
+            OUTCOME=fabricated
+        elif [[ "$DID_NOTHING" -eq 1 ]]; then
+            OUTCOME=no-op
+        elif [[ "$TREE_OK" -eq 1 && "$REPORT_OK" -eq 1 ]]; then
+            OUTCOME=accepted
+        elif [[ "$TREE_OK" -eq 1 ]]; then
+            OUTCOME=patch-ok-no-report
+        else
+            OUTCOME=patch-damaged
+        fi
+
         # Produce the evidence bundle while the worktree still exists.
         #
         # This is what a reviewing model reads instead of re-running the work itself: every gate
@@ -787,7 +824,7 @@ for provider in "${PROVIDER_LIST[@]}"; do
 
         write_metrics "$RESULT_DIR" "$STATUS" "$CRITERIA_MET" "$SCOPE_VIOLATIONS" \
             "$DEVIATIONS" "$BLOCKERS" "$ROUNDS" "$ELAPSED" "$DRIVER_STATUS" \
-            "$REWRITES" "$DID_NOTHING" "$LITTER"
+            "$REWRITES" "$DID_NOTHING" "$LITTER" "$OUTCOME"
 
         remove_active_worktree "$RESULT_DIR" "$PLAN/$provider/$repetition"
     done

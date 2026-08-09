@@ -61,8 +61,8 @@ render_report() {
             echo "Sample: $RUN_COUNT runs."
         fi
         echo
-        echo "| Provider | Run | Status | Criteria | Diff bytes | Rewrites | Empty | Litter | Scope violations | Deviations | Blockers | Rounds to green | Seconds | Exit |"
-        echo "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+        echo "| Provider | Run | Outcome | Status | Criteria | Diff bytes | Rewrites | Empty | Litter | Scope violations | Deviations | Blockers | Rounds to green | Seconds | Exit |"
+        echo "| --- | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
 
         while IFS= read -r metrics; do
             RUN_DIR="${metrics%/metrics}"
@@ -70,6 +70,7 @@ render_report() {
             PROVIDER="${RELATIVE%%/*}"
             REPETITION="${RELATIVE##*/}"
             STATUS="$(metric_value "$metrics" status)"
+            OUTCOME="$(metric_or_dash "$metrics" outcome)"
             CRITERIA_TOTAL="$(metric_value "$metrics" criteria_total)"
             CRITERIA_MET="$(metric_value "$metrics" criteria_met)"
             SCOPE="$(metric_value "$metrics" scope_violations)"
@@ -83,9 +84,9 @@ render_report() {
             LITTER="$(metric_or_dash "$metrics" litter)"
             DIFF_BYTES="$(diff_bytes "$RUN_DIR")"
 
-            printf '| %s | %s | %s | %s/%s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n' \
-                "$PROVIDER" "$REPETITION" "$STATUS" "$CRITERIA_MET" "$CRITERIA_TOTAL" \
-                "$DIFF_BYTES" "$REWRITES" "$EMPTY" \
+            printf '| %s | %s | %s | %s | %s/%s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n' \
+                "$PROVIDER" "$REPETITION" "$OUTCOME" "$STATUS" "$CRITERIA_MET" "$CRITERIA_TOTAL" \
+                "$DIFF_BYTES" "$REWRITES" "$EMPTY" "$LITTER" \
                 "$SCOPE" "$DEVIATIONS" "$BLOCKERS" "$ROUNDS" "$SECONDS" "$EXIT_CODE"
         done < <(find "$plan_dir" -mindepth 3 -maxdepth 3 -type f -name metrics | sort)
 

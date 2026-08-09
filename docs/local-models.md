@@ -608,7 +608,18 @@ Ranked by measured effect, not by how good the idea sounded.
 | Per-result `manifest.json` — engine, build, model digest, context, KV, client, reasoning | "gpt-oss" names several serving stacks that behave differently |
 | Byte-identical criterion on unnamed regions | Catches collateral damage that functional tests pass straight through |
 
-### Open, roughly by value per hour
+### Open
+
+Moved to [docs/roadmap.md](roadmap.md), which carries enough reasoning on each to pick it up cold.
+Summarised here so this section is not a dead end:
+
+1. give the repair loop the diff and a reading of where it failed
+2. converge `verify-round` and `bench/run` into one gate implementation
+3. compute cost to an accepted patch
+4. a conformance gate for the serving stack
+5. byte-identical cannot see a mis-placed insertion
+
+### Previously listed here, in detail
 
 **1. A conformance gate for the serving stack.** The highest-value item. Turn
 `tools/repro-ollama-toolcall-500.py` into an engine-neutral probe — first-turn call, a call after
