@@ -104,6 +104,33 @@ capability flag says the template claims tool support; it does not say the emitt
 the client can parse. Any new model needs a one-prompt read-a-file probe before it is benchmarked,
 or its failures will be misattributed exactly like this.
 
+
+### Engine swap does not fix text-format tool calls — tested, not assumed
+
+Three models emit tool calls as fenced JSON text rather than as native calls, so opencode never
+executes them: `qwen2.5-coder:14b` (qwen2), `JanusCoder-14B` (qwen3) and
+`gemma-4-12B-coder-fable5` (gemma4). The last one matters: it kills the tidy "Qwen family"
+explanation, because another gemma4 model works. **Tool-call support is per-build, decided by
+whichever chat template that package ships — not per-architecture and not per-source.**
+
+Two fixes were tested and both failed:
+
+- **Newer ollama.** Reinstalled from ollama.com; `/usr/local/lib/ollama` was replaced and the
+  service restarted, but client and server both still report 0.32.6 — it is already current, so
+  there was nothing newer to get.
+- **llama.cpp with `--jinja`.** Installed the Vulkan build (b10331) — it reaches the RTX 5060 Ti,
+  loads at 32k with `-ctk/-ctv q8_0`, and serves an OpenAI-compatible API. Given JanusCoder's own
+  HF GGUF, template embedded, it produced the *same* fenced JSON with `tool_calls` absent.
+
+So the format is the model's, not the engine's. One caveat worth recording: ollama stores its
+chat template as a **separate layer outside the GGUF**, so pointing llama.cpp at an
+ollama-repackaged blob tests a template-stripped model. That invalidated a first attempt here and
+would silently mislead anyone doing the same.
+
+**Consequence:** these three models cannot drive this harness through either engine. The probe
+that catches them costs about a minute and is the only reliable signal, since all three advertise
+`tools`.
+
 ## Results
 
 _Round 1 pending._
