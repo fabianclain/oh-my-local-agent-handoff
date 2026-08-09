@@ -131,6 +131,57 @@ would silently mislead anyone doing the same.
 that catches them costs about a minute and is the only reliable signal, since all three advertise
 `tools`.
 
+
+## Method changes for round 3 and beyond (owner's proposal, adopted)
+
+Round 1 and 2 measure *capability on one trivial task*. That is the wrong target. The goal is
+**reducing hosted-model usage**, so the metric is total cost to an accepted patch, not whether a
+local model can produce code at all.
+
+### Adopted
+
+**Patch-only editing.** Give the local model `read_file` + `apply_patch`; block `write_file` on
+tracked files at the harness level. The greenfield/edit split observed so far is a correlation,
+not a mechanism — this isolates whether the weakness is editing *logic* or whole-file
+*regeneration*. Evidence points at regeneration (a 421-line service replaced by an 11-line
+fragment whose code was correct but whose destination was wrong), but that is inference. If
+regeneration is the cause, patch-only tools make local edits viable immediately.
+
+**Three task classes**, replacing the binary greenfield/edit split:
+1. greenfield creation
+2. surgical edits (1–10 lines)
+3. architectural / multi-file edits
+
+A model may be fine at the first two and hopeless at the third, which the current split cannot
+express.
+
+**Test-first delegation.** Hosted model writes or approves acceptance tests; the local model
+iterates until green. This puts the expensive model on the part needing judgement and the free
+one on the part needing iteration, and is the most promising token-saving structure available.
+
+**Repair loops, capped at 3 attempts.** First-pass success is the wrong headline if success
+within three attempts is high. Measure both.
+
+**Scope contract enforced by the harness, not the prompt:** allowed paths, max changed files, max
+new files, deletion permitted or not. Prompted constraints have already been ignored — a plan
+stated the `SUM(clicks)/SUM(impressions)` rule explicitly and the wrong version shipped anyway.
+
+**A semantic-risk task class:** aggregate SQL, statistics, permissions, auth, money, dates,
+concurrency. These are dangerous because wrong output still parses and looks plausible, so they
+need verification that checks *values*, not just that the code runs.
+
+**Metrics:** first-pass success, success within 3 attempts, false-success rate, time-to-green,
+and hosted verification tokens spent.
+
+### Adopted with modification
+
+**Repetitions:** 5 per task for screening rather than 10–20. At 1–20 minutes per run the larger
+number is hours per model. Raise to 15+ only for a model that survives screening.
+
+**Stop adding models.** Characterise one model's operating envelope under a good harness first.
+Seven candidates were tested before any one was understood, and three of those turned out to be
+blocked by a harness or template fault rather than by capability.
+
 ## Results
 
 ### Round 1 — uniform 32k context, q8_0 KV
