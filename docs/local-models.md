@@ -272,6 +272,37 @@ Practical consequence on a 16 GB card: prefer a quantisation that leaves at leas
 after weights. For a 24B that means Q3 rather than Q4. Check `ollama ps` for `100% GPU` — a
 `31%/69% CPU/GPU` split is both slow and a signal that context has been squeezed to make it fit.
 
+
+## Partial GPU offload is not a mild compromise — measured
+
+Devstral Small 24B was tried at two quantisations on a 16 GB card (14.4 GB usable after the
+desktop). Both "work" in the sense that they load and answer. Neither is usable.
+
+| Build | Weights | Context | Residency | Outcome |
+| --- | ---: | ---: | --- | --- |
+| Q4_K_M | 15 GB | 16k | 31%/69% CPU/GPU | correct code, truncated before writing a report |
+| UD-Q3_K_XL | 12 GB | 32k | 28%/72% | 17 GB footprint — KV alone is ~5 GB |
+| UD-Q3_K_XL | 12 GB | 16k | 15%/85% | trivial bench task: 15 min and still running (Q4 did it in 5) |
+| UD-Q3_K_XL | 12 GB | 16k | 15%/85% | **real edit task: 101 minutes, zero files written** |
+
+The last row is the one that settles it. A 15% *layer* offload did not cost 15% of throughput or
+even the 3x the bench suggested — on a task that first has to read several existing files, it
+produced nothing in an hour and forty. `llama-server` sat at 550% CPU throughout, so it was
+computing, not hung. Every token waits on the CPU-resident layers, and an editing task pays that
+cost across a far larger prompt than a greenfield one.
+
+**Rules that follow:**
+
+- Treat anything short of `100% GPU` in `ollama ps` as unusable for agentic work, not as
+  "slower". The relationship between offload share and wall-clock is wildly non-linear.
+- Budget KV cache seriously. For this 24B it cost roughly **5 GB at 32k** — far more than the
+  1-2 GB assumed. Weights that "fit" with 2 GB spare do not fit.
+- On a 16 GB card, a 24B is out unless the KV cache is quantised
+  (`OLLAMA_FLASH_ATTENTION=1` + `OLLAMA_KV_CACHE_TYPE=q8_0`), which would take 32k KV from ~5 GB
+  to ~2.5 GB and is the only remaining path to full residency.
+- A 12B with room beats a 24B without it, by a margin large enough that code quality is
+  irrelevant. Devstral wrote the best code of anything tested here and delivered nothing.
+
 ## Model selection
 
 Check `ollama show <model>` for `tools` under Capabilities before anything else. Without tool
