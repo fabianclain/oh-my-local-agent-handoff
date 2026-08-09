@@ -102,6 +102,21 @@ BASE_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 # model to a comparison would wipe the four already measured, and the report afterwards looks
 # like a clean single-provider run rather than a loss. Comparing models one at a time is the
 # normal way to use this, so the destructive reading of --force was wrong for the common case.
+# Only one benchmark may run at a time on a machine. Two concurrent runs share a GPU and, with
+# OLLAMA_MAX_LOADED_MODELS=1, evict each other's model continuously -- so both produce timings and
+# outcomes that measure the contention rather than the model. That happened here: a forgotten loop
+# and its replacement ran together, each thrashing the other, and neither result was usable.
+#
+# flock is used rather than a PID file because it releases automatically when the process dies,
+# including on kill -9, so a crashed run cannot leave the bench permanently locked.
+BENCH_LOCK="${TMPDIR:-/tmp}/agent-handoff-bench.lock"
+exec 9>"$BENCH_LOCK"
+if ! flock -n 9; then
+    echo "another benchmark is already running (lock: $BENCH_LOCK)" >&2
+    echo "concurrent runs share the GPU and measure contention, not the model" >&2
+    exit 75
+fi
+
 # Parsed here rather than at first use further down: the --force scoping below needs it, and a
 # list parsed twice is a list that can disagree with itself.
 IFS=',' read -r -a PROVIDER_LIST <<<"$PROVIDERS"
