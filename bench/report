@@ -16,6 +16,23 @@ metric_value() {
     awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$file"
 }
 
+# Runs recorded before a metric existed have no line for it. Rendering an empty cell would read as
+# "zero violations" on a run that was never checked, so those are marked "—" instead.
+metric_or_dash() {
+    local value
+    value="$(metric_value "$1" "$2")"
+    printf '%s' "${value:-—}"
+}
+
+# Diff size is the measurement the surgical plans exist to take: whether a contained change was
+# made without regenerating everything around it. A criteria count cannot express that — two runs
+# can both score 2/6 with one patching eight lines and the other replacing the file.
+diff_bytes() {
+    local run_dir="$1"
+    [[ -f "$run_dir/tree.diff" ]] || { printf '—'; return; }
+    wc -c <"$run_dir/tree.diff" | tr -d ' '
+}
+
 render_report() {
     echo "# Benchmark evidence"
     echo
@@ -44,8 +61,8 @@ render_report() {
             echo "Sample: $RUN_COUNT runs."
         fi
         echo
-        echo "| Provider | Run | Status | Criteria | Scope violations | Deviations | Blockers | Rounds to green | Seconds | Exit |"
-        echo "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+        echo "| Provider | Run | Status | Criteria | Diff bytes | Rewrites | Empty | Litter | Scope violations | Deviations | Blockers | Rounds to green | Seconds | Exit |"
+        echo "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
 
         while IFS= read -r metrics; do
             RUN_DIR="${metrics%/metrics}"
@@ -61,9 +78,14 @@ render_report() {
             ROUNDS="$(metric_value "$metrics" rounds_to_green)"
             SECONDS="$(metric_value "$metrics" wall_clock_seconds)"
             EXIT_CODE="$(metric_value "$metrics" exit_code)"
+            REWRITES="$(metric_or_dash "$metrics" rewrite_violations)"
+            EMPTY="$(metric_or_dash "$metrics" empty_diff)"
+            LITTER="$(metric_or_dash "$metrics" litter)"
+            DIFF_BYTES="$(diff_bytes "$RUN_DIR")"
 
-            printf '| %s | %s | %s | %s/%s | %s | %s | %s | %s | %s | %s |\n' \
+            printf '| %s | %s | %s | %s/%s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n' \
                 "$PROVIDER" "$REPETITION" "$STATUS" "$CRITERIA_MET" "$CRITERIA_TOTAL" \
+                "$DIFF_BYTES" "$REWRITES" "$EMPTY" \
                 "$SCOPE" "$DEVIATIONS" "$BLOCKERS" "$ROUNDS" "$SECONDS" "$EXIT_CODE"
         done < <(find "$plan_dir" -mindepth 3 -maxdepth 3 -type f -name metrics | sort)
 
@@ -88,6 +110,28 @@ render_report() {
                 while IFS= read -r deviation; do
                     printf '> Reported deviation: "%s"\n' "$deviation"
                 done <"$RUN_DIR/deviations.txt"
+            fi
+
+            if [[ -s "$RUN_DIR/litter.txt" ]]; then
+                echo
+                echo "Files the agent invented that the plan never named:"
+                while IFS= read -r junk; do
+                    printf -- '- `%s`\n' "$junk"
+                done <"$RUN_DIR/litter.txt"
+            fi
+
+            if [[ -s "$RUN_DIR/rewrite-violations.txt" ]]; then
+                echo
+                echo "Regenerated rather than patched:"
+                while IFS= read -r violation; do
+                    printf -- '- %s\n' "$violation"
+                done <"$RUN_DIR/rewrite-violations.txt"
+            fi
+
+            if [[ -s "$RUN_DIR/empty-diff.txt" ]]; then
+                while IFS= read -r line; do
+                    printf '> %s\n' "$line"
+                done <"$RUN_DIR/empty-diff.txt"
             fi
 
             if [[ -s "$RUN_DIR/scope-violations.txt" ]]; then

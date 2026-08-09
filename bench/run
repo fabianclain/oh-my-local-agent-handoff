@@ -94,12 +94,18 @@ done
 
 BENCH_TIMEOUT_SECONDS="${BENCH_TIMEOUT_SECONDS:-3600}"
 BENCH_VERIFY_TIMEOUT_SECONDS="${BENCH_VERIFY_TIMEOUT_SECONDS:-120}"
+# Attempts per repetition, including the first. 3 means one run plus two repairs.
+BENCH_MAX_ATTEMPTS="${BENCH_MAX_ATTEMPTS:-3}"
 [[ "$BENCH_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || {
     echo "BENCH_TIMEOUT_SECONDS must be a positive integer" >&2
     exit 64
 }
 [[ "$BENCH_VERIFY_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || {
     echo "BENCH_VERIFY_TIMEOUT_SECONDS must be a positive integer" >&2
+    exit 64
+}
+[[ "$BENCH_MAX_ATTEMPTS" =~ ^[1-9][0-9]*$ ]] || {
+    echo "BENCH_MAX_ATTEMPTS must be a positive integer" >&2
     exit 64
 }
 
@@ -189,6 +195,22 @@ awk '
 
 [[ "$CRITERIA_TOTAL" -gt 0 ]] || { echo "plan has no checklist criteria: bench/plans/$PLAN.md" >&2; exit 1; }
 [[ -s "$VERIFICATION_FILE" ]] || { echo "plan has no verification commands: bench/plans/$PLAN.md" >&2; exit 1; }
+
+# The score's denominator is the checklist and its numerator is the command list, so a plan whose
+# two counts disagree can never be fully satisfied and every model on it looks worse than it is.
+#
+# surgical-discount shipped with six checklist items and two commands, making 2/6 the maximum
+# achievable score. That was read as a model scoring a third of the criteria when it was in fact
+# passing everything the harness ever ran, and it understated the gap to a model that scored 1/6
+# by doing nothing at all. A denominator nothing can reach is not a measurement.
+VERIFICATION_TOTAL="$(grep -c . "$VERIFICATION_FILE" | tr -d ' ')"
+[[ "$VERIFICATION_TOTAL" -eq "$CRITERIA_TOTAL" ]] || {
+    echo "plan bench/plans/$PLAN.md has $CRITERIA_TOTAL checklist criteria but" >&2
+    echo "$VERIFICATION_TOTAL verification commands. Scoring counts commands, so the maximum" >&2
+    echo "achievable score would be $VERIFICATION_TOTAL/$CRITERIA_TOTAL and every provider would" >&2
+    echo "be understated. Give each criterion exactly one command, in the same order." >&2
+    exit 1
+}
 [[ -s "$ALLOWED_FILE" ]] || { echo "plan has no Files to touch entries: bench/plans/$PLAN.md" >&2; exit 1; }
 
 json_balanced() {
@@ -303,11 +325,16 @@ report_has_required_fields() {
 write_metrics() {
     local dir="$1" status="$2" criteria_met="$3" scope="$4" deviations="$5"
     local blockers="$6" rounds="$7" elapsed="$8" exit_code="$9"
+    local rewrites="${10:-0}" empty="${11:-0}" litter="${12:-0}"
     printf '%s\n' \
         "status=$status" \
         "criteria_total=$CRITERIA_TOTAL" \
         "criteria_met=$criteria_met" \
         "scope_violations=$scope" \
+        "litter=$litter" \
+        "rewrite_violations=$rewrites" \
+        "attempts=$ATTEMPTS" \
+        "empty_diff=$empty" \
         "deviations=$deviations" \
         "blockers=$blockers" \
         "rounds_to_green=$rounds" \
@@ -426,18 +453,89 @@ for provider in "${PROVIDER_LIST[@]}"; do
             continue
         fi
 
+        # Record the serving stack alongside the result. Optional: adapters that do not define
+        # provider_manifest simply produce no file, so this cannot break an existing provider.
+        (
+            source "$PROVIDER_FILE"
+            declare -F provider_manifest >/dev/null || exit 0
+            provider_manifest
+        ) >"$RESULT_DIR/manifest.json" 2>/dev/null
+        [[ -s "$RESULT_DIR/manifest.json" ]] || rm -f "$RESULT_DIR/manifest.json"
+
         mkdir -p "$ACTIVE_WORKTREE/.handoff/plans"
         cp "$PLAN_FILE" "$ACTIVE_WORKTREE/.handoff/plans/$PLAN.md"
+
+        # Assert the plan is actually readable where the model will look for it, immediately
+        # before the run.
+        #
+        # "The plan file does not exist" is the single most misdiagnosed report in this project:
+        # once it was true (a 4,096-token context hid it) and once it was a model asserting it
+        # without making a single tool call. Telling those apart after the fact is impossible,
+        # because the worktree is removed when the run ends. Checking here means a future
+        # "plan not found" can only ever be the model's claim, never the harness's fault.
+        [[ -r "$ACTIVE_WORKTREE/.handoff/plans/$PLAN.md" &&
+           -s "$ACTIVE_WORKTREE/.handoff/plans/$PLAN.md" ]] || {
+            echo "plan was not staged into the worktree for $PLAN/$provider/$repetition" >&2
+            exit 1
+        }
         RUN_DIR="$ACTIVE_WORKTREE/.handoff/runs/$PLAN"
         STARTED_AT="$(date +%s)"
 
+        # Repair loop. First-pass success is the wrong headline if success within a few attempts
+        # is high, and the real target is cost to an accepted patch — so both are measured: the
+        # attempt count is recorded whether or not the round ever goes green.
+        #
+        # The feedback handed back is the harness's own verification output, not the model's
+        # opinion of what went wrong. The model's report is the least trustworthy thing available;
+        # the list of commands that actually exited non-zero is the most.
+        mkdir -p "$RUN_DIR"
+        FEEDBACK_FILE="$RUN_DIR/feedback.md"
+        rm -f "$FEEDBACK_FILE"
+        ATTEMPTS=0
+        FIRST_TREE_BEFORE=""
+        while : ; do
+        ATTEMPTS=$(( ATTEMPTS + 1 ))
+
+        # Run the driver in its own process group and kill the GROUP on timeout.
+        #
+        # `timeout` signals only the process it launched. The agent CLI is a grandchild, so a
+        # timed-out round left it alive: an orphaned Cline from a 30-minute timeout was still
+        # running against the deleted worktree while the NEXT repetition ran, both hitting the
+        # same GPU model at once. The following runs produced empty diffs and unparseable reports
+        # and looked like a model collapsing, when they were competing with a ghost.
+        #
+        # This is the third variant of the same bug in this harness — an opencode process
+        # outliving its parent previously held the bench flock for 600s. Anything that spawns a
+        # long-lived child needs the group killed, not the child.
+        # The session leader records its own pgid. `$!` here is setsid's pid, not the leader's --
+        # setsid forks when it is already a group leader, so killing -$! signals the wrong group
+        # and the grandchild survives exactly as before. Verified: the first attempt at this fix
+        # still left the child alive, which is why the pgid is read back from the process itself
+        # rather than inferred.
+        PGID_FILE="$RESULT_DIR/driver.pgid"
         set +e
-        (
-            cd "$ACTIVE_WORKTREE"
-            HANDOFF_PROVIDER="$provider" timeout --foreground "$BENCH_TIMEOUT_SECONDS" \
-                ./bin/handoff do "$PLAN"
-        ) >"$RESULT_DIR/driver.log" 2>&1
+        # --wait is not optional: without it setsid forks and returns 0 immediately whenever it is
+        # already a process-group leader, so the driver detaches, the run records exit 0 before
+        # any work happens, and the timeout never applies to anything.
+        setsid --wait bash -c '
+            echo $$ >"$5"
+            cd "$1" || exit 1
+            HANDOFF_PROVIDER="$2" HANDOFF_FEEDBACK_FILE="$6" \
+                timeout -k 15 "$3" ./bin/handoff do "$4"
+        ' _ "$ACTIVE_WORKTREE" "$provider" "$BENCH_TIMEOUT_SECONDS" "$PLAN" "$PGID_FILE" \
+            "$FEEDBACK_FILE" >>"$RESULT_DIR/driver.log" 2>&1
         DRIVER_STATUS=$?
+        # Sweep whatever the driver left behind. An agent CLI is a grandchild of the driver, so a
+        # timed-out round otherwise leaves it running against a worktree that is about to be
+        # deleted -- and it then competes with the next repetition for the same GPU model, which
+        # reads as the next model collapsing.
+        DRIVER_PGID="$(cat "$PGID_FILE" 2>/dev/null)"
+        if [[ "$DRIVER_PGID" =~ ^[0-9]+$ ]]; then
+            kill -TERM "-$DRIVER_PGID" 2>/dev/null
+            sleep 2
+            kill -KILL "-$DRIVER_PGID" 2>/dev/null
+        fi
+        rm -f "$PGID_FILE"
         set -e
 
         FINISHED_AT="$(date +%s)"
@@ -449,7 +547,55 @@ for provider in "${PROVIDER_LIST[@]}"; do
         [[ ! -f "$RUN_DIR/stdout.log" ]] || cp "$RUN_DIR/stdout.log" "$RESULT_DIR/provider.log"
         [[ ! -f "$RUN_DIR/session-id" ]] || cp "$RUN_DIR/session-id" "$RESULT_DIR/session-id"
 
+        # Capture against the tree as it stood before the FIRST attempt, not this one.
+        #
+        # bin/handoff snapshots tree-before at the start of every invocation, so on a repair
+        # attempt the "before" state already contains the previous attempt's work and the captured
+        # diff shows only the final increment. One run recorded a 257-byte diff containing nothing
+        # but the deletion of a scratch file, while the ~4,500 bytes of real implementation — four
+        # files, one of them new — went unrecorded.
+        #
+        # The scoring itself was unaffected, because the plan's verification commands read the
+        # working tree directly. The danger is the gates that read these artifacts: a final attempt
+        # that changes nothing because the previous one finished the job would trip the empty-diff
+        # gate and be relabelled `false-success`, condemning a correct run as fabrication.
+        if [[ -z "$FIRST_TREE_BEFORE" && -s "$RUN_DIR/tree-before" ]]; then
+            FIRST_TREE_BEFORE="$(cat "$RUN_DIR/tree-before")"
+        elif [[ -n "$FIRST_TREE_BEFORE" ]]; then
+            printf '%s\n' "$FIRST_TREE_BEFORE" >"$RUN_DIR/tree-before"
+        fi
+
         capture_tree_artifacts "$ACTIVE_WORKTREE" "$RUN_DIR" "$RESULT_DIR"
+
+        # Accumulate the changed-file list per attempt, inside the loop.
+        #
+        # A file created in one attempt and deleted in the next nets to zero in the final diff, so
+        # anything reading only the end state cannot see it — one run created a scratch `temp.php`
+        # and removed it on the retry, leaving no evidence. Littering is worth catching even when
+        # the model tidies up after itself, because the next model will not.
+        #
+        # This must stay inside the loop. Placed after it, the union sees only the last attempt and
+        # the transient case is missed — which is exactly how the first version of this check
+        # failed its own test.
+        cat "$RESULT_DIR/tree-files.txt" >>"$RESULT_DIR/touched-files.txt" 2>/dev/null || true
+        [[ ! -s "$RESULT_DIR/touched-files.txt" ]] ||
+            sort -u -o "$RESULT_DIR/touched-files.txt" "$RESULT_DIR/touched-files.txt"
+
+        # An empty diff scores zero, before any criterion is evaluated.
+        #
+        # "The file parses" passes trivially on an unmodified tree, so a run that did nothing at
+        # all collected 1/6 rather than 0/6 and sat above the floor in the results table. Devstral
+        # scored that way six times out of six while changing zero bytes, three of those runs
+        # reporting status: complete with an invented summary. A criterion that a do-nothing run
+        # can satisfy is not measuring the model.
+        #
+        # This is deliberately checked against the captured tree diff rather than the model's
+        # report, because the report is the thing least worth trusting here.
+        DID_NOTHING=0
+        if [[ ! -s "$RESULT_DIR/tree-files.txt" ]]; then
+            DID_NOTHING=1
+            echo "no file changed; every criterion scored zero" >"$RESULT_DIR/empty-diff.txt"
+        fi
 
         CRITERIA_MET=0
         COMMAND_NUMBER=0
@@ -468,16 +614,91 @@ for provider in "${PROVIDER_LIST[@]}"; do
             [[ "$COMMAND_STATUS" -ne 0 ]] || CRITERIA_MET=$(( CRITERIA_MET + 1 ))
         done <"$VERIFICATION_FILE"
         (( CRITERIA_MET <= CRITERIA_TOTAL )) || CRITERIA_MET="$CRITERIA_TOTAL"
+        if [[ "$DID_NOTHING" -eq 1 ]]; then
+            printf 'tree unchanged: criteria forced from %s to 0\n' "$CRITERIA_MET" \
+                >>"$RESULT_DIR/verification.log"
+            CRITERIA_MET=0
+        fi
 
-        SCOPE_VIOLATIONS=0
-        : >"$RESULT_DIR/scope-violations.txt"
+        cp "$RESULT_DIR/verification.log" "$RESULT_DIR/verification-attempt-$ATTEMPTS.log"
+
+        # Green, or out of attempts: stop. Otherwise hand back the failing commands and go again.
+        if [[ "$CRITERIA_MET" -eq "$CRITERIA_TOTAL" && "$DID_NOTHING" -eq 0 ]]; then
+            break
+        fi
+        if (( ATTEMPTS >= BENCH_MAX_ATTEMPTS )); then
+            break
+        fi
+
+        {
+            awk '
+                /^command [0-9]+: / { cmd = $0 }
+                /^exit_code: / {
+                    if ($2 != 0) { sub(/^command [0-9]+: /, "", cmd); print "- FAILED: `" cmd "`" }
+                }
+            ' "$RESULT_DIR/verification.log"
+            [[ "$DID_NOTHING" -eq 0 ]] || echo "- You changed no files at all. The task is not done."
+        } >"$FEEDBACK_FILE"
+        printf '==> attempt %s did not pass; retrying\n' "$ATTEMPTS" >>"$RESULT_DIR/driver.log"
+        done
+
+        # Patch-only contract: a tracked file may be modified, never regenerated.
+        #
+        # The greenfield/edit split recorded earlier is a correlation, and the mechanism behind it
+        # matters more than the split. A model that replaces a file loses everything it did not
+        # reproduce -- a 421-line service once came back as an 11-line fragment whose code was
+        # correct and whose destination was not. That happened to be a parse error, so a syntax
+        # gate caught it; a fragment carrying its own class declaration would have been valid PHP
+        # and would have deleted 410 working lines silently.
+        #
+        # opencode cannot prevent this: permission config was measured twice against this exact
+        # failure (write=deny, then edit=deny, in a project-level opencode.json) and the file was
+        # created both times. So the contract is enforced here, where the harness -- not the model
+        # and not the model's report -- decides whether the round stands.
+        #
+        # Threshold: a tracked file that loses more than half its lines, or whose change rewrites
+        # more lines than the file originally had, is treated as regenerated rather than patched.
+        REWRITES=0
+        : >"$RESULT_DIR/rewrite-violations.txt"
         while IFS= read -r changed; do
             [[ -n "$changed" ]] || continue
-            if ! grep -Fqx -- "$changed" "$ALLOWED_FILE"; then
-                echo "$changed" >>"$RESULT_DIR/scope-violations.txt"
-                SCOPE_VIOLATIONS=$(( SCOPE_VIOLATIONS + 1 ))
+            git -C "$ACTIVE_WORKTREE" cat-file -e "$BASE_COMMIT:$changed" 2>/dev/null || continue
+            BEFORE_LINES="$(git -C "$ACTIVE_WORKTREE" show "$BASE_COMMIT:$changed" 2>/dev/null | wc -l)"
+            [[ "$BEFORE_LINES" -gt 0 ]] || continue
+            [[ -f "$ACTIVE_WORKTREE/$changed" ]] && \
+                AFTER_LINES="$(wc -l <"$ACTIVE_WORKTREE/$changed")" || AFTER_LINES=0
+            REMOVED="$(git -C "$ACTIVE_WORKTREE" diff --numstat "$BASE_COMMIT" -- "$changed" |
+                awk '{ print $2 + 0 }')"
+            REMOVED="${REMOVED:-0}"
+            if (( AFTER_LINES * 2 < BEFORE_LINES )) || (( REMOVED >= BEFORE_LINES )); then
+                printf '%s: %s lines -> %s, %s removed (regenerated, not patched)\n' \
+                    "$changed" "$BEFORE_LINES" "$AFTER_LINES" "$REMOVED" \
+                    >>"$RESULT_DIR/rewrite-violations.txt"
+                REWRITES=$(( REWRITES + 1 ))
             fi
         done <"$RESULT_DIR/tree-files.txt"
+
+        # Scope is judged on the union accumulated per attempt, and littering is reported
+        # separately from editing a file
+        # the plan did not name. They are different mistakes: one leaves rubbish behind, the other
+        # changes code that was supposed to be untouched.
+        SCOPE_VIOLATIONS=0
+        LITTER=0
+        : >"$RESULT_DIR/scope-violations.txt"
+        : >"$RESULT_DIR/litter.txt"
+        while IFS= read -r changed; do
+            [[ -n "$changed" ]] || continue
+            grep -Fqx -- "$changed" "$ALLOWED_FILE" && continue
+            echo "$changed" >>"$RESULT_DIR/scope-violations.txt"
+            SCOPE_VIOLATIONS=$(( SCOPE_VIOLATIONS + 1 ))
+            # Untracked at the base commit means the agent invented it.
+            if ! git -C "$ACTIVE_WORKTREE" cat-file -e "$BASE_COMMIT:$changed" 2>/dev/null; then
+                gone=""
+                [[ -e "$ACTIVE_WORKTREE/$changed" ]] || gone="  (created then removed)"
+                printf '%s%s\n' "$changed" "$gone" >>"$RESULT_DIR/litter.txt"
+                LITTER=$(( LITTER + 1 ))
+            fi
+        done <"$RESULT_DIR/touched-files.txt"
 
         STATUS=""
         DEVIATIONS=0
@@ -526,16 +747,47 @@ for provider in "${PROVIDER_LIST[@]}"; do
             fi
         fi
 
+        # A round is green only when the harness agrees, and the harness reads the tree. The
+        # model's own status is one input among several and the least reliable of them: three
+        # runs reported complete on a tree they had not touched.
         ROUNDS=null
         if [[ "$STATUS" == complete && "$CRITERIA_MET" -eq "$CRITERIA_TOTAL" &&
-              "$SCOPE_VIOLATIONS" -eq 0 && "$BLOCKERS" -eq 0 ]]; then
-            ROUNDS=1
+              "$SCOPE_VIOLATIONS" -eq 0 && "$BLOCKERS" -eq 0 &&
+              "$REWRITES" -eq 0 && "$DID_NOTHING" -eq 0 ]]; then
+            ROUNDS="$ATTEMPTS"
         elif [[ ! -f "$RESULT_DIR/note.txt" ]]; then
             echo "resume rounds are a manual follow-up" >"$RESULT_DIR/note.txt"
         fi
 
+        # A report claiming success over an untouched tree is fabrication, and naming it as such
+        # in the metrics keeps it out of the "complete" column where it would flatter the model.
+        if [[ "$DID_NOTHING" -eq 1 && "$STATUS" == complete ]]; then
+            STATUS=false-success
+            echo "reported complete having changed nothing" >"$RESULT_DIR/note.txt"
+        fi
+
+        # Produce the evidence bundle while the worktree still exists.
+        #
+        # This is what a reviewing model reads instead of re-running the work itself: every gate
+        # with the command that produced it, its exit code, an excerpt and a digest of the full
+        # output — and an explicit list of what was NOT checked. The point is to move verification
+        # cost off the hosted model without asking it to trust a summary that could be invented.
+        #
+        # Known duplication: verify-round re-implements several gates that this script also
+        # computes, and two implementations of "is this acceptable" will drift. Scoring stays here
+        # for now so the existing results remain comparable; converging them is tracked in
+        # docs/local-models.md §9.
+        if [[ -x "$ACTIVE_WORKTREE/tools/verify-round" ]]; then
+            "$ACTIVE_WORKTREE/tools/verify-round" \
+                "$ACTIVE_WORKTREE" \
+                "$ACTIVE_WORKTREE/.handoff/plans/$PLAN.md" \
+                "$BASE_COMMIT" \
+                "$RESULT_DIR/evidence" >"$RESULT_DIR/evidence.log" 2>&1 || true
+        fi
+
         write_metrics "$RESULT_DIR" "$STATUS" "$CRITERIA_MET" "$SCOPE_VIOLATIONS" \
-            "$DEVIATIONS" "$BLOCKERS" "$ROUNDS" "$ELAPSED" "$DRIVER_STATUS"
+            "$DEVIATIONS" "$BLOCKERS" "$ROUNDS" "$ELAPSED" "$DRIVER_STATUS" \
+            "$REWRITES" "$DID_NOTHING" "$LITTER"
 
         remove_active_worktree "$RESULT_DIR" "$PLAN/$provider/$repetition"
     done

@@ -79,6 +79,26 @@ snapshot_tree() {
 
 DEV_INSTRUCTIONS="You are the implementer in a two-model workflow. Another model wrote the plan and will review your work; you write the code. The plan file is the complete specification — implement exactly what it says, nothing more. Do not create git commits, do not amend, do not stash, do not run git checkout or git reset. Leave every change uncommitted in the working tree. Do not modify files listed as out of scope. If the plan is wrong or ambiguous, implement your best reading and record it under deviations rather than stopping. Report honestly: never claim a test passed unless you ran it and saw it pass."
 
+# The operational rules are a separate layer from both the plan and the project's own conventions,
+# and only the rule headings travel to the model — the rationale table in that file is for the
+# maintainer. Three layers, kept apart on purpose: benchmark findings (never shown to the model,
+# because telling a model under test which mistakes it is expected to make contaminates the
+# measurement), these task-independent rules, and the plan.
+#
+# Extracted rather than inlined so the rules can be edited and diffed as prose. Everything from
+# the first "## EDITING RULES" heading to the "## Why each rule is here" heading is sent.
+AGENT_RULES_FILE="${HANDOFF_AGENT_RULES:-$HANDOFF_HOME/templates/agent-rules.md}"
+if [[ -f "$AGENT_RULES_FILE" ]]; then
+    AGENT_RULES="$(awk '
+        /^## EDITING RULES/ { on=1 }
+        /^## Why each rule is here/ { on=0 }
+        on { print }
+    ' "$AGENT_RULES_FILE")"
+    [[ -z "$AGENT_RULES" ]] || DEV_INSTRUCTIONS="$DEV_INSTRUCTIONS
+
+$AGENT_RULES"
+fi
+
 case "$MODE" in
 diff)
     if [[ ! -f "$RUN_DIR/tree-before" || ! -f "$RUN_DIR/tree-after" ]]; then
@@ -105,6 +125,27 @@ Read that file first, in full. It is the complete specification: implement every
 ${PROJECT_RULES}
 
 When you are done, run the verification commands listed in the plan and report the real results. Leave all changes uncommitted in the working tree — the reviewer reads the diff and owns the commit."
+
+    # A repair attempt. The harness has already run the plan's verification commands and knows
+    # exactly which ones failed, so the model is told that rather than being asked to look again.
+    #
+    # This exists as a `do`-mode option rather than relying on `handoff resume` because resume
+    # needs provider session support, and the Cline adapter has none: `--id` is incompatible with
+    # --json in 3.0.52. A repair loop that only worked for some providers would silently measure
+    # different things for different models.
+    if [[ -n "${HANDOFF_FEEDBACK_FILE:-}" && -s "${HANDOFF_FEEDBACK_FILE}" ]]; then
+        PROMPT="$PROMPT
+
+## Previous attempt
+
+You already attempted this task and the working tree still holds your changes. These acceptance
+checks FAILED when the harness ran them:
+
+$(cat "$HANDOFF_FEEDBACK_FILE")
+
+Fix only what is needed to make those checks pass. Do not start over, do not revert your earlier
+work, and do not change anything the plan did not ask for."
+    fi
     ;;
 
 resume)
