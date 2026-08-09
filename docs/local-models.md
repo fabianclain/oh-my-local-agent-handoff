@@ -70,6 +70,43 @@ fenced JSON with `tool_calls` absent. The format is the model's.
 > Trap: ollama stores the chat template as a **separate layer outside the GGUF**. Pointing
 > llama.cpp at an ollama blob tests a template-stripped model and tells you nothing.
 
+
+### The Qwen family emits correct tool calls — as text
+
+Four models were rejected by the tool-call probe: `qwen2.5-coder:14b`, `JanusCoder-14B`,
+`Qwen3-Coder-30B-A3B-Instruct` and `gemma-4-12B-coder-fable5`. That rejection is about **format,
+not capability**, and the distinction matters because Qwen3-Coder is marketed specifically for
+agentic coding.
+
+Probed at ollama's API directly, with tools in the payload:
+
+```
+qwen2.5-coder → content: {"name":"read","arguments":{"filePath":"/tmp/probe.md"}}
+qwen3-coder   → content: {"name":"read","arguments":{"filePath":"/tmp/probe.md"}}
+```
+
+Correct tool, correct argument name, correct path — in `content` rather than `tool_calls`.
+
+**One cause is a packaging bug.** Qwen3-Coder's documented format is
+`<tool_call><function=name><parameter=key>value</parameter></function></tool_call>`. The unsloth
+GGUF ships a template containing `<tool_call>` but **neither `<function=` nor `<parameter=`** — a
+Qwen2.5-era template. The model is instructed in a format it was not trained to emit and falls
+back to bare JSON. Worth reporting upstream.
+
+**A shim fixes this at the API layer.** `tools/toolcall-shim.py` proxies ollama, parses a tool
+call out of `content`, and promotes it into `tool_calls`. It only promotes a call whose name
+matches a tool the request actually offered, so incidental JSON in prose is untouched. Verified
+with curl for both qwen models: `tool_calls: PRESENT`.
+
+**It does not yet work inside opencode.** Three streaming shapes were tried; the last emits
+NDJSON matching ollama's own format (content chunk with `done:false`, terminator with `done:true`
+and an empty message) and opencode still returns nothing. Decisively, **gemma also fails through
+the shim** while working directly — so the fault is the shim, not the Qwen models.
+
+Two better routes than reverse-engineering ollama's wire format from the outside: read what
+`ollama-ai-provider-v2` actually parses, or point the client at an OpenAI-compatible endpoint
+(llama.cpp's server offers one) where the contract is specified rather than inferred.
+
 ---
 
 ## 2. Residency — below 100% GPU, treat it as unusable
