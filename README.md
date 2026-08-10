@@ -15,6 +15,10 @@ failure modes it exists to catch.
 **[docs/START-HERE.md](docs/START-HERE.md)** — clone, one setup command, your first plan, and how
 to read the verdict. Pre-configured for the stack that measured best.
 
+**[docs/DRIVING.md](docs/DRIVING.md)** — the three seats, how to size a task, and how to read a
+failure. Claude plans with `/local-implement`, Codex runs the loop with `/local-drive`, the local
+model writes the code.
+
 ```bash
 tools/setup-local-implementer            # probes the stack with a real tool call, then stops if it is wrong
 HANDOFF_PROVIDER=local handoff do <slug> # implements, verifies, and fails if the gates reject
@@ -134,12 +138,32 @@ Mann-Whitney, and — for a variable that only acts on repair — scores attempt
 the arms are identical by construction. One comparison showed a 27-point gap of which 20 points
 were already present before the variable applied.
 
+```bash
+handoff auto <slug>   # local implements ×2 → a hosted planner re-specifies → local retries ×2 → stop
+```
+
+Three seats, three different jobs: you (or Claude Code) drive, `codex` and `glm` alternate as the
+planner that re-specifies after a rejection, and the local model implements. The ladder refuses to
+run if the planner and the implementer are the same model, and a planner that edits anything but
+its plan file stops the ladder rather than being trusted.
+
+Every run is journalled: `handoff log` for one line per run, `handoff stats` for outcomes,
+adapter errors and what actually rejects rounds, `handoff retro <slug>` to ask the model what it
+would change about the plan. Records are JSON Lines under `.handoff/journal/`, with each round's
+plan, evidence and event stream archived before the next round overwrites the run directory.
+
 The harness has its own tests, none of which need a GPU:
 
 ```bash
-tools/harness-selftest      # bench/run end to end, against a provider that runs no model
-tools/feedback-selftest tools/patch-shape-selftest tools/shim-selftest
+tools/selftest-all          # every suite, plus the checks no single suite can make
+tools/smoke-e2e             # the whole journey in two seconds — run this one first
 ```
+
+`smoke-e2e` walks `init → check → do → verify → diff` against a provider that runs no model and
+asserts the state left at each step, plus the things only an end-to-end pass can see: that every
+path in a documented command exists, that all four prompt layers reach the implementer, and that
+each documented refusal exits with its documented status *and says why*. Every check in it was
+mutation-tested — break the thing it guards and that check, and preferably only that check, fails.
 
 ## Providers
 

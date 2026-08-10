@@ -24,17 +24,24 @@ On a six-file refactoring task, 30 runs, gpt-oss-20b on a 16 GB card:
 everything around reporting on it — which is why the harness reads the tree and not the report.
 
 **Those figures are a six-file refactor of code that already existed.** On a greenfield Laravel
-task — new service, new view, aggregate SQL — the same stack went **0 accepted in 5 rounds**. Do
+task — new service, new view, aggregate SQL — the same stack went **0 accepted in 7 rounds**. Do
 not carry the numbers above across task shapes; carry the method instead.
 
 | | six-file refactor | greenfield + aggregate SQL |
 | --- | ---: | ---: |
-| Rounds accepted | 93% within three attempts | **0 of 5** |
-| Best single round | — | 9 of 12 criteria |
+| Rounds accepted | 93% within three attempts | **0 of 7** |
+| Best single round | — | 9 of 12 criteria, then 3 of 14 on the resume |
 
-What broke there, in order: file corruption on a second edit of a long file (2 of 5, both fatal),
-invented conditions the plan never mentioned (3 of 5), scratch files despite prose forbidding them
-(2 of 5), and silently dropped fields in a contract a later step depended on.
+What broke there, by frequency: invented conditions the plan never mentioned (3 of 7), file
+truncation on a *later* edit of a file the model had already written (2 of 7, both fatal, both on
+files over 150 lines), tool-call format errors (2 of 7 — one round made 44 calls, none of them a
+write, and reported success over an empty diff), scratch files despite prose forbidding them
+(2 of 7), placement errors after two prose warnings (2 of 7), and silently dropped fields in a
+contract a later step depended on.
+
+The reviewer wrote the same service by hand afterwards: 8/8 tests, 12/12 acceptance, first run.
+Read that as scope guidance rather than as a verdict — the local model is worth reaching for on
+mechanical change to code that exists, and is currently a poor bet on greenfield design.
 
 **This is a specific slice, not a general coding agent.** It works for well-specified, mechanically
 checkable changes. It is unproven on ambiguous work, on design decisions, and on tasks where a
@@ -60,10 +67,18 @@ cd oh-my-local-agent-handoff
 tools/setup-local-implementer
 ```
 
-That checks prerequisites, starts `llama-server` at 64k context, points Cline at it, and — the step
+That checks prerequisites, starts `llama-server` at a context size chosen from your **free** VRAM
+(32k unless ~15 GB is free — 64k does not fit alongside a desktop session, and llama.cpp spills to
+host RAM rather than refusing), points Cline at it, and — the step
 that matters — **probes the stack with a real tool call**. A server that answers `/health` can
 still corrupt every tool call it returns, and a benchmark cannot tell that apart from a bad model.
 Finding that out the hard way cost this project every result it had gathered.
+
+To check the harness itself rather than the model — after pulling, or if something behaves oddly:
+
+```bash
+tools/smoke-e2e     # ~2s: the whole journey against a provider that runs no model. No GPU.
+```
 
 If the weights are missing it prints the download command and stops. Get the GGUF from Hugging
 Face, **not** from ollama's blob store: ollama keeps the chat template as a separate layer outside
@@ -84,6 +99,24 @@ plans being added.
 
 Edit `.handoff/config.sh` — it carries how your project builds, tests and formats into every
 prompt. Without it the implementer is guessing at your conventions.
+
+### Run it in a worktree, and check where the worktree's database points
+
+The implementer runs arbitrary commands against a live tree with approval disabled. Nothing in the
+harness isolates that, so isolate it yourself:
+
+```bash
+git worktree add ../myproject-featurename -b featurename
+```
+
+One session lost its development database — every table, including `sqlite_master` — with no
+backup. The cause was never established, but the leading candidate is a scratch script a round
+wrote that booted the whole application against the real database. Recovery was possible only
+because the raw source data happened to still be on disk.
+
+**A worktree alone is not isolation if the database is not.** Copying `.env` across brings an
+absolute `DB_DATABASE` with it, which points the worktree straight back at the live file and buys
+nothing. Point it at a copy, and take a backup you can actually restore from.
 
 **Do not skip the `.gitignore` line.** Plans usually assert "exactly N files changed", and any
 agent framework writing state into your working directory will break that check. The first
@@ -217,14 +250,25 @@ the easiest thing in a codebase to satisfy with three lines that mean nothing.
 
 ### Or drive it from Claude Code
 
-`skills/local-implement/SKILL.md` is a Claude Code skill that does all of the above: it interviews
-you about the change, writes the plan in verifiable form, checks it, runs it, and reports the
-harness's verdict rather than the model's account of itself.
+`integrations/claude-skills/local-implement/SKILL.md` is a Claude Code skill that does all of the
+above: it interviews you about the change, writes the plan in verifiable form, checks it, runs it,
+and reports the harness's verdict rather than the model's account of itself.
 
 ```bash
 mkdir -p ~/.claude/skills
-cp -r skills/local-implement ~/.claude/skills/     # available in every project on the machine
+cp -r integrations/claude-skills/local-implement ~/.claude/skills/   # every project on the machine
 ```
+
+There are two skills, one per seat, and both install for both CLIs:
+
+```bash
+tools/build-integrations --install
+```
+
+`/local-implement` writes the plan; `/local-drive` gets an existing plan through the gates and
+reports. The intended pairing is Claude planning and Codex driving — the expensive model spends its
+turn on the specification, which is the part that decides everything, and a cheaper one runs the
+loop. See [DRIVING.md](DRIVING.md).
 
 Then ask for a feature in plain language and it takes it from there. The division of labour is the
 point: the hosted model writes the specification, which is the part the local model cannot do and
@@ -269,7 +313,24 @@ patched, for instance. They are what tells you whether an accepted patch is one 
 Then `handoff diff my-task` to see exactly what changed, and commit it yourself. The implementer
 never commits.
 
-## 7. When it fails
+## 7. Look at what actually happened
+
+Every run is recorded. The run directory is reused by the next round of the same plan, so the
+journal copies each round's plan, evidence and event stream somewhere immutable first.
+
+```bash
+handoff log       # one line per run: outcome, criteria score, time, writes, adapter errors
+handoff stats     # across all runs: what is actually failing, and how often
+```
+
+The column to watch is **writes**. A round with zero writes never attempted the task — that is an
+adapter or context failure wearing a model failure's clothes, and re-specifying the plan will not
+help. Backfilling three real runs found the context limit hit in all three.
+
+`handoff retro <slug>` asks the model, read-only and after it has been shown the verdict, what it
+would change about the plan. Full detail in [usage.md](usage.md).
+
+## 8. When it fails
 
 Roughly 1 in 14 tasks needs you. Far more common, about 1 in 3, is a correct patch with **no report
 at all** — the tree is fine and the model simply ended its turn without saying anything. Check the
@@ -301,6 +362,7 @@ dishonest:
 
 | | |
 | --- | --- |
+| [DRIVING.md](DRIVING.md) | Who does what, how to size a task, how to read a failure |
 | [usage.md](usage.md) | The full command surface, provider table, settings with their evidence |
 | [how-it-works.md](how-it-works.md) | The gates, the four prompt layers, who decides what "verified" means |
 | [local-models.md](local-models.md) | Every measured finding, and the register of conclusions that turned out wrong |

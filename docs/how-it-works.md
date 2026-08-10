@@ -280,11 +280,21 @@ regression; that probe can, and not having it is what made every ollama-served g
 The harness has its own tests, none of which need a GPU:
 
 ```bash
+tools/selftest-all            # all of the below, plus the plan-parser agreement check
+tools/smoke-e2e               # the whole journey, and the state each step leaves behind
 tools/harness-selftest        # bench/run end to end, against a provider that runs no model
+tools/verifier-selftest       # verify-round and bin/handoff — what real use touches
 tools/feedback-selftest       # what a repair attempt is told
 tools/patch-shape-selftest    # the order and hunk-count checks
 tools/shim-selftest           # the tool-call shim
 ```
+
+The split is worth understanding, because it maps onto where the bugs actually were. The
+`*-selftest` suites test units. `smoke-e2e` tests that the units are still connected to each
+other — which is where three of the defects users hit lived: a verifier looked up under the user's
+repo instead of the harness (so verification silently skipped for every real user while the
+benchmark kept working), a `resume` that did not verify and exited 0 regardless, and a template
+that taught a heading the parser does not read. None of those were visible from inside a unit.
 
 Plan slugs are short, ideally one word: a long hyphenated slug was mis-transcribed with
 underscores and reported as a missing file.

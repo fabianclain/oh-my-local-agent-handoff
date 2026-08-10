@@ -37,15 +37,29 @@ attributed to the model.
 
 ## Queued from real use — the editing-failure batch
 
-Five rounds on a greenfield Laravel task produced 0 accepted, against documented figures of 78%
+Seven rounds on a greenfield Laravel task produced 0 accepted, against documented figures of 78%
 first-attempt. **File corruption ended the two most promising rounds** — a docblock running into a
 method body, parse error, both times on files over 150 lines being edited a second time. That is an
 editing failure, not a reasoning failure, and nothing in the harness targets it.
+
+Rounds 6 and 7 of that feature added a second failure with nothing behind it either: **intermittent
+tool-call corruption**, reported by the adapter as `peg-native format`, three occurrences in each
+round. Round 7 recovered and wrote both files. Round 6 never did — 44 tool calls, every one a
+`read_files` or `search_codebase`, not a single `apply_patch` or `run_commands`, over in 35 seconds
+and 1336 output tokens, empty diff, and a report claiming partial success. An entire round bought
+nothing, and the harness recorded it as a model failure because it has no way to tell the two
+apart.
 
 | Round | Arm | n | What it settles | Est. |
 | --- | --- | ---: | --- | ---: |
 | 15 | `lcgptosslwhole` — whole-file writes under ~400 lines | 15 | Does rewriting the file wholesale eliminate mis-anchored partial edits? Targets the #1 observed failure | ~1.5h |
 | 16 | `lcgptosslsyntax` — linter as a post-write hook | 15 | Does feeding a parse error back immediately let the model repair a truncation, instead of building on a broken file for the rest of its budget? | ~1.5h |
+| 17 | `peg-native` repro, not a benchmark | — | Is the tool-call corruption reproducible outside Cline? Extend `tools/engine-conformance` with the call shapes round 6 died on, alongside `tools/repro-ollama-toolcall-500.py` | ~1h |
+
+Round 17 is diagnostic rather than comparative, and it should run **before** 15 and 16: a round
+that emits no writes at all is scored as a failure, so an intermittent adapter fault silently
+depresses every arm it touches. Two of seven real rounds hit it. If that rate holds inside the
+benchmark, it is larger than most of the effects being measured.
 
 Both are measurable against `wide` with round 11's arm as control, and both should be run before
 anyone trusts a read of five rounds — including the read that produced them.

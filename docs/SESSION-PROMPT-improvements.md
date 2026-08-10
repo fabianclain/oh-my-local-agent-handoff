@@ -12,12 +12,19 @@ and the harness verifying.
 ## First, prove nothing is broken
 
 ```bash
-tools/selftest-all      # every suite + the plan-parser agreement check. No GPU, ~3 minutes.
+tools/smoke-e2e         # the whole journey, ~2 seconds. Start here when something is broken.
+tools/selftest-all      # every suite + the plan-parser agreement check. No GPU, ~90 seconds.
 ```
 
-It must print `everything passes`. Run it before trusting a change and again before committing one.
-Both of its newest checks were mutation-tested; if you add a check, mutate the thing it guards and
-confirm it fails, because several guards here passed vacuously the first time.
+`selftest-all` must print `everything passes`. Run it before trusting a change and again before
+committing one. `smoke-e2e` is the fast one to keep re-running while editing: it walks
+`init → check → do → verify → diff` against the stub provider and asserts the state at each step,
+that every path in a documented command exists, that all four prompt layers arrive, and that each
+documented refusal exits with its status *and says why*.
+
+Every check in both was mutation-tested. If you add one, mutate the thing it guards and confirm it
+fails — three checks in `smoke-e2e` passed vacuously on the first attempt, each because the fixture
+failed for a second reason and so could not isolate what it claimed to test.
 
 ## Read first
 

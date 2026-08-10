@@ -208,6 +208,109 @@ command, not on appearances.
 This is also the economics. A rejected round should never reach a hosted reviewer; if every attempt
 costs hosted tokens to triage, the case for a local implementer collapses.
 
+## Three models, one task: `handoff auto`
+
+The loop this automates has three seats, and they are different jobs:
+
+| Seat | Who | Why that one |
+| --- | --- | --- |
+| **Driver** | you, or Claude Code via the skill | Decides what to build, splits it into steps, reads the handover, owns the commit |
+| **Planner** | `codex` and `glm`, alternating | Re-specifies after a rejection. Hosted, cheap relative to a person's time, and *not* the model being judged |
+| **Implementer** | the local model | Writes the code. Free at inference, and reliable when the specification is mechanical |
+
+```bash
+handoff auto <slug>                                  # local ×2 → planner → local ×2 → planner → stop
+handoff auto <slug> --planners glm --escalations 1   # one cheap escalation only
+handoff auto <slug> --dry-run                        # print the ladder without running anything
+```
+
+Each rung is recorded in `.handoff/runs/<slug>/ladder.md`, which doubles as the handover brief when
+the ladder gives up: what was tried, what each round scored, and what to read first.
+
+**Why alternate planners.** Two different models reading the same failure is a second opinion for
+the price of one API call. More usefully, if both write plans that fail the same way, that is
+evidence about the *task* — the step is too big, or the work is not mechanical — rather than about
+either plan. That is the moment to write it yourself.
+
+**Why the planner is never the implementer.** The ladder refuses to start if they are the same
+model. One model writing the plan, writing the code, and being judged against its own criteria has
+removed the only independent step in the loop. `codex` is a perfectly good implementer and the
+harness's default provider, which makes this an easy mistake to make by accident.
+
+**What a planner is allowed to touch.** The new plan file, and `.handoff/ladder-notes.md` for
+anything that is not a plan change. Nothing else. If it edits source, or the harness that judges
+the work, the ladder stops and hands you the diff. A model editing its own grader is self-approval
+by another route, and no automation here gets to do it — if a planner thinks the harness is wrong,
+it says so in the notes and a person decides.
+
+### Where the ladder stops early, and why
+
+- **The gates accept.** Done; the changes are uncommitted, review and commit.
+- **A round scored worse than the round before it.** Repairing is losing ground — the usual cause
+  is a partial edit truncating a file the previous round had nearly finished. Repair stops
+  immediately rather than continuing.
+- **The round never happened.** No write attempted and an adapter error recorded: the plan was
+  never asked, so the same plan is re-run once instead of spending an escalation re-specifying it.
+- **The planner's plan would be refused by `check-plan`.** Better to stop than to send the local
+  model at a contract the harness will not score.
+
+## Keeping track across runs
+
+Every `do` and `resume` appends one record to `.handoff/journal/runs.jsonl` and copies that round's
+plan, evidence and event stream into `.handoff/journal/runs/<run-id>/` before the next round can
+overwrite them.
+
+```bash
+handoff log                 # one line per run: outcome, criteria score, time, writes, errors
+handoff log <slug>          # just this plan's rounds
+handoff stats               # across everything: outcomes, adapter errors, what rejects rounds
+tools/journal show <slug>   # the whole record for the latest round of a plan
+tools/journal export-sqlite # a queryable .db, rebuilt from the records in a second
+```
+
+**Why this exists.** `.handoff/runs/<slug>` is reused by every round of the same plan. One real
+feature ran seven rounds and left three surviving logs — the other four had been overwritten by the
+time anyone came to write up what happened, including both rounds that failed most informatively.
+
+**Why JSON Lines and not a database.** No daemon, no migrations, nothing beyond python3, safe to
+append to from concurrent runs, and readable with `grep` and `jq`. SQLite is available as a derived
+view rather than the source of truth — a corrupted source of truth is the failure that prompted
+this in the first place.
+
+### What it records, and the one number worth watching
+
+Per run: the plan and its hash, the provider and model, wall time, the files changed with insertion
+and deletion counts, the verdict and criteria score, every gate that failed, token totals, and —
+mined from the provider's own event stream — how many tool calls it made, how many of those were
+writes, and every error the adapter reported.
+
+**Watch `write_calls`.** A round with zero writes did not fail at the task; it never attempted it.
+Backfilling three real runs immediately showed this:
+
+```
+outcomes           patch-damaged 3
+adapter errors     context-overflow 3, output-token-limit 2, tool-call-format 1
+```
+
+Every one of those rounds hit the context limit, and two hit the output-token ceiling mid-turn.
+Those are infrastructure failures being scored as model failures, and no amount of re-specifying
+the plan addresses them.
+
+### Asking the model what it thinks went wrong
+
+```bash
+handoff retro <slug>        # read-only turn; the answer is stored on the run record
+```
+
+The model is shown the plan and the harness's verdict, then asked what was unclear, what it got
+wrong, and — the useful part — what it would change **about the plan**. Asked without the verdict a
+model grades itself with the same confidence its completion reports do, which is why the verdict
+goes in first.
+
+Treat the answers as leads, not findings. This is stored as data and never fed back into a later
+run automatically: two rounds tested giving the implementer a richer account of its own failure and
+both made outcomes worse.
+
 ## Two things that will bite you
 
 **Do not run two rounds against the same files at once.** The tree-snapshot diff is cumulative,
