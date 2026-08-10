@@ -169,14 +169,56 @@ the gates accept and the report is missing, say the patch is good and the report
 
 The implementer never commits.
 
-### 9. When the gates reject
+### 9. When the gates reject — diagnose, then re-specify narrowly
 
-Read the failing command's output first. Usual causes in order: the plan was ambiguous, an
-acceptance command was wrong, the model got it wrong. Fix the plan and re-run rather than patching
-by hand.
+**Never re-run the same plan.** The harness already retried it internally up to three times, handing
+the model its failing commands each time. Running it again unchanged asks a question that has been
+answered.
 
-**After two failed rounds, split that step further rather than attempting a third.** Two rounds failing the
-same way is evidence about the task's shape, not about the model.
+Your value here is the diagnosis, and it is the part of the loop the local model measurably cannot
+do for itself. Two rounds tested the alternative — giving the implementer a richer account of its
+own failure, then giving it git's account of the tree — and both made outcomes worse. Diagnosis is
+judgement. Keep it on your side.
+
+**Read, in this order:**
+
+1. `.handoff/runs/<slug>/evidence/evidence.md` — which command failed, and its real output
+2. `handoff diff <slug>` — what the tree now contains
+3. The criterion that failing command was supposed to enforce
+
+**Classify it, because the four causes have different fixes:**
+
+| What you find | What it means | What to do |
+| --- | --- | --- |
+| It failed for a reason the plan never mentioned | The plan was ambiguous | Specify that one point exactly, and add a criterion for it |
+| The command tests something the plan never asked for | Your acceptance command is wrong | Fix the command, not the code |
+| The code is a stub that satisfies weaker criteria | The criteria were too coarse | Sharpen the assertions — the commonest case in view work |
+| The code attempts the right thing and gets it wrong | A genuine model error | Narrow the step until the mistake has nowhere to hide |
+
+**Re-specify, do not re-ask.** Write a *new, smaller* plan covering only what failed — often a
+single criterion. If step 3 of 5 failed one of its four criteria, the retry is a one-criterion step,
+not step 3 again.
+
+**Turn the diagnosis into a command, never into more prose.** If your instinct is to add "remember
+to register the route before the catch-all", that instinct is the signal that a criterion is
+missing. A constraint stated twice in prose was still violated; an acceptance command returning 404
+caught it. Every retry should leave the plan with more executable checks, not more emphasis.
+
+**Decide what happens to the failed attempt's changes**, and say so — the tree still holds them,
+and every plan asserts how many files changed:
+
+- **Revert and re-run** when the attempt was mostly wrong: `git checkout -- <files>`, then run the
+  sharpened plan from a clean base. Usually correct.
+- **Keep and follow up** only when the attempt was right as far as it went. The follow-up must then
+  describe the *remaining* delta, and its file-count criterion must match what will actually change.
+
+**After two failures on the same step, split the step rather than attempting a third.** Two rounds
+failing the same way is evidence about the task's shape, not about the model. This is where a
+service-and-view step becomes a service step and a view step.
+
+**This part is designed, not measured.** The rest of this skill rests on runs; the hosted-diagnosis
+loop does not yet. Treat it as the best available reasoning, and be ready to find it wrong — two
+other plausible improvements to the retry path already were.
 
 ## Setup
 

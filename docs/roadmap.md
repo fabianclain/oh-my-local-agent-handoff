@@ -138,6 +138,39 @@ green rate too — round 7 showed how much of a difference this plan can produce
 
 ---
 
+## 0b. Hosted diagnosis between rounds — designed, untested
+
+Rounds 7 and 8 both tried to improve the retry by giving the **implementer** more: a richer account
+of its failure, then git's account of the tree. Round 7 was inconclusive, round 8 damaged trees. The
+conclusion drawn at the time — give the local model less to judge, not better material for judging
+— is right as far as it goes, and it leaves an obvious gap: nobody has tried moving the diagnosis
+to the model that is good at it.
+
+**The proposal.** When a round is rejected, the hosted driver reads the evidence bundle, classifies
+the failure, and writes a *new, narrower* plan — often one criterion — rather than re-running the
+same one. The harness's internal repair loop already re-asks the same question three times; this
+operates a layer above it, between rounds.
+
+Four causes, four different fixes: an ambiguous plan needs a criterion added; a wrong acceptance
+command needs the command fixed and not the code; a stub that satisfies coarse criteria needs
+sharper assertions; a genuine model error needs the step narrowed until the mistake has nowhere to
+hide. Collapsing those into "try again" is what makes a second attempt worth so little.
+
+It is in the skill as step 9, labelled there as designed rather than measured.
+
+**How to measure it.** It cannot be tested by the bench harness as it stands, because bench/run
+drives one plan per round and this loop spans rounds with a hosted model in between. The cheapest
+honest test is a small set of tasks known to fail once — the semantic plan is one — run twice each:
+once re-running the plan unchanged, once with a hosted re-specification. Attempts-to-green is the
+measure, and the sample needed is large, because at n≈15 this plan's noise floor is around 20
+points.
+
+Note the shape of the risk. The two failed attempts both put more context in front of the local
+model. This one puts *less* in front of it — a smaller plan — and puts the extra work on the
+hosted side. That is a different bet, but it is still a bet.
+
+---
+
 ## 0a. What the verifier still cannot tell you
 
 `bin/handoff do` now runs `tools/verify-round` and folds the verdict into its exit status, so real
