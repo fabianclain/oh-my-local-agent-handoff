@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+#
+# doctor — can this machine run a round right now? Read-only, ten seconds, no GPU work.
+#
+#   handoff doctor          check everything and say what to fix
+#   handoff doctor --quiet  print nothing unless something is wrong (for a driver's first step)
+#
+# Written for an agent driving the harness rather than for a person. When an operator model picks
+# up a task, its first question is "is the stack up", and the failures that answer it badly are all
+# silent: a server that is up but serving nothing, a client pointed at the wrong port, a sandbox
+# with no network so localhost is unreachable, `handoff` not on PATH inside the agent's shell.
+# Each of those presents as the local model being bad at its job.
+#
+# Nothing here starts, stops or changes anything. Diagnosis and action are separated on purpose:
+# a check that fixes things cannot be run to find out what is wrong.
+
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HANDOFF_HOME="$(cd "$HERE/.." && pwd)"
+PORT="${LLAMACPP_PORT:-8071}"
+QUIET=0
+[[ "${1:-}" == "--quiet" ]] && QUIET=1
+
+PROBLEMS=0
+ok()   { (( QUIET )) || printf '  ok    %s\n' "$1"; }
+warn() { printf '  WARN  %s\n' "$1"; }
+bad()  { printf '  FAIL  %s\n' "$1"; PROBLEMS=$(( PROBLEMS + 1 )); }
+hint() { printf '        %s\n' "$1"; }
+
+(( QUIET )) || echo "handoff doctor"
+
+# --- the harness itself --------------------------------------------------------------------------
+if command -v handoff >/dev/null 2>&1; then
+    ok "handoff is on PATH ($(command -v handoff))"
+else
+    bad "handoff is not on PATH"
+    hint "export PATH=\"$HANDOFF_HOME/bin:\$PATH\"   — or call $HANDOFF_HOME/bin/handoff directly."
+    hint "An agent's shell does not always inherit your interactive PATH."
+fi
+
+# --- the project ---------------------------------------------------------------------------------
+if REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+    ok "inside a git repository ($REPO_ROOT)"
+    PLANS="$REPO_ROOT/.handoff/plans"
+    # shellcheck disable=SC1091
+    [[ -f "$REPO_ROOT/.handoff/config.sh" ]] && PLANS="$(
+        REPO_ROOT="$REPO_ROOT"; source "$REPO_ROOT/.handoff/config.sh" >/dev/null 2>&1
+        echo "${HANDOFF_PLANS_DIR:-$REPO_ROOT/.handoff/plans}")"
+    if [[ -d "$PLANS" ]]; then
+        ok "$(find "$PLANS" -maxdepth 1 -name '*.md' 2>/dev/null | wc -l) plan(s) in ${PLANS#"$REPO_ROOT"/}"
+    else
+        bad "no plans directory — run: handoff init"
+    fi
+    if [[ -f "$REPO_ROOT/.handoff/config.sh" ]]; then
+        if grep -q '<your formatter>' "$REPO_ROOT/.handoff/config.sh" 2>/dev/null; then
+            warn ".handoff/config.sh is still the unedited template"
+            hint "Its contents go into every prompt. Placeholders teach the model your"
+            hint "conventions are '<your formatter>', which is worse than saying nothing."
+        else
+            ok ".handoff/config.sh is present and edited"
+        fi
+    else
+        warn "no .handoff/config.sh — the implementer gets no project conventions"
+    fi
+    # A dirty tree makes every "exactly N files changed" criterion wrong before the model starts.
+    DIRTY="$(git -C "$REPO_ROOT" status --porcelain -- . ':(exclude).handoff' 2>/dev/null | wc -l)"
+    if (( DIRTY > 0 )); then
+        warn "$DIRTY uncommitted change(s) already in the tree"
+        hint "Most plans assert how many files changed, and that count includes these."
+        hint "Commit or stash before a round, and commit between steps of a sequence."
+    else
+        ok "working tree is clean"
+    fi
+else
+    bad "not inside a git repository — the harness diffs trees, so it needs one"
+fi
+
+# --- the model -------------------------------------------------------------------------------
+if curl -fsS --max-time 3 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+    SERVED="$(curl -fsS --max-time 3 "http://127.0.0.1:$PORT/props" 2>/dev/null |
+        python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("model_path","?").split("/")[-1], d.get("default_generation_settings",{}).get("n_ctx","?"))' 2>/dev/null)"
+    ok "llama-server answering on :$PORT — ${SERVED:-unknown}"
+    CTX="${SERVED##* }"
+    if [[ "$CTX" =~ ^[0-9]+$ ]] && (( CTX < 32768 )); then
+        warn "context is only $CTX tokens"
+        hint "Real rounds here have exceeded 32k and failed with 'exceeds the available"
+        hint "context size'. That reads as a model failure and is not one."
+    fi
+else
+    bad "nothing answering on http://127.0.0.1:$PORT/health"
+    hint "Start it:  $HANDOFF_HOME/tools/llamacpp-serve start gpt-oss-20b 32768"
+    hint "If you are an agent inside a sandbox, localhost may be unreachable even though the"
+    hint "server is running. Codex needs -c sandbox_workspace_write.network_access=true."
+fi
+
+if command -v cline >/dev/null 2>&1; then
+    ok "cline $(cline --version 2>/dev/null | head -1)"
+else
+    bad "cline is not on PATH — npm i -g cline"
+fi
+
+CLINE_CONFIG="${HANDOFF_CLINE_CONFIG:-$HOME/.cline-llamacpp}"
+if [[ -f "$CLINE_CONFIG/data/settings/providers.json" ]]; then
+    ok "cline configured for the local server ($CLINE_CONFIG)"
+else
+    bad "cline is not pointed at llama.cpp — run: $HANDOFF_HOME/tools/setup-local-implementer"
+fi
+
+# --- GPU residency ---------------------------------------------------------------------------
+if command -v nvidia-smi >/dev/null 2>&1; then
+    read -r USED FREE < <(nvidia-smi --query-gpu=memory.used,memory.free \
+        --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ',')
+    if [[ -n "${USED:-}" ]]; then
+        ok "GPU: ${USED} MiB used, ${FREE} MiB free"
+        LOG="${LLAMACPP_STATE:-$HOME/.cache/agent-handoff}/llamacpp.log"
+        if [[ -f "$LOG" ]] && ! "$HERE/llamacpp-serve" residency "$LOG" >/dev/null 2>&1; then
+            warn "the model may not be fully GPU-resident"
+            hint "$HERE/llamacpp-serve residency $LOG   — for the detail"
+            hint "A spilled model still serves, then fills swap and gets OOM-killed."
+        fi
+    fi
+fi
+
+# --- the planners, if a ladder is going to be run -----------------------------------------------
+AVAILABLE=()
+for planner in codex glm claude; do
+    command -v "$planner" >/dev/null 2>&1 && AVAILABLE+=("$planner")
+done
+if (( ${#AVAILABLE[@]} )); then
+    ok "hosted planners available for escalation: ${AVAILABLE[*]}"
+else
+    warn "no hosted planner on PATH — 'handoff auto' can still run local attempts only"
+fi
+
+if (( QUIET )) && (( PROBLEMS == 0 )); then
+    exit 0
+fi
+echo
+if (( PROBLEMS == 0 )); then
+    echo "ready."
+else
+    echo "$PROBLEMS blocking problem(s). Fix those before reading anything into a failed round —"
+    echo "an environment fault and a model failure look identical from the evidence bundle."
+fi
+exit $(( PROBLEMS > 0 ? 1 : 0 ))

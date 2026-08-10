@@ -1,0 +1,764 @@
+#!/usr/bin/env bash
+#
+# smoke-e2e — walk the journey a user walks, and assert every state it leaves behind.
+#
+#   tools/smoke-e2e
+#
+# The other suites test units: verify-round's gates, the feedback renderer, the patch-shape checks.
+# This one tests that the pieces are still wired to each other, which is where every bug that
+# reached a user actually lived:
+#
+#   - the verifier was looked up under the user's repo instead of the harness, so verification
+#     silently skipped for every real user while the benchmark kept working
+#   - `resume` did not verify and exited 0 regardless
+#   - the plan template taught a heading the parser does not read
+#
+# None of those were visible from inside a unit. All three would have failed here.
+#
+# No GPU, no model, no network. Everything runs against providers/stub.sh in a throwaway git repo,
+# so it is safe to run while a benchmark is on the card. Target: under a minute.
+#
+#   1  surface     every path the docs hand a user, and every file the driver loads, exists
+#   2  contract    every provider defines what the driver calls on it
+#   3  journey     init → check → do → verify → diff, with the state asserted at each step
+#   4  rejection   a wrong tree is rejected, and the evidence says which command said so
+#   5  prompt      all four prompt layers reach the implementer, including repair feedback
+#   6  resume       a resumable provider is re-verified, and a losing round is flagged
+#   7  journal     every round is recorded and archived before the next overwrites it
+#   8  ladder      local tries, a hosted planner re-specifies, local tries again
+#   9  refusals    every documented failure exits with its documented status
+#
+# A note on what this can and cannot say. It asserts that the machinery works; it says nothing
+# about whether a model can do the task. Those are separate questions and conflating them is how
+# six harness defects here were first mistaken for model behaviour.
+
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$HERE/.." && pwd)"
+SANDBOX="$(mktemp -d)"
+FAILURES=0
+trap 'rm -rf "$SANDBOX"' EXIT
+
+pass() { echo "    PASS: $1"; }
+fail() { echo "    FAIL: $1"; FAILURES=$(( FAILURES + 1 )); }
+note() { echo "    ~     $1"; }
+
+# Scratch project: one source file, committed, so HEAD is a real baseline.
+new_project() {
+    local root="$SANDBOX/$1"
+    mkdir -p "$root/src"
+    (
+        cd "$root" && git init --quiet . &&
+        git config user.email a@b.c && git config user.name t &&
+        printf '<?php\nclass Cart\n{\n    public function shipping(): int\n    {\n        return 0;\n    }\n}\n' >src/Cart.php &&
+        printf 'untouched\n' >NOTES.md &&
+        git add -A && git commit --quiet -m init
+    ) >/dev/null
+    echo "$root"
+}
+
+# A plan with three criteria and three commands, which is the shape the harness accepts.
+write_plan() {
+    local root="$1" slug="$2"
+    mkdir -p "$root/.handoff/plans"
+    cat >"$root/.handoff/plans/${slug}.md" <<'PLAN'
+# Free shipping over 5000
+
+## The change
+
+`Cart::shipping()` returns 0 when the subtotal reaches 5000 and 499 below it.
+
+## Files to touch
+
+| Path | Action |
+| --- | --- |
+| `src/Cart.php` | modify |
+
+## Acceptance criteria
+
+- [ ] The file parses
+- [ ] shipping() returns 499
+- [ ] Exactly one file changed
+
+## Verification
+
+```bash
+php -l src/Cart.php
+php -r 'require "src/Cart.php"; exit((new Cart)->shipping()===499?0:1);'
+test "$(git status --porcelain -- . ':(exclude).handoff' | wc -l)" -eq 1
+```
+
+## Out of scope
+
+Everything else.
+PLAN
+}
+
+json_field() { python3 -c "import json,sys;print(json.load(open(sys.argv[1]))[sys.argv[2]])" "$1" "$2"; }
+
+command -v php >/dev/null || { echo "smoke-e2e needs php for the acceptance commands"; exit 2; }
+
+# ------------------------------------------------------------------------------------------------
+echo "==> 1/9 surface: what the docs promise, and what the driver loads"
+
+# Files bin/handoff reads at runtime. A missing one degrades a prompt layer silently rather than
+# erroring, which is the worst failure mode available.
+for f in bin/handoff tools/check-plan tools/verify-round tools/setup-local-implementer \
+         tools/journal tools/escalate tools/doctor tools/build-integrations \
+         templates/plan.md templates/config.sh templates/agent-rules.md \
+         schemas/handoff.schema.json providers/local.sh providers/stub.sh \
+         integrations/procedure.md integrations/drive.md; do
+    [[ -e "$REPO/$f" ]] || fail "missing $f — the driver or the docs expect it"
+done
+[[ -x "$REPO/bin/handoff" ]] || fail "bin/handoff is not executable"
+
+# The rules layer is extracted by an awk range in bin/handoff. Rename either heading and the rules
+# vanish from every prompt with no error anywhere.
+RULES="$(awk '/^## EDITING RULES/{on=1} /^## Why each rule is here/{on=0} on' "$REPO/templates/agent-rules.md")"
+if [[ "$(grep -c . <<<"$RULES")" -ge 5 ]]; then
+    pass "the agent-rules extraction still finds rules"
+else
+    fail "bin/handoff's awk range extracts nothing from templates/agent-rules.md"
+fi
+
+# Paths a user is told to type. Only fenced code blocks are scanned: prose legitimately names
+# things that do not exist yet (roadmap items), a command block does not.
+MISSING_PATHS=()
+while read -r p; do
+    [[ -n "$p" ]] || continue
+    [[ -e "$REPO/$p" ]] || MISSING_PATHS+=("$p")
+done < <(
+    cd "$REPO" &&
+    awk '/^ *```/{fence=!fence; next} fence' README.md docs/*.md |
+    grep -oE '(^|[[:space:]"'"'"'(])((tools|bin|templates|providers|schemas|skills|bench|integrations)/[A-Za-z0-9_./-]+)' |
+    sed -E 's/^[[:space:]"'"'"'(]//; s/[.,:)]+$//' | sort -u
+)
+if (( ${#MISSING_PATHS[@]} == 0 )); then
+    pass "every path in a documented command exists"
+else
+    fail "the docs tell a user to run paths that do not exist: ${MISSING_PATHS[*]}"
+fi
+
+# The plan the guide shows must be a plan the harness accepts. A template that teaches an
+# unparsed heading has shipped here once, and six real plans were written against it.
+awk '/^````markdown/{on=1;next} /^````$/{on=0} on' "$REPO/docs/START-HERE.md" >"$SANDBOX/doc-plan.md"
+if [[ -s "$SANDBOX/doc-plan.md" ]]; then
+    if "$HERE/check-plan" "$SANDBOX/doc-plan.md" >/dev/null 2>&1; then
+        pass "the example plan in START-HERE.md would be accepted"
+    else
+        fail "START-HERE.md shows a plan the harness would refuse"
+        "$HERE/check-plan" "$SANDBOX/doc-plan.md" 2>&1 | sed 's/^/          /' | head -4
+    fi
+else
+    fail "no example plan found in START-HERE.md — the guide's worked example is gone"
+fi
+
+# The GPU-residency check, against captured logs rather than a GPU. A partial offload is silently
+# successful — the server answers /health and serves tokens — until it fills swap and the OOM
+# killer takes the terminal scope with it, which is how one session lost a run and a desktop.
+cat >"$SANDBOX/resident.log" <<'LOG'
+load_tensors: offloaded 25/25 layers to GPU
+llama_kv_cache_unified: CUDA0 KV buffer size =  1536.00 MiB
+LOG
+cat >"$SANDBOX/spilled.log" <<'LOG'
+load_tensors: offloaded 19/25 layers to GPU
+llama_kv_cache_unified: CPU KV buffer size =  3072.00 MiB
+LOG
+RES_OK=1
+"$HERE/llamacpp-serve" residency "$SANDBOX/resident.log" 780000 >/dev/null 2>&1 ||
+    { RES_OK=0; fail "a fully resident model was reported as spilled"; }
+"$HERE/llamacpp-serve" residency "$SANDBOX/spilled.log" 8151060 >/dev/null 2>&1 &&
+    { RES_OK=0; fail "a partial offload was reported as healthy — this is what took a machine down"; }
+"$HERE/llamacpp-serve" residency "$SANDBOX/resident.log" 8900000 >/dev/null 2>&1 &&
+    { RES_OK=0; fail "8.9 GB of host RSS was not treated as evidence of a spill"; }
+(( RES_OK == 0 )) || pass "the residency check separates a resident model from a spilled one"
+
+# The driver procedure ships twice — a Claude skill and a Codex prompt — from one shared body.
+# It was hand-ported three times in one session and drifted on the third.
+if "$HERE/build-integrations" --check >"$SANDBOX/integrations.log" 2>&1; then
+    pass "the Claude skill and the Codex prompt are both current with the shared procedure"
+else
+    fail "an integration is out of date — run tools/build-integrations"
+    sed 's/^/          /' "$SANDBOX/integrations.log" | head -4
+fi
+
+# `doctor` is the operator's first step, so it must survive the conditions it exists to report on:
+# no model server, no project, nothing configured. A checker that crashes on a broken machine is
+# worse than none, because the crash is what the operator will report instead of the diagnosis.
+DOC_OUT="$( cd "$SANDBOX" && LLAMACPP_PORT=1 HANDOFF_CLINE_CONFIG="$SANDBOX/nope" \
+    "$HERE/doctor" 2>&1 )"
+DOC_STATUS=$?
+if [[ "$DOC_STATUS" -ne 0 ]] && grep -q 'nothing answering' <<<"$DOC_OUT" &&
+   grep -q 'blocking problem' <<<"$DOC_OUT"; then
+    pass "doctor reports a broken environment instead of failing on it"
+else
+    fail "doctor did not diagnose a machine with no server and no project (exit $DOC_STATUS)"
+fi
+# And it must pass on a machine that is set up, or the operator will chase a phantom every time.
+R0="$(new_project doctor_ok)"
+( cd "$R0" && "$HERE/../bin/handoff" init >/dev/null 2>&1 )
+DOC_OK="$( cd "$R0" && PATH="$REPO/bin:$PATH" LLAMACPP_PORT=1 "$HERE/doctor" 2>&1 )"
+if grep -q 'ok    handoff is on PATH' <<<"$DOC_OK" &&
+   grep -q 'ok    .*plan(s) in' <<<"$DOC_OK"; then
+    pass "doctor recognises a correctly initialised project"
+else
+    fail "doctor did not recognise an initialised project"
+fi
+
+# ------------------------------------------------------------------------------------------------
+echo "==> 2/9 contract: every provider defines what the driver calls on it"
+
+# bin/handoff calls preflight and run on every provider, unconditionally.
+REQUIRED=(provider_preflight provider_run)
+# These are called too, but only on some paths, and a provider may reasonably lack them.
+OPTIONAL=(provider_capabilities provider_parse_session_id provider_resume)
+BROKEN=(); THIN=()
+for pf in "$REPO"/providers/*.sh; do
+    name="$(basename "$pf" .sh)"
+    out="$(
+        set +u
+        # shellcheck disable=SC1090
+        if ! source "$pf" >/dev/null 2>&1; then echo "SOURCE"; exit 0; fi
+        for fn in "${REQUIRED[@]}"; do declare -F "$fn" >/dev/null || echo "MISSING $fn"; done
+        for fn in "${OPTIONAL[@]}"; do declare -F "$fn" >/dev/null || echo "THIN $fn"; done
+    )"
+    grep -q '^SOURCE' <<<"$out" && { BROKEN+=("$name: does not source"); continue; }
+    while read -r kind fn; do
+        [[ "$kind" == MISSING ]] && BROKEN+=("$name: no $fn")
+        [[ "$kind" == THIN ]] && THIN+=("$name:${fn#provider_}")
+    done < <(grep -E '^(MISSING|THIN) ' <<<"$out")
+done
+if (( ${#BROKEN[@]} == 0 )); then
+    pass "all $(ls "$REPO"/providers/*.sh | wc -l) providers source and define preflight+run"
+else
+    fail "provider contract broken — ${BROKEN[*]}"
+fi
+(( ${#THIN[@]} == 0 )) || note "no session/capability support (fine, but resume will not work): ${THIN[*]}"
+
+# ------------------------------------------------------------------------------------------------
+echo "==> 3/9 journey: init → check → do → verify → diff"
+export PATH="$REPO/bin:$PATH"
+R="$(new_project journey)"
+write_plan "$R" ship
+
+( cd "$R" && handoff init >"$SANDBOX/init.log" 2>&1 )
+# Commit what init produced, as the guide tells a user to. Left uncommitted, the new .gitignore is
+# itself an unexpected changed file and every plan asserting a file count fails on setup residue.
+( cd "$R" && git add -A && git commit --quiet -m init-handoff ) >/dev/null 2>&1
+INIT_OK=1
+[[ -d "$R/.handoff/plans" ]] || { INIT_OK=0; fail "init did not create the plans directory"; }
+[[ -f "$R/.handoff/config.sh" ]] || { INIT_OK=0; fail "init did not copy the config template"; }
+grep -qxF '.handoff/runs/' "$R/.gitignore" 2>/dev/null || { INIT_OK=0; fail "init did not ignore .handoff/runs/"; }
+(( INIT_OK == 0 )) || pass "init left plans dir, config and gitignore in place"
+
+# A project rule with a marker, so the prompt assertion in phase 5 can prove this layer arrived.
+cat >>"$R/.handoff/config.sh" <<'CFG'
+PROJECT_RULES="Format with SMOKE-FORMATTER before finishing."
+CFG
+
+if ( cd "$R" && handoff check ship >/dev/null 2>&1 ); then
+    pass "check accepts a well-formed plan"
+else
+    fail "check refused a plan with matching criteria and commands"
+fi
+
+( cd "$R" &&
+  STUB_PROMPT_LOG="$SANDBOX/prompt.txt" \
+  STUB_PATCH="sed -i 's/return 0;/return 499;/' src/Cart.php" \
+  STUB_REPORT='{"status":"complete","summary":"s","files_changed":["src/Cart.php"],"tests_run":[],"deviations":[],"blockers":[],"follow_ups":[]}' \
+  HANDOFF_PROVIDER=stub handoff do ship >"$SANDBOX/do.log" 2>&1 )
+DO_STATUS=$?
+
+RUN="$R/.handoff/runs/ship"
+STATE_OK=1
+for f in tree-before tree-after result.json stdout.log evidence/evidence.json evidence/evidence.md; do
+    [[ -s "$RUN/$f" ]] || { STATE_OK=0; fail "a completed run left no $f"; }
+done
+if [[ -s "$RUN/tree-before" && -s "$RUN/tree-after" ]] &&
+   [[ "$(cat "$RUN/tree-before")" == "$(cat "$RUN/tree-after")" ]]; then
+    STATE_OK=0; fail "tree-before and tree-after are identical over a run that changed a file"
+fi
+(( STATE_OK == 0 )) || pass "the run left every artifact a reviewer needs"
+
+if [[ "$DO_STATUS" -eq 0 ]] && [[ "$(json_field "$RUN/evidence/evidence.json" verdict)" == ACCEPT ]]; then
+    pass "a correct patch is accepted, and do exits 0"
+else
+    fail "a correct patch was not accepted: exit=$DO_STATUS verdict=$(json_field "$RUN/evidence/evidence.json" verdict 2>/dev/null)"
+    grep -E 'FAIL|fail' "$SANDBOX/do.log" | head -4 | sed 's/^/          /'
+fi
+
+DIFF="$( cd "$R" && handoff diff ship 2>&1 )"
+if [[ "$(grep -c . <<<"$DIFF")" -eq 1 ]] && grep -q 'src/Cart.php' <<<"$DIFF"; then
+    pass "diff reports exactly the file the run changed"
+else
+    fail "diff is wrong — got: $(tr '\n' ' ' <<<"$DIFF")"
+fi
+
+# verify must stand alone: it is what a reviewer runs after picking a run back up.
+rm -rf "$RUN/evidence"
+if ( cd "$R" && handoff verify ship >/dev/null 2>&1 ) && [[ -s "$RUN/evidence/evidence.md" ]]; then
+    pass "verify runs on its own and rebuilds the evidence bundle"
+else
+    fail "verify does not work standalone"
+fi
+
+# ------------------------------------------------------------------------------------------------
+echo "==> 4/9 rejection: a wrong tree fails, and the evidence says which command said so"
+R="$(new_project reject)"
+write_plan "$R" ship
+( cd "$R" && printf '.handoff/runs/\n' >>.gitignore && git add -A && git commit --quiet -m ig )
+( cd "$R" &&
+  STUB_PATCH="sed -i 's/return 0;/return 1;/' src/Cart.php" \
+  STUB_REPORT='{"status":"complete","summary":"all criteria met","files_changed":["src/Cart.php"],"tests_run":["all green"],"deviations":[],"blockers":[],"follow_ups":[]}' \
+  HANDOFF_PROVIDER=stub handoff do ship >/dev/null 2>&1 )
+BAD=$?
+EV="$R/.handoff/runs/ship/evidence"
+if [[ "$BAD" -ne 0 ]] && [[ "$(json_field "$EV/evidence.json" verdict)" == REJECT ]]; then
+    pass "a wrong value is rejected despite a report claiming success"
+else
+    fail "a wrong tree passed: exit=$BAD verdict=$(json_field "$EV/evidence.json" verdict 2>/dev/null)"
+fi
+if grep -q 'shipping()===499' "$EV/evidence.md" 2>/dev/null; then
+    pass "the evidence names the command that failed"
+else
+    fail "the evidence does not show which acceptance command failed"
+fi
+
+# Scope: a file the plan never named must fail the round even when every criterion passes.
+#
+# Deliberately WITHOUT a file-count command, so the scope gate is the only thing that can reject.
+# The first version of this case reused the plan above, whose own `git status | wc -l` command
+# caught the stray file — so disabling the scope gate entirely still "passed" the check.
+R="$(new_project scope)"
+mkdir -p "$R/.handoff/plans"
+cat >"$R/.handoff/plans/ship.md" <<'PLAN'
+# Free shipping
+
+## Files to touch
+
+| Path | Action |
+| --- | --- |
+| `src/Cart.php` | modify |
+
+## Acceptance criteria
+
+- [ ] shipping() returns 499
+
+## Verification
+
+```bash
+php -r 'require "src/Cart.php"; exit((new Cart)->shipping()===499?0:1);'
+```
+
+## Out of scope
+
+Everything else.
+PLAN
+( cd "$R" && printf '.handoff/runs/\n' >>.gitignore && git add -A && git commit --quiet -m ig )
+( cd "$R" &&
+  STUB_PATCH="sed -i 's/return 0;/return 499;/' src/Cart.php; echo scratch > scratch.txt" \
+  STUB_REPORT='{"status":"complete","summary":"s","files_changed":[],"tests_run":[],"deviations":[],"blockers":[],"follow_ups":[]}' \
+  HANDOFF_PROVIDER=stub handoff do ship >/dev/null 2>&1 )
+SCOPE_EXIT=$?
+SCOPE_EV="$R/.handoff/runs/ship/evidence/evidence.json"
+SCOPE_GATE="$(python3 -c "
+import json,sys
+d=json.load(open(sys.argv[1]))
+print(next((g['status'] for g in d['gates'] if g['gate']=='scope'), 'absent'))" "$SCOPE_EV" 2>/dev/null)"
+if [[ "$SCOPE_GATE" == fail && "$SCOPE_EXIT" -ne 0 ]] &&
+   [[ "$(json_field "$SCOPE_EV" verdict)" == REJECT ]]; then
+    pass "an invented file fails the scope gate and rejects the round on its own"
+else
+    fail "the scope gate did not carry the verdict: gate=$SCOPE_GATE exit=$SCOPE_EXIT verdict=$(json_field "$SCOPE_EV" verdict 2>/dev/null)"
+fi
+
+# ------------------------------------------------------------------------------------------------
+echo "==> 5/9 prompt: all four layers reach the implementer"
+LAYERS_OK=1
+grep -q '.handoff/plans/ship.md' "$SANDBOX/prompt.txt" || { LAYERS_OK=0; fail "the prompt never names the plan file"; }
+grep -q 'SMOKE-FORMATTER' "$SANDBOX/prompt.txt" || { LAYERS_OK=0; fail "PROJECT_RULES from .handoff/config.sh never reached the prompt"; }
+grep -q 'Leave all changes uncommitted' "$SANDBOX/prompt.txt" || { LAYERS_OK=0; fail "the do-not-commit instruction is missing from the prompt"; }
+(( LAYERS_OK == 0 )) || pass "plan, project rules and the commit prohibition all arrive"
+
+# The repair path. Feedback that does not reach the prompt turns a repair attempt into a retry,
+# and a retry of the same prompt is a different experiment than the one being reported.
+R="$(new_project repair)"
+write_plan "$R" ship
+printf 'The command `php -r ...shipping()===499` exited 1. Fix only that.\n' >"$SANDBOX/feedback.md"
+( cd "$R" &&
+  STUB_PROMPT_LOG="$SANDBOX/repair-prompt.txt" \
+  HANDOFF_FEEDBACK_FILE="$SANDBOX/feedback.md" \
+  STUB_PATCH="sed -i 's/return 0;/return 499;/' src/Cart.php" \
+  STUB_REPORT='{"status":"complete","summary":"s","files_changed":[],"tests_run":[],"deviations":[],"blockers":[],"follow_ups":[]}' \
+  HANDOFF_PROVIDER=stub handoff do ship >/dev/null 2>&1 )
+if grep -q '## Previous attempt' "$SANDBOX/repair-prompt.txt" 2>/dev/null &&
+   grep -q 'Fix only that' "$SANDBOX/repair-prompt.txt"; then
+    pass "feedback reaches the repair prompt, marked as a previous attempt"
+else
+    fail "HANDOFF_FEEDBACK_FILE did not reach the prompt — repair is silently a plain retry"
+fi
+
+# ------------------------------------------------------------------------------------------------
+echo "==> 6/9 resume and regression: the second round is judged against the first"
+
+# A provider that CAN resume must run, and must be verified afterwards. `resume` used to exit 0
+# without verifying, leaving the previous round's REJECT bundle sitting next to it — a stale
+# verdict that was nearly reported as a pass.
+R="$(new_project resume)"
+write_plan "$R" ship
+( cd "$R" && printf '.handoff/runs/\n' >>.gitignore && git add -A && git commit --quiet -m ig )
+( cd "$R" && STUB_SESSION=1 STUB_PATCH="true" STUB_REPORT='{}' \
+    HANDOFF_PROVIDER=stub handoff do ship >/dev/null 2>&1 )
+RUN="$R/.handoff/runs/ship"
+FIRST="$(json_field "$RUN/evidence/evidence.json" verdict 2>/dev/null)"
+printf 'shipping() returned 0, expected 499.\n' >"$RUN/feedback.md"
+( cd "$R" && STUB_SESSION=1 STUB_RESUME_PATCH="sed -i 's/return 0;/return 499;/' src/Cart.php" \
+    STUB_REPORT='{}' HANDOFF_PROVIDER=stub handoff resume ship >/dev/null 2>&1 )
+RESUME_EXIT=$?
+if [[ "$FIRST" == REJECT && "$RESUME_EXIT" -eq 0 ]] &&
+   [[ "$(json_field "$RUN/evidence/evidence.json" verdict)" == ACCEPT ]]; then
+    pass "resume runs, is verified, and the new verdict replaces the old one"
+else
+    fail "resume did not re-verify: first=$FIRST resume-exit=$RESUME_EXIT now=$(json_field "$RUN/evidence/evidence.json" verdict 2>/dev/null)"
+fi
+
+# A repair that scores worse than the attempt it repairs is the signal to stop resuming. Nothing
+# said so before: one real feature went 9/12 then 3/14 on a resume, and both bundles read as
+# ordinary rejections.
+( cd "$R" && STUB_SESSION=1 STUB_RESUME_PATCH="printf '<?php\nclass Cart{public function shi' > src/Cart.php" \
+    STUB_REPORT='{}' HANDOFF_PROVIDER=stub handoff resume ship >/dev/null 2>&1 )
+EV="$RUN/evidence/evidence.json"
+if [[ "$(python3 -c "import json;print(json.load(open('$EV'))['regressed'])")" == True ]] &&
+   grep -q 'REGRESSED' "$RUN/evidence/evidence.md" &&
+   [[ "$(wc -l <"$RUN/evidence/history.jsonl")" -eq 3 ]]; then
+    pass "a round that loses ground is flagged as a regression, and the trajectory is kept"
+else
+    fail "a 3-of-3 round followed by a 0-of-3 round was not reported as a regression"
+fi
+
+echo "==> 7/9 journal: every round is recorded, and survives the next round"
+
+# Events in the shape Cline actually emits, including the two failures that cost real rounds:
+# a tool-call format error and an output-token limit. The miner has to name both, because the
+# whole point of recording them is to stop an adapter fault being read as a model failure.
+EVENTS='printf "%s\n" \
+ "{\"event\":{\"type\":\"iteration_start\"}}" \
+ "{\"event\":{\"type\":\"content_start\",\"contentType\":\"reasoning\",\"reasoning\":\"noise\"}}" \
+ "{\"event\":{\"type\":\"content_end\",\"contentType\":\"tool\",\"toolName\":\"read_files\"}}" \
+ "{\"event\":{\"type\":\"content_end\",\"contentType\":\"tool\",\"toolName\":\"apply_patch\"}}" \
+ "{\"event\":{\"type\":\"error\",\"error\":{\"message\":\"The model produced output that does not match the expected peg-native format\"}}}" \
+ "{\"event\":{\"type\":\"error\",\"error\":{\"message\":\"Model reached the maximum output token limit before completing the turn\"}}}" \
+ "{\"event\":{\"type\":\"usage\",\"totalInputTokens\":27278,\"totalOutputTokens\":878,\"totalCacheReadTokens\":23827}}" \
+ >> .handoff/runs/ship/stdout.log'
+
+R="$(new_project journal)"
+write_plan "$R" ship
+( cd "$R" && printf '.handoff/runs/\n' >>.gitignore && git add -A && git commit --quiet -m ig )
+( cd "$R" && STUB_PATCH="sed -i 's/return 0;/return 1;/' src/Cart.php; $EVENTS" \
+    STUB_REPORT='{"status":"complete","summary":"all done","files_changed":[],"tests_run":[],"deviations":[],"blockers":[],"follow_ups":[]}' \
+    HANDOFF_PROVIDER=stub handoff do ship >/dev/null 2>&1 )
+( cd "$R" && STUB_PATCH="sed -i 's/return 1;/return 499;/' src/Cart.php" \
+    STUB_REPORT='{"status":"complete","summary":"fixed","files_changed":[],"tests_run":[],"deviations":[],"blockers":[],"follow_ups":[]}' \
+    HANDOFF_PROVIDER=stub handoff do ship >/dev/null 2>&1 )
+
+RECORDS="$R/.handoff/journal/runs.jsonl"
+if [[ "$(wc -l <"$RECORDS" 2>/dev/null)" -eq 2 ]]; then
+    pass "both rounds recorded, one line each"
+else
+    fail "expected 2 journal records, found $(wc -l <"$RECORDS" 2>/dev/null || echo 0)"
+fi
+
+JQ() { python3 -c "
+import json,sys
+rows=[json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+print(eval(sys.argv[2], {'rows': rows}))" "$RECORDS" "$1" 2>/dev/null; }
+FIELDS_OK=1
+[[ "$(JQ "rows[0]['outcome']")" == patch-damaged ]] || { FIELDS_OK=0; fail "round 1 outcome wrong: $(JQ "rows[0]['outcome']")"; }
+[[ "$(JQ "rows[1]['outcome']")" == accepted ]] || { FIELDS_OK=0; fail "round 2 outcome wrong: $(JQ "rows[1]['outcome']")"; }
+[[ "$(JQ "rows[0]['gates']['acceptance_passed']")" == 2 ]] || { FIELDS_OK=0; fail "criteria score not recorded: $(JQ "rows[0]['gates']")"; }
+[[ "$(JQ "sorted(rows[0]['activity']['errors'])")" == "['output-token-limit', 'tool-call-format']" ]] ||
+    { FIELDS_OK=0; fail "adapter errors not classified: $(JQ "sorted(rows[0]['activity']['errors'])")"; }
+[[ "$(JQ "rows[0]['activity']['write_calls']")" == 1 ]] || { FIELDS_OK=0; fail "write calls not counted"; }
+[[ "$(JQ "rows[0]['activity']['tokens']['output']")" == 878 ]] || { FIELDS_OK=0; fail "tokens not recorded"; }
+[[ "$(JQ "rows[1]['attempt']")" == 2 ]] || { FIELDS_OK=0; fail "attempts not numbered"; }
+(( FIELDS_OK == 0 )) || pass "outcome, criteria score, adapter errors, writes and tokens all recorded"
+
+# The reason this exists at all: the run directory is reused, so without an archive the earlier
+# round's evidence is gone. Seven real rounds left three surviving logs.
+ARCHIVES=("$R"/.handoff/journal/runs/*/)
+if [[ "${#ARCHIVES[@]}" -eq 2 ]] && [[ -s "${ARCHIVES[0]}evidence.md" ]] &&
+   [[ -s "${ARCHIVES[0]}plan.md" ]] && [[ -s "${ARCHIVES[0]}events.jsonl.gz" ]]; then
+    pass "each round's evidence, plan and event stream are archived before the next overwrites them"
+else
+    fail "the first round's artifacts were not preserved"
+fi
+# The trimmed stream keeps the tool calls and drops the reasoning tokens that are 98% of the bytes.
+if zcat "${ARCHIVES[0]}events.jsonl.gz" 2>/dev/null | grep -q apply_patch &&
+   ! zcat "${ARCHIVES[0]}events.jsonl.gz" 2>/dev/null | grep -q '"reasoning"'; then
+    pass "the archived stream keeps tool calls and drops the reasoning noise"
+else
+    fail "log trimming kept the wrong events"
+fi
+
+if ( cd "$R" && handoff stats 2>&1 | grep -q 'usable patch' ) &&
+   ( cd "$R" && handoff log 2>&1 | grep -q 'patch-damaged' ); then
+    pass "stats and log read the journal back"
+else
+    fail "handoff stats or handoff log does not work"
+fi
+
+if ( cd "$R" && "$HERE/journal" --repo . export-sqlite >/dev/null 2>&1 ) &&
+   [[ -s "$R/.handoff/journal/runs.db" ]] &&
+   [[ "$(python3 -c "
+import sqlite3,sys
+print(sqlite3.connect(sys.argv[1]).execute('SELECT count(*) FROM runs').fetchone()[0])" "$R/.handoff/journal/runs.db")" -eq 2 ]]; then
+    pass "the sqlite view rebuilds from the records"
+else
+    fail "export-sqlite did not produce a queryable database"
+fi
+
+# The retrospective prompt must carry the plan and the verdict. Asked without the verdict, a model
+# grading its own work produces the same confident fiction its completion reports do.
+RETRO="$( cd "$R" && "$HERE/journal" --repo . retro-prompt ship 2>&1 )"
+if grep -q 'Free shipping over 5000' <<<"$RETRO" && grep -q 'Verification evidence' <<<"$RETRO" &&
+   grep -q 'plan_changes' <<<"$RETRO"; then
+    pass "the retro prompt carries the plan, the verdict, and asks for plan changes"
+else
+    fail "the retro prompt is missing the plan or the verdict"
+fi
+printf '{"what_worked":"clear signature","plan_changes":["define fresh"],"confidence":"medium"}' \
+    >"$SANDBOX/retro.json"
+( cd "$R" && "$HERE/journal" --repo . attach ship --retro "$SANDBOX/retro.json" >/dev/null 2>&1 )
+if [[ "$(JQ "rows[1]['retro']['confidence']")" == medium ]] &&
+   [[ "$(wc -l <"$RECORDS")" -eq 2 ]]; then
+    pass "a retrospective attaches to its run without disturbing the others"
+else
+    fail "attaching a retrospective corrupted the journal"
+fi
+
+echo "==> 8/9 ladder: local tries, a hosted planner re-specifies, local tries again"
+
+R="$(new_project ladder)"
+mkdir -p "$R/.handoff/plans"
+cat >"$R/.handoff/plans/ship.md" <<'PLAN'
+# ship
+## Files to touch
+| Path | Action |
+| --- | --- |
+| `src/Cart.php` | modify |
+## Acceptance criteria
+- [ ] returns 499
+## Verification
+```bash
+php -r 'require "src/Cart.php"; exit((new Cart)->shipping()===499?0:1);'
+```
+## Out of scope
+Everything else.
+PLAN
+( cd "$R" && printf '.handoff/runs/\n.handoff/journal/\n' >>.gitignore && git add -A && git commit --quiet -m ig )
+
+# The implementer gets it wrong every time; the planner writes a plan the tree does satisfy. That
+# is the ladder's shape: the local model stops being asked to guess and is given a better contract.
+cat >"$SANDBOX/planner.sh" <<'PLANNER'
+mkdir -p .handoff/plans
+cat > .handoff/plans/ship-e1.md <<'PLAN'
+# ship, narrowed
+## Files to touch
+| Path | Action |
+| --- | --- |
+| `src/Cart.php` | modify |
+## Acceptance criteria
+- [ ] returns 1
+## Verification
+```bash
+php -r 'require "src/Cart.php"; exit((new Cart)->shipping()===1?0:1);'
+```
+## Out of scope
+Everything else.
+PLAN
+PLANNER
+REPORT='{"status":"complete","summary":"s","files_changed":[],"tests_run":[],"deviations":[],"blockers":[],"follow_ups":[]}'
+( cd "$R" && HANDOFF_PROVIDER=stub STUB_PATCH="sed -i 's/return 0;/return 1;/' src/Cart.php" \
+    STUB_PLANNER_PATCH="bash $SANDBOX/planner.sh" STUB_REPORT="$REPORT" \
+    STUB_PROMPT_LOG="$SANDBOX/ladder-prompts.txt" \
+    handoff auto ship --planners stub --attempts 2 --escalations 1 >"$SANDBOX/ladder.log" 2>&1 )
+LADDER_EXIT=$?
+LADDER_MD="$R/.handoff/runs/ship/ladder.md"
+if [[ "$LADDER_EXIT" -eq 0 ]] && grep -q 'ACCEPTED on plan' "$LADDER_MD" 2>/dev/null &&
+   grep -q 'escalation 1 of 1' "$LADDER_MD" && [[ -s "$R/.handoff/plans/ship-e1.md" ]]; then
+    pass "the ladder escalated, the planner wrote a plan, and the retry was accepted"
+else
+    fail "the ladder did not complete: exit=$LADDER_EXIT"
+    tail -5 "$SANDBOX/ladder.log" | sed 's/^/          /'
+fi
+# The narrative is the handover. A ladder that cannot say what it tried is not usable by a person.
+if grep -q 'local attempt 2 of 2' "$LADDER_MD" && grep -qE 'result: [0-9]+/[0-9]+' "$LADDER_MD"; then
+    pass "the ladder records each rung and its score"
+else
+    fail "the ladder narrative is missing the attempts or their scores"
+fi
+# The repair must actually receive the failing command, not merely be announced as a repair. The
+# narrative line alone passed while the feedback was never built.
+if grep -q 'These acceptance checks FAILED' "$SANDBOX/ladder-prompts.txt" 2>/dev/null &&
+   grep -q 'shipping()===499' "$SANDBOX/ladder-prompts.txt"; then
+    pass "the repair rung was handed the exact command that failed"
+else
+    fail "the repair rung ran without the failing command in its prompt"
+fi
+# The planner's plan is gated before it is run. A planner that produces a plan the harness would
+# refuse must stop the ladder, not send the local model at an unrunnable contract.
+cat >"$SANDBOX/planner-bad.sh" <<'BAD'
+mkdir -p .handoff/plans
+printf '# lopsided\n## Files to touch\n| Path | Action |\n| --- | --- |\n| `src/Cart.php` | modify |\n## Acceptance criteria\n- [ ] a\n- [ ] b\n## Verification\n```bash\ntrue\n```\n## Out of scope\nx\n' > .handoff/plans/ship-e1.md
+BAD
+R3="$(new_project ladder_badplan)"
+mkdir -p "$R3/.handoff/plans" && cp "$R/.handoff/plans/ship.md" "$R3/.handoff/plans/ship.md"
+( cd "$R3" && printf '.handoff/runs/\n.handoff/journal/\n' >>.gitignore && git add -A && git commit --quiet -m ig )
+( cd "$R3" && HANDOFF_PROVIDER=stub STUB_PATCH="sed -i 's/return 0;/return 1;/' src/Cart.php" \
+    STUB_PLANNER_PATCH="bash $SANDBOX/planner-bad.sh" STUB_REPORT="$REPORT" \
+    handoff auto ship --planners stub --attempts 1 --escalations 1 >/dev/null 2>&1 )
+if grep -q 'would be refused by the harness' "$R3/.handoff/runs/ship/ladder.md" 2>/dev/null &&
+   [[ ! -d "$R3/.handoff/runs/ship-e1" ]]; then
+    pass "a plan the harness would refuse stops the ladder instead of being run"
+else
+    fail "the ladder ran a plan check-plan would have refused"
+fi
+# An ACCEPT must not be reported as fabrication just because that round changed nothing — a later
+# rung legitimately finds the work already in the tree. It did exactly this the first time it ran.
+if ! grep -q 'fabricated' <(python3 -c "
+import json,sys
+rows=[json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+print('\n'.join(r['outcome'] for r in rows if (r.get('gates') or {}).get('verdict')=='ACCEPT'))" \
+    "$R/.handoff/journal/runs.jsonl" 2>/dev/null); then
+    pass "an accepted round is never recorded as fabricated"
+else
+    fail "a round the gates accepted was recorded as fabricated"
+fi
+
+# A repair that loses ground ends the repair loop. This is the field failure it was built from:
+# 9 of 12 criteria, then 3 of 14 on the resume, because the round corrupted the file it had nearly
+# finished. Three attempts are allowed here; the ladder must stop after the second.
+R4="$(new_project ladder_regress)"
+write_plan "$R4" ship
+( cd "$R4" && printf '.handoff/runs/\n.handoff/journal/\n' >>.gitignore && git add -A && git commit --quiet -m ig )
+( cd "$R4" && HANDOFF_PROVIDER=stub STUB_REPORT="$REPORT" \
+    STUB_PATCH="if grep -q 'return 1;' src/Cart.php; then printf '<?php\nclass Cart{public function shi' > src/Cart.php; else sed -i 's/return 0;/return 1;/' src/Cart.php; fi" \
+    handoff auto ship --planners stub --attempts 3 --escalations 0 >/dev/null 2>&1 )
+LADDER4="$R4/.handoff/runs/ship/ladder.md"
+if grep -q 'scored worse than the last' "$LADDER4" 2>/dev/null &&
+   ! grep -q 'local attempt 3 of 3' "$LADDER4"; then
+    pass "a repair that scored worse ended the loop instead of losing more ground"
+else
+    fail "the ladder kept repairing after a regression"
+fi
+
+# Independence, enforced rather than trusted: the planner may not also be the implementer.
+#
+# --dry-run on purpose. The guard must fire before anything runs, and if a mutation removes it this
+# check must not then launch a real hosted CLI — which is exactly what happened the first time it
+# was mutation-tested, and it hung the suite waiting on codex.
+INDEP="$( cd "$R" && HANDOFF_PROVIDER=codex handoff auto ship --planners codex --dry-run 2>&1 )"
+if [[ $? -eq 64 ]] && grep -q 'removes the independence' <<<"$INDEP"; then
+    pass "the ladder refuses to let the planner and the implementer be the same model"
+else
+    fail "one model was allowed to plan, implement and be judged on its own work"
+fi
+
+# A planner that edits source has stopped planning; one that edits the harness is grading itself.
+cat >"$SANDBOX/planner-rogue.sh" <<'ROGUE'
+mkdir -p .handoff/plans
+printf '# x\n## Files to touch\n| Path | Action |\n| --- | --- |\n| `src/Cart.php` | modify |\n## Acceptance criteria\n- [ ] a\n## Verification\n```bash\ntrue\n```\n## Out of scope\nx\n' > .handoff/plans/ship-e1.md
+echo "// planner was here" >> src/Cart.php
+ROGUE
+R2="$(new_project ladder_rogue)"
+cp "$R/.handoff/plans/ship.md" "$R2/.handoff/plans/ship.md" 2>/dev/null || {
+    mkdir -p "$R2/.handoff/plans"; cp "$R/.handoff/plans/ship.md" "$R2/.handoff/plans/ship.md"; }
+( cd "$R2" && printf '.handoff/runs/\n.handoff/journal/\n' >>.gitignore && git add -A && git commit --quiet -m ig )
+( cd "$R2" && HANDOFF_PROVIDER=stub STUB_PATCH="sed -i 's/return 0;/return 1;/' src/Cart.php" \
+    STUB_PLANNER_PATCH="bash $SANDBOX/planner-rogue.sh" STUB_REPORT="$REPORT" \
+    handoff auto ship --planners stub --attempts 1 --escalations 1 >/dev/null 2>&1 )
+if grep -q 'wrote outside the plan' "$R2/.handoff/runs/ship/ladder.md" 2>/dev/null; then
+    pass "a planner that touched source stopped the ladder instead of being run"
+else
+    fail "a planner edited source and the ladder carried on"
+fi
+
+echo "==> 9/9 refusals: documented failures exit with their documented status"
+R="$(new_project refusals)"
+write_plan "$R" ship
+
+# Status and message together. Status alone is not enough: with the guards removed from `resume`,
+# the driver crashed on the missing file and exited 1 anyway — indistinguishable from a refusal
+# until you read what it said. That mutation passed an earlier version of this check.
+expect_refusal() {  # <expected-status> <expected-message> <description> <command...>
+    local want="$1" says="$2" what="$3"; shift 3
+    local got out
+    out="$( cd "$R" && "$@" 2>&1 )"; got=$?
+    if [[ "$got" -ne "$want" ]]; then
+        fail "$what: expected exit $want, got $got"
+    elif ! grep -qi -- "$says" <<<"$out"; then
+        fail "$what: exited $want but never said '$says' — a crash, not a refusal"
+    fi
+}
+BEFORE="$FAILURES"
+expect_refusal 64 "usage:"        "no arguments"       handoff
+expect_refusal 64 "unknown mode"  "unknown mode"       handoff frobnicate ship
+expect_refusal 64 "unknown provider" "unknown provider" env HANDOFF_PROVIDER=nosuchprovider handoff do ship
+expect_refusal 1  "plan not found" "plan not found"    env HANDOFF_PROVIDER=stub handoff do no-such-plan
+expect_refusal 1  "no completed run" "diff with no run" handoff diff ship
+# A provider with no session support must refuse to resume. Before this guard the driver printed
+# `provider_resume: command not found`, ran no model at all, then verified the untouched tree and
+# printed a verdict on it — a real verdict for a round that never happened.
+expect_refusal 64 "cannot resume" "resume on a provider with no session support" \
+    env HANDOFF_PROVIDER=stub handoff resume ship
+[[ "$FAILURES" -eq "$BEFORE" ]] && pass "all six refusals refuse, with a message that says why"
+
+# The usage line is the only discovery mechanism there is; a mode missing from it does not exist.
+USAGE="$( cd "$R" && handoff 2>&1 )"
+MODES_MISSING=()
+for m in do check resume diff verify init; do grep -q "$m" <<<"$USAGE" || MODES_MISSING+=("$m"); done
+if (( ${#MODES_MISSING[@]} == 0 )); then
+    pass "usage names every mode"
+else
+    fail "usage does not mention: ${MODES_MISSING[*]}"
+fi
+
+# A refused plan must be refused before a model is ever paid for it. This one is complete in every
+# other respect — a table, criteria, commands — so the count mismatch is the only thing that can
+# reject it. Without the table it failed for a missing table instead, and a checker that had
+# stopped comparing counts at all still looked healthy.
+mkdir -p "$R/.handoff/plans"
+cat >"$R/.handoff/plans/lopsided.md" <<'PLAN'
+# lopsided
+
+## Files to touch
+
+| Path | Action |
+| --- | --- |
+| `src/Cart.php` | modify |
+
+## Acceptance criteria
+
+- [ ] a
+- [ ] b
+
+## Verification
+
+```bash
+git status --porcelain
+```
+
+## Out of scope
+
+Everything else.
+PLAN
+if ( cd "$R" && handoff check lopsided >/dev/null 2>&1 ); then
+    fail "check accepted 2 criteria against 1 command — the score is capped at 1/2 by construction"
+else
+    pass "check refuses a plan whose criteria and commands disagree"
+fi
+
+echo
+if [[ "$FAILURES" -eq 0 ]]; then echo "all checks passed"; else echo "$FAILURES check(s) failed"; fi
+exit $(( FAILURES > 0 ? 1 : 0 ))

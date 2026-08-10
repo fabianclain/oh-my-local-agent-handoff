@@ -1,0 +1,729 @@
+#!/usr/bin/env python3
+"""journal — what the local model did, per run, kept where you can query it later.
+
+    tools/journal record --run-dir DIR --slug SLUG ...   append a record (called by bin/handoff)
+    tools/journal list [--slug S] [--limit N]            one line per run, newest last
+    tools/journal show <run-id|slug>                     everything recorded about one run
+    tools/journal stats [--json]                         aggregate across runs
+    tools/journal export-sqlite [path]                   build a queryable .db from the records
+    tools/journal retro-prompt <run-id>                  the prompt that asks the model to reflect
+    tools/journal attach <run-id> --retro FILE           store that reflection against the run
+
+Why this exists
+---------------
+Seven rounds of one real feature left three surviving logs. `.handoff/runs/<slug>` is reused, so
+each round overwrote the one before it, and by the time anyone wrote the round up the evidence for
+four of them was gone. The single most useful diagnostic in this project — comparing a round with
+the round before it — was impossible on the runs that most needed it.
+
+So: every run appends one immutable record here, and its artifacts are copied aside before the next
+round can overwrite them.
+
+Storage is JSON Lines, one object per run, and that is deliberate. It needs no daemon, no schema
+migration and no dependency beyond python3; it is append-safe under concurrent runs; and `grep`,
+`jq` and `git diff` all work on it. SQLite is offered as a *derived view* — `export-sqlite` rebuilds
+it from the records in a second — rather than as the source of truth, because a corrupted source of
+truth is exactly the failure that motivated this file.
+
+What is recorded, and what is not
+---------------------------------
+Everything here is measured from the tree, the evidence bundle and the provider's own event stream.
+The model's completion report is stored, but only as an object of study: it is recorded next to the
+tree so the two can be compared, never used to decide what happened. Three runs in this project
+reported success over trees they had not touched.
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import gzip
+import hashlib
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+SCHEMA_VERSION = 1
+
+
+# --------------------------------------------------------------------------------------------
+# paths
+
+
+def journal_dir(repo: Path) -> Path:
+    return Path(os.environ.get("HANDOFF_JOURNAL_DIR") or (repo / ".handoff" / "journal"))
+
+
+def records_path(repo: Path) -> Path:
+    return journal_dir(repo) / "runs.jsonl"
+
+
+def load_records(repo: Path) -> list[dict]:
+    path = records_path(repo)
+    if not path.exists():
+        return []
+    out = []
+    for line in path.read_text(errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            # A truncated final line loses one record, not the history. Skipping beats refusing to
+            # read anything, which is what a database would do here.
+            continue
+    return out
+
+
+# --------------------------------------------------------------------------------------------
+# mining the provider's event stream
+#
+# Cline emits newline-delimited JSON events, one per token, so a 45-turn run is 1.4 MB of which
+# 98% is reasoning tokens. Three things in there are worth keeping and nothing else is:
+# which tools were called, what the adapter complained about, and the token totals.
+
+
+WRITE_TOOLS = {"apply_patch", "write_file", "write_to_file", "create_file", "edit_file"}
+
+
+def mine_events(log: Path) -> dict:
+    tools: collections.Counter = collections.Counter()
+    errors: collections.Counter = collections.Counter()
+    iterations = 0
+    tokens = {}
+    if not log.exists():
+        return {"parsed": False}
+
+    for line in log.open(errors="replace"):
+        line = line.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line).get("event") or {}
+        except ValueError:
+            continue
+        kind = event.get("type")
+        if kind == "iteration_start":
+            iterations += 1
+        elif kind == "content_end" and event.get("contentType") == "tool":
+            tools[event.get("toolName") or "?"] += 1
+        elif kind == "error":
+            message = (event.get("error") or {}).get("message") or str(event.get("error"))
+            errors[classify_error(message)] += 1
+        elif kind == "usage":
+            tokens = {
+                "input": event.get("totalInputTokens"),
+                "output": event.get("totalOutputTokens"),
+                "cache_read": event.get("totalCacheReadTokens"),
+            }
+
+    if not tools and not iterations and not errors:
+        return {"parsed": False}
+
+    return {
+        "parsed": True,
+        "iterations": iterations,
+        "tool_calls": dict(tools),
+        "total_tool_calls": sum(tools.values()),
+        "write_calls": sum(n for t, n in tools.items() if t in WRITE_TOOLS),
+        "errors": dict(errors),
+        "tokens": tokens,
+    }
+
+
+# Error messages carry ids and token counts, so the raw text never aggregates. These are the
+# classes seen in real runs; anything else is kept verbatim, truncated, so a new failure mode
+# shows up as itself rather than being folded into "other".
+ERROR_CLASSES = [
+    (r"does not match the expected .*format", "tool-call-format"),
+    (r"maximum output token limit", "output-token-limit"),
+    (r"exceeds the available context size", "context-overflow"),
+    (r"\b(429|rate.?limit)", "rate-limited"),
+    (r"\b(ECONNREFUSED|socket hang up|fetch failed)", "connection"),
+    (r"\btimed? ?out\b", "timeout"),
+]
+
+
+def classify_error(message: str) -> str:
+    for pattern, name in ERROR_CLASSES:
+        if re.search(pattern, message, re.I):
+            return name
+    return message.strip()[:80]
+
+
+def trim_log(src: Path, dest: Path) -> None:
+    """Keep the events worth re-reading, gzipped. Reasoning tokens are 98% of the bytes and
+    nothing has ever been diagnosed from them; tool calls, errors and usage are everything."""
+    kept = 0
+    with gzip.open(dest, "wt") as out:
+        for line in src.open(errors="replace"):
+            line = line.strip()
+            if not line or not line.startswith("{"):
+                continue
+            try:
+                event = json.loads(line).get("event") or {}
+            except ValueError:
+                continue
+            if event.get("contentType") == "reasoning":
+                continue
+            if event.get("type") == "content_start" and event.get("contentType") == "text":
+                continue
+            out.write(line + "\n")
+            kept += 1
+    if kept == 0:
+        dest.unlink(missing_ok=True)
+
+
+# --------------------------------------------------------------------------------------------
+# reading the rest of the run
+
+
+def git(repo: Path, *args: str) -> str:
+    try:
+        return subprocess.run(["git", "-C", str(repo), *args], capture_output=True,
+                              text=True, check=False).stdout.strip()
+    except OSError:
+        return ""
+
+
+def read_tree_change(repo: Path, run_dir: Path) -> dict:
+    before, after = run_dir / "tree-before", run_dir / "tree-after"
+    if not (before.exists() and after.exists()):
+        return {"known": False}
+    a, b = before.read_text().strip(), after.read_text().strip()
+    excludes = [":(exclude).handoff/**", ":(exclude).omc/**", ":(exclude).claude/**"]
+    names = git(repo, "diff-tree", "-r", "--name-status", a, b, "--", *excludes)
+    stat = git(repo, "diff-tree", "-r", "--numstat", a, b, "--", *excludes)
+    changed, created, deleted = [], [], []
+    for row in names.splitlines():
+        parts = row.split("\t")
+        if len(parts) < 2:
+            continue
+        status, path = parts[0], parts[-1]
+        changed.append(path)
+        if status.startswith("A"):
+            created.append(path)
+        elif status.startswith("D"):
+            deleted.append(path)
+    insertions = deletions = 0
+    for row in stat.splitlines():
+        cells = row.split("\t")
+        if len(cells) >= 2:
+            insertions += int(cells[0]) if cells[0].isdigit() else 0
+            deletions += int(cells[1]) if cells[1].isdigit() else 0
+    return {"known": True, "changed": changed, "created": created, "deleted": deleted,
+            "files_changed": len(changed), "insertions": insertions, "deletions": deletions}
+
+
+def read_gates(run_dir: Path) -> dict:
+    path = run_dir / "evidence" / "evidence.json"
+    if not path.exists():
+        return {"known": False}
+    try:
+        data = json.loads(path.read_text())
+    except ValueError:
+        return {"known": False}
+    rows = data.get("gates") or []
+    return {
+        "known": True,
+        "verdict": data.get("verdict"),
+        "acceptance_passed": data.get("acceptance_passed"),
+        "acceptance_total": data.get("acceptance_total"),
+        "regressed": data.get("regressed"),
+        "failed": [r["gate"] for r in rows if r.get("status") == "fail" and not r.get("advisory")],
+        "advisory_failed": [r["gate"] for r in rows
+                            if r.get("status") == "fail" and r.get("advisory")],
+        "skipped": [r["gate"] for r in rows if r.get("status") == "skipped"],
+    }
+
+
+def read_report(run_dir: Path) -> dict:
+    path = run_dir / "result.json"
+    if not path.exists() or path.stat().st_size == 0:
+        return {"present": False, "parsed": False}
+    raw = path.read_text(errors="replace").strip()
+    if not raw:
+        return {"present": False, "parsed": False}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return {"present": True, "parsed": False}
+    if not isinstance(data, dict):
+        return {"present": True, "parsed": False}
+    return {"present": True, "parsed": True, "status": data.get("status"),
+            "summary": (data.get("summary") or "")[:400],
+            "claimed_files": data.get("files_changed") or [],
+            "deviations": data.get("deviations") or [],
+            "blockers": data.get("blockers") or []}
+
+
+def read_plan(plan: Path) -> dict:
+    if not plan or not plan.exists():
+        return {"known": False}
+    text = plan.read_text(errors="replace")
+    criteria = len(re.findall(r"(?m)^- \[ \]", text))
+    commands = 0
+    in_section = in_block = False
+    for line in text.splitlines():
+        if re.match(r"^## Verification(\s+commands)?\s*$", line):
+            in_section = True
+            continue
+        if in_section and line.startswith("```"):
+            if in_block:
+                break
+            in_block = True
+            continue
+        if in_block and line.strip():
+            commands += 1
+    files = len(re.findall(r"(?m)^\|", text))
+    return {"known": True, "path": str(plan), "criteria": criteria, "commands": commands,
+            "table_rows": files, "bytes": len(text),
+            "sha256": hashlib.sha256(text.encode()).hexdigest()[:16]}
+
+
+# --------------------------------------------------------------------------------------------
+# the outcome
+#
+# Same taxonomy as bench/run, which derives it from the tree and never from the report, plus one
+# class bench/run has no way to see: a round the infrastructure ate. Round 6 of a real feature made
+# 41 tool calls, hit a tool-call format error, wrote nothing, and reported partial success. Scored
+# as an ordinary failure it is indistinguishable from a model that tried and got it wrong — and the
+# correct response is the opposite one. Re-run that plan; do not re-specify it.
+
+
+def classify(tree: dict, gates: dict, report: dict, activity: dict) -> tuple[str, list[str]]:
+    notes: list[str] = []
+    changed = tree.get("files_changed", 0) if tree.get("known") else None
+    verdict = gates.get("verdict") if gates.get("known") else None
+    status = report.get("status")
+    infra_errors = {"tool-call-format", "context-overflow", "connection", "timeout"}
+    hit_infra = bool(infra_errors & set((activity.get("errors") or {}).keys()))
+
+    if activity.get("parsed") and activity.get("write_calls") == 0 and changed == 0:
+        if hit_infra:
+            notes.append("no write was ever attempted and the adapter reported an error — "
+                         "re-run this plan once before changing it")
+            return "infra-failed", notes
+        notes.append("no write was ever attempted")
+
+    # The verdict comes first, and this is a deliberate divergence from bench/run's taxonomy.
+    # There, every round starts from a clean worktree, so "changed nothing" and "gates accept"
+    # cannot both be true unless the plan is vacuous. In real use the tree is cumulative: a repair
+    # round, or a round after an escalation, can legitimately change nothing because the work is
+    # already there. Calling that `fabricated` reads as an accusation of a model that did nothing
+    # wrong, and it appeared the first time the ladder ran.
+    if verdict == "ACCEPT":
+        if changed == 0:
+            notes.append("this round changed nothing; the tree was already acceptable")
+        return ("accepted" if report.get("parsed") else "patch-ok-no-report"), notes
+
+    if changed == 0:
+        if status in ("complete", "success"):
+            notes.append("reported success over a tree it never touched")
+            return "fabricated", notes
+        return "no-op", notes
+
+    if verdict == "ACCEPT":
+        return ("accepted" if report.get("parsed") else "patch-ok-no-report"), notes
+    if verdict == "REJECT":
+        if gates.get("regressed"):
+            notes.append("scored worse than the previous round — stop resuming")
+        return "patch-damaged", notes
+    return "unverified", notes
+
+
+# --------------------------------------------------------------------------------------------
+# record
+
+
+def cmd_record(args: argparse.Namespace) -> int:
+    repo = Path(args.repo).resolve()
+    run_dir = Path(args.run_dir).resolve()
+    jdir = journal_dir(repo)
+    (jdir / "runs").mkdir(parents=True, exist_ok=True)
+
+    started = args.started or ""
+    ended = args.ended or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    seconds = None
+    if started and ended:
+        try:
+            fmt = "%Y-%m-%dT%H:%M:%SZ"
+            seconds = int((datetime.strptime(ended, fmt) - datetime.strptime(started, fmt))
+                          .total_seconds())
+        except ValueError:
+            seconds = None
+
+    existing = load_records(repo)
+    attempt = sum(1 for r in existing if r.get("slug") == args.slug) + 1
+    run_id = f"{(started or ended).replace(':', '').replace('-', '')}-{args.slug}-{attempt}"
+
+    tree = read_tree_change(repo, run_dir)
+    gates = read_gates(run_dir)
+    report = read_report(run_dir)
+    activity = mine_events(run_dir / "stdout.log")
+    outcome, notes = classify(tree, gates, report, activity)
+
+    record = {
+        "schema": SCHEMA_VERSION,
+        "run_id": run_id,
+        "slug": args.slug,
+        "attempt": attempt,
+        "mode": args.mode,
+        "recorded_at": ended,
+        "started_at": started or None,
+        "seconds": seconds,
+        "provider": {"name": args.provider, "model": args.model or None,
+                     "reasoning": args.reasoning or None, "context": args.context or None},
+        "harness": {"commit": git(Path(args.handoff_home or repo), "rev-parse", "--short", "HEAD"),
+                    "dirty": bool(git(Path(args.handoff_home or repo), "status", "--porcelain"))},
+        "repo_head": git(repo, "rev-parse", "--short", "HEAD"),
+        "plan": read_plan(Path(args.plan) if args.plan else None),
+        "provider_exit": args.exit_status,
+        "tree": tree,
+        "gates": gates,
+        "activity": activity,
+        "report": report,
+        "outcome": outcome,
+        "notes": notes,
+        "retro": None,
+    }
+
+    # Copy the artifacts aside before the next round of this slug overwrites them. This is the
+    # whole reason the file exists: seven rounds produced three surviving logs.
+    archive = jdir / "runs" / run_id
+    archive.mkdir(parents=True, exist_ok=True)
+    for name in ("evidence/evidence.md", "evidence/evidence.json", "result.json", "feedback.md"):
+        src = run_dir / name
+        if src.exists():
+            shutil.copy2(src, archive / Path(name).name)
+    if (run_dir / "stdout.log").exists():
+        trim_log(run_dir / "stdout.log", archive / "events.jsonl.gz")
+    if args.plan and Path(args.plan).exists():
+        shutil.copy2(args.plan, archive / "plan.md")
+    record["archive"] = str(archive.relative_to(repo)) if archive.is_relative_to(repo) else str(archive)
+
+    with records_path(repo).open("a") as fh:
+        fh.write(json.dumps(record) + "\n")
+
+    print(f"==> journal: {run_id}  {outcome}"
+          + (f"  ({gates['acceptance_passed']}/{gates['acceptance_total']} criteria)"
+             if gates.get("acceptance_total") else ""))
+    for note in notes:
+        print(f"==>          {note}")
+    return 0
+
+
+# --------------------------------------------------------------------------------------------
+# read
+
+
+def fmt_row(r: dict) -> str:
+    g = r.get("gates") or {}
+    score = (f"{g.get('acceptance_passed')}/{g.get('acceptance_total')}"
+             if g.get("acceptance_total") else "-")
+    act = r.get("activity") or {}
+    return (f"{r.get('recorded_at', ''):<21}{r.get('slug', '')[:28]:<29}"
+            f"{r.get('outcome', ''):<20}{score:>7}"
+            f"{(str(r.get('seconds')) + 's' if r.get('seconds') is not None else '-'):>8}"
+            f"{(str(act.get('write_calls')) if act.get('parsed') else '-'):>7}"
+            f"  {','.join(sorted((act.get('errors') or {}).keys()))}")
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    rows = load_records(Path(args.repo).resolve())
+    if args.slug:
+        rows = [r for r in rows if r.get("slug") == args.slug]
+    if not rows:
+        print("no runs recorded yet")
+        return 0
+    print(f"{'when':<21}{'slug':<29}{'outcome':<20}{'score':>7}{'time':>8}{'writes':>7}  errors")
+    for r in rows[-args.limit:]:
+        print(fmt_row(r))
+    return 0
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    rows = load_records(Path(args.repo).resolve())
+    match = [r for r in rows if r.get("run_id") == args.which or r.get("slug") == args.which]
+    if not match:
+        print(f"no run matching '{args.which}'", file=sys.stderr)
+        return 1
+    print(json.dumps(match[-1] if args.latest else match, indent=2))
+    return 0
+
+
+def cmd_stats(args: argparse.Namespace) -> int:
+    rows = load_records(Path(args.repo).resolve())
+    if not rows:
+        print("no runs recorded yet")
+        return 0
+
+    outcomes = collections.Counter(r.get("outcome") for r in rows)
+    errors: collections.Counter = collections.Counter()
+    gate_failures: collections.Counter = collections.Counter()
+    durations, criteria_rates = [], []
+    writes_zero = 0
+    for r in rows:
+        for name, n in ((r.get("activity") or {}).get("errors") or {}).items():
+            errors[name] += n
+        # verify-round records each acceptance command as `acceptance-N` and a summary row as
+        # `acceptance`, so counting both charges one round twice for the same failure.
+        for name in {re.sub(r"-\d+$", "", n) for n in (r.get("gates") or {}).get("failed") or []}:
+            gate_failures[name] += 1
+        if r.get("seconds"):
+            durations.append(r["seconds"])
+        g = r.get("gates") or {}
+        if g.get("acceptance_total"):
+            criteria_rates.append(g["acceptance_passed"] / g["acceptance_total"])
+        act = r.get("activity") or {}
+        if act.get("parsed") and act.get("write_calls") == 0:
+            writes_zero += 1
+
+    total = len(rows)
+    accepted = outcomes["accepted"] + outcomes["patch-ok-no-report"]
+    summary = {
+        "runs": total,
+        "distinct_plans": len({r.get("slug") for r in rows}),
+        "usable_patch_rate": round(accepted / total, 3),
+        "outcomes": dict(outcomes.most_common()),
+        "median_seconds": sorted(durations)[len(durations) // 2] if durations else None,
+        "mean_criteria_rate": round(sum(criteria_rates) / len(criteria_rates), 3)
+        if criteria_rates else None,
+        "adapter_errors": dict(errors.most_common()),
+        "gate_failures": dict(gate_failures.most_common()),
+        "rounds_with_no_write": writes_zero,
+        "regressions": sum(1 for r in rows if (r.get("gates") or {}).get("regressed")),
+    }
+    if args.json:
+        print(json.dumps(summary, indent=2))
+        return 0
+
+    print(f"{total} runs across {summary['distinct_plans']} plans")
+    print(f"usable patch (accepted or patch-ok-no-report): "
+          f"{accepted}/{total} = {summary['usable_patch_rate']:.0%}")
+    if summary["mean_criteria_rate"] is not None:
+        print(f"mean acceptance-criteria rate: {summary['mean_criteria_rate']:.0%}")
+    if summary["median_seconds"]:
+        print(f"median run: {summary['median_seconds']}s")
+    print("\noutcomes")
+    for name, n in outcomes.most_common():
+        print(f"  {name:<22}{n:>4}")
+    if errors:
+        print("\nadapter errors — these are infrastructure, not the model")
+        for name, n in errors.most_common():
+            print(f"  {name:<22}{n:>4}")
+    if gate_failures:
+        print("\nwhat rejected rounds")
+        for name, n in gate_failures.most_common(8):
+            print(f"  {name:<22}{n:>4}")
+    if summary["rounds_with_no_write"]:
+        print(f"\n{summary['rounds_with_no_write']} round(s) attempted no write at all. "
+              "Check those for adapter faults before reading anything into the model.")
+    if summary["regressions"]:
+        print(f"{summary['regressions']} round(s) scored worse than the round before.")
+    return 0
+
+
+def cmd_export_sqlite(args: argparse.Namespace) -> int:
+    repo = Path(args.repo).resolve()
+    rows = load_records(repo)
+    dest = Path(args.path) if args.path else journal_dir(repo) / "runs.db"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.unlink(missing_ok=True)
+    db = sqlite3.connect(dest)
+    db.executescript("""
+        CREATE TABLE runs (
+            run_id TEXT PRIMARY KEY, slug TEXT, attempt INT, mode TEXT, recorded_at TEXT,
+            seconds INT, provider TEXT, model TEXT, outcome TEXT, verdict TEXT,
+            acceptance_passed INT, acceptance_total INT, regressed INT,
+            files_changed INT, insertions INT, deletions INT,
+            tool_calls INT, write_calls INT, iterations INT,
+            input_tokens INT, output_tokens INT,
+            report_present INT, report_status TEXT, harness_commit TEXT, record JSON);
+        CREATE TABLE errors (run_id TEXT, error TEXT, n INT);
+        CREATE TABLE gate_failures (run_id TEXT, gate TEXT);
+    """)
+    for r in rows:
+        g, t, a, p = (r.get(k) or {} for k in ("gates", "tree", "activity", "provider"))
+        db.execute("INSERT OR REPLACE INTO runs VALUES (" + ",".join("?" * 25) + ")", (
+            r.get("run_id"), r.get("slug"), r.get("attempt"), r.get("mode"), r.get("recorded_at"),
+            r.get("seconds"), p.get("name"), p.get("model"), r.get("outcome"), g.get("verdict"),
+            g.get("acceptance_passed"), g.get("acceptance_total"), int(bool(g.get("regressed"))),
+            t.get("files_changed"), t.get("insertions"), t.get("deletions"),
+            a.get("total_tool_calls"), a.get("write_calls"), a.get("iterations"),
+            (a.get("tokens") or {}).get("input"), (a.get("tokens") or {}).get("output"),
+            int(bool((r.get("report") or {}).get("present"))), (r.get("report") or {}).get("status"),
+            (r.get("harness") or {}).get("commit"), json.dumps(r)))
+        for name, n in (a.get("errors") or {}).items():
+            db.execute("INSERT INTO errors VALUES (?,?,?)", (r.get("run_id"), name, n))
+        for gate in g.get("failed") or []:
+            db.execute("INSERT INTO gate_failures VALUES (?,?)", (r.get("run_id"), gate))
+    db.commit()
+    db.close()
+    print(f"{len(rows)} run(s) -> {dest}")
+    print(f"  sqlite3 {dest} 'SELECT outcome, count(*) FROM runs GROUP BY 1 ORDER BY 2 DESC;'")
+    return 0
+
+
+# --------------------------------------------------------------------------------------------
+# the model's own account of the round
+#
+# Asked for AFTER the verdict, and shown the verdict, because a model asked to grade itself with no
+# ground truth produces the same confident fiction its completion reports do. Given the gate output
+# it is being asked a different question — not "did you succeed" but "here is what failed, what
+# about the instructions made that likely" — and that is a question about the plan, which is the
+# thing we can actually act on.
+#
+# Stored as data, never fed back into a later run automatically. Two rounds tested giving the
+# implementer a richer account of its own failure and both made outcomes worse.
+
+
+RETRO_PROMPT = """You have finished a task and it has already been graded. Do not attempt any
+further work, do not edit any file, and do not run any command.
+
+Below is the plan you were given, and the harness's verdict on what you produced. The verdict comes
+from running commands against the tree; it is not open to negotiation.
+
+Answer in JSON with exactly these keys:
+
+  "what_worked":     what in the plan made the task tractable — be specific, quote wording
+  "what_was_unclear": anything you had to guess at, decide for yourself, or interpret
+  "what_i_got_wrong": your own account of the failures below, in your words
+  "plan_changes":    a list of concrete edits to the PLAN that would have prevented each failure
+  "harness_friction": anything about the tooling that cost you turns — failed tool calls, files you
+                      could not read, commands that did not exist
+  "confidence":      "high" | "medium" | "low", in your own answers above
+
+Be blunt and specific. "Be clearer" is useless; "the plan said `fresh` but never defined the
+threshold, so I chose 7 days" is actionable.
+
+## The plan you were given
+
+{plan}
+
+## The verdict
+
+{evidence}
+"""
+
+
+def cmd_retro_prompt(args: argparse.Namespace) -> int:
+    repo = Path(args.repo).resolve()
+    rows = load_records(repo)
+    match = [r for r in rows if r.get("run_id") == args.which or r.get("slug") == args.which]
+    if not match:
+        print(f"no run matching '{args.which}'", file=sys.stderr)
+        return 1
+    record = match[-1]
+    archive = repo / record.get("archive", "")
+    plan = (archive / "plan.md")
+    evidence = (archive / "evidence.md")
+    print(RETRO_PROMPT.format(
+        plan=plan.read_text(errors="replace") if plan.exists() else "(plan not archived)",
+        evidence=evidence.read_text(errors="replace")[:8000] if evidence.exists()
+        else "(no evidence bundle)"))
+    return 0
+
+
+def cmd_attach(args: argparse.Namespace) -> int:
+    repo = Path(args.repo).resolve()
+    path = records_path(repo)
+    rows = load_records(repo)
+    target = None
+    for r in rows:
+        if r.get("run_id") == args.which or r.get("slug") == args.which:
+            target = r
+    if target is None:
+        print(f"no run matching '{args.which}'", file=sys.stderr)
+        return 1
+
+    payload = Path(args.retro).read_text(errors="replace") if args.retro else sys.stdin.read()
+    try:
+        parsed = json.loads(payload)
+    except ValueError:
+        # A retrospective wrapped in prose or a code fence is still worth keeping. The commonest
+        # provider failure in this project is an envelope problem, not a content problem.
+        match = re.search(r"\{.*\}", payload, re.S)
+        parsed = None
+        if match:
+            try:
+                parsed = json.loads(match.group(0))
+            except ValueError:
+                parsed = None
+        if parsed is None:
+            parsed = {"raw": payload[:4000], "parsed": False}
+    target["retro"] = parsed
+
+    # Rewrite in place. The file is small, append-only in normal use, and this is the one operation
+    # that edits history — done by replacing the whole file so a crash cannot leave a half-record.
+    tmp = path.with_suffix(".jsonl.tmp")
+    tmp.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    tmp.replace(path)
+    print(f"retro attached to {target['run_id']}")
+    return 0
+
+
+# --------------------------------------------------------------------------------------------
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--repo", default=os.environ.get("HANDOFF_REPO") or ".")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    rec = sub.add_parser("record")
+    rec.add_argument("--run-dir", required=True)
+    rec.add_argument("--slug", required=True)
+    rec.add_argument("--mode", default="do")
+    rec.add_argument("--provider", default="?")
+    rec.add_argument("--model", default="")
+    rec.add_argument("--reasoning", default="")
+    rec.add_argument("--context", default="")
+    rec.add_argument("--plan", default="")
+    rec.add_argument("--started", default="")
+    rec.add_argument("--ended", default="")
+    rec.add_argument("--exit-status", type=int, default=None)
+    rec.add_argument("--handoff-home", default="")
+    rec.set_defaults(func=cmd_record)
+
+    lst = sub.add_parser("list")
+    lst.add_argument("--slug")
+    lst.add_argument("--limit", type=int, default=30)
+    lst.set_defaults(func=cmd_list)
+
+    shw = sub.add_parser("show")
+    shw.add_argument("which")
+    shw.add_argument("--latest", action="store_true", default=True)
+    shw.add_argument("--all", dest="latest", action="store_false")
+    shw.set_defaults(func=cmd_show)
+
+    sts = sub.add_parser("stats")
+    sts.add_argument("--json", action="store_true")
+    sts.set_defaults(func=cmd_stats)
+
+    exp = sub.add_parser("export-sqlite")
+    exp.add_argument("path", nargs="?")
+    exp.set_defaults(func=cmd_export_sqlite)
+
+    rp = sub.add_parser("retro-prompt")
+    rp.add_argument("which")
+    rp.set_defaults(func=cmd_retro_prompt)
+
+    at = sub.add_parser("attach")
+    at.add_argument("which")
+    at.add_argument("--retro")
+    at.set_defaults(func=cmd_attach)
+
+    args = parser.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

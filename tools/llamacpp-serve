@@ -49,7 +49,63 @@ model_path() {
     esac
 }
 
-usage() { echo "usage: llamacpp-serve {start <model> [context]|stop|status}" >&2; }
+usage() { echo "usage: llamacpp-serve {start <model> [context]|stop|status|residency <log> [rss-kb]}" >&2; }
+
+# Did the model actually land on the GPU?
+#
+# A partial offload is silently successful: the server answers /health, serves tokens, and passes
+# every probe. It only announces itself later, as swap thrashing. On a machine whose GPU also
+# drives a desktop, 64k context did not fit — the server fell back to host RAM, took 8.9 GB of RSS
+# against 0.80 GB when resident, filled 7 of 8 GB of swap, and was OOM-killed inside the terminal's
+# cgroup, which killed the terminal and the run with it. Load average hit 128; that was processes
+# blocked on page-in, not CPU.
+#
+# Three independent signals, because each can be absent depending on build and log verbosity:
+# the layer-offload line, KV cache buffers allocated on the CPU, and host RSS. RSS is the blunt
+# one and the hardest to misread — a fully resident 20B model holds well under a gigabyte here.
+#
+# Separated from `start` and taking its inputs as arguments so it can be tested against captured
+# logs instead of requiring a GPU.
+cmd_residency() {
+    local log="$1" rss_kb="${2:-}" problems=0
+    [[ -f "$log" ]] || { echo "no log at $log" >&2; return 2; }
+
+    local layers
+    layers="$(grep -oE 'offloaded [0-9]+/[0-9]+ layers' "$log" | tail -1)"
+    if [[ -n "$layers" ]]; then
+        local on total
+        on="$(sed -E 's|offloaded ([0-9]+)/([0-9]+) layers|\1|' <<<"$layers")"
+        total="$(sed -E 's|offloaded ([0-9]+)/([0-9]+) layers|\2|' <<<"$layers")"
+        if [[ "$on" != "$total" ]]; then
+            echo "  WARNING: only $on of $total layers are on the GPU."
+            problems=$(( problems + 1 ))
+        fi
+    fi
+
+    # A KV buffer on the CPU means the context did not fit even though the weights did. This is
+    # what a too-large `-c` produces, and it is the failure the context table above documents.
+    local kv
+    kv="$(grep -iE 'CPU[ _]KV buffer size *= *[0-9.]+' "$log" | tail -1)"
+    if [[ -n "$kv" ]] && ! grep -qiE 'CPU[ _]KV buffer size *= *0[. ]' <<<"$kv"; then
+        echo "  WARNING: part of the KV cache is in host RAM — ${kv#*: }"
+        echo "           Lower the context: the KV cache, not the weights, is what overflows first."
+        problems=$(( problems + 1 ))
+    fi
+
+    if [[ -n "$rss_kb" ]] && [[ "$rss_kb" =~ ^[0-9]+$ ]] && (( rss_kb > 2000000 )); then
+        printf '  WARNING: llama-server holds %.1f GB of host RAM. A GPU-resident model holds well\n' \
+            "$(awk -v k="$rss_kb" 'BEGIN{print k/1048576}')"
+        echo "           under 1 GB here, so the model is at least partly in host memory."
+        problems=$(( problems + 1 ))
+    fi
+
+    if (( problems > 0 )); then
+        echo "  The server will still answer, slowly, and may take the machine down under swap."
+        echo "  Restart with a smaller context: tools/llamacpp-serve start <model> 32768"
+        return 1
+    fi
+    return 0
+}
 
 cmd_status() {
     if curl -fsS --max-time 3 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
@@ -106,6 +162,10 @@ cmd_start() {
             echo "llama-server: up on :$PORT serving $model at ${context} context"
             nvidia-smi --query-gpu=memory.used,memory.free --format=csv,noheader 2>/dev/null |
                 sed 's/^/  GPU: /'
+            local pid rss=""
+            pid="$(pgrep -f "$LLAMA_SERVER" 2>/dev/null | head -1)"
+            [[ -z "$pid" ]] || rss="$(awk '/^VmRSS:/{print $2}' "/proc/$pid/status" 2>/dev/null)"
+            cmd_residency "$LOG" "$rss" || true
             return 0
         fi
         pgrep -f "$LLAMA_SERVER" >/dev/null 2>&1 || break
@@ -120,5 +180,8 @@ case "${1:-}" in
 start)  shift; [[ $# -ge 1 ]] || { usage; exit 64; }; cmd_start "$@" ;;
 stop)   cmd_stop ;;
 status) cmd_status ;;
+# Exposed as a subcommand so the check can be run against a log after the fact — and so it can be
+# tested without a GPU, which is the only way it would ever have been tested at all.
+residency) shift; [[ $# -ge 1 ]] || { usage; exit 64; }; cmd_residency "$@" ;;
 *)      usage; exit 64 ;;
 esac

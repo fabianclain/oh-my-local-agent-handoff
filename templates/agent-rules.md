@@ -39,9 +39,13 @@ as general good advice.
 - Report the exact checks actually performed.
 - If any requested verification could not be performed, report it explicitly as unverified.
 - The plan already tells you how to verify. Run those commands. Do not write your own test file,
-  verification script or scratch harness — not in the repository, not in a temp directory.
+  verification script or scratch harness anywhere in the repository.
 - If you need to check something the plan does not cover, run it inline as a one-off command.
-  Nothing you create for your own checking may survive the run.
+- If a one-off command is not enough and you must write a file to inspect something, put it in
+  `.handoff/scratch/`. That directory is yours, it is ignored by the verifier and by git, and it is
+  the only place outside the plan's file list where you may create anything.
+- Never write a script that boots the whole application against its real database. Query through a
+  read-only command or a test, or do without the answer and report it as unverified.
 
 ## OUTPUT RULES
 
@@ -66,8 +70,10 @@ Stated for the maintainer, not for the model. The model sees only the rules abov
 | Completion report is not proof | Three runs reported `status: complete` with invented summaries — "added discount calculation to order processing and updated API endpoints; all tests pass" — over a tree they had not touched. There was no order processing and there were no API endpoints in the task. |
 | Real newlines | Files written as one line containing the characters `\` and `n`. It reached filenames too: a real file named `OpportunityReport.php` with a trailing newline, invisible to `ls`, evading a `*.php` check. |
 | One implementation | The first artifact produced here contained three successive implementations in one file, each commenting on the last: *"Correction: the above is wrong"*, *"Actually, the rule is..."*. |
+| A sanctioned scratch directory | The prohibition above was present in rounds 3–7 of a real feature and litter appeared in two of them anyway. Both were the model wanting to inspect a value with no permitted way to do it. A place to work is more likely to be used than a prohibition is to be obeyed, and `.handoff/scratch/` is excluded from the scope gate, so anything left there costs nothing. |
+| Never boot the app against its real database | One of those scratch scripts bootstrapped the whole application against the live SQLite file. That session ended with the development database corrupted beyond `sqlite_master`, cause never established — and this is the most plausible candidate. Recovery was possible only because the raw SERP snapshots on disk were re-parseable. |
 
 **None of these rules is enforcement.** A plan stated the `SUM(clicks)/SUM(impressions)` rule
 explicitly and the wrong version shipped anyway. Stating a constraint is not the same as honouring
-it: the harness gates in `bench/run` and `.handoff/bin/gemma-round` are what decide whether a
+it: the harness gates in `bench/run` and `tools/verify-round` are what decide whether a
 round stands.

@@ -1,0 +1,361 @@
+#!/usr/bin/env bash
+#
+# escalate — run the ladder: the local model tries, a hosted model re-specifies, the local model
+# tries again. Stop as soon as the gates accept, and hand back to a person when they do not.
+#
+#   tools/escalate <slug> [--planners codex,glm] [--attempts 2] [--escalations 2] [--dry-run]
+#   handoff auto <slug>
+#
+# The division of labour this automates is the one the whole project rests on: the local model is
+# good at writing code to a specification and bad at deciding what the specification should say.
+# Every defect that shipped in ~30 real rounds originated in a specification. So when a round is
+# rejected, the thing to change is usually the plan — and that is a hosted model's job.
+#
+#   rung 1   local implements the plan
+#   rung 2   local repairs, given the exact commands that failed
+#   rung 3   a hosted planner reads the plan, the evidence and the diff, and writes a NEW, narrower
+#            plan. It never writes code.
+#   ...      back to rung 1 against the new plan, up to --escalations times
+#   stop     a handover brief: what was tried, what each round scored, what is left
+#
+# Planners alternate (`--planners codex,glm`) on purpose. Two different models reading the same
+# failure is a cheap second opinion, and if both produce plans that fail the same way, that is
+# evidence about the task rather than about either plan.
+#
+# Three rules are enforced rather than trusted, because each is a way this could quietly become
+# worthless:
+#
+#   1. The planner may not be the implementer. A model that writes the plan, writes the code and
+#      then judges the result has removed the only independent step in the loop.
+#   2. The planner may write the new plan and its notes file. Nothing else. If it touches source,
+#      or the harness that judges the work, the ladder stops and says so — a model editing its own
+#      grader is self-approval by another route, and no automation here gets to do it.
+#   3. A plan the planner produces must pass `check-plan` before it is run, and a round that scores
+#      worse than the round before it ends the repair immediately rather than continuing to lose
+#      ground.
+
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HANDOFF_HOME="$(cd "$HERE/.." && pwd)"
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+SLUG=""
+PLANNERS="${HANDOFF_PLANNERS:-codex,glm}"
+ATTEMPTS="${HANDOFF_LOCAL_ATTEMPTS:-2}"
+ESCALATIONS="${HANDOFF_ESCALATIONS:-2}"
+IMPLEMENTER="${HANDOFF_PROVIDER:-local}"
+DRY_RUN=0
+
+while (( $# > 0 )); do
+    case "$1" in
+    --planners) PLANNERS="${2:?--planners needs a value}"; shift 2 ;;
+    --attempts) ATTEMPTS="${2:?--attempts needs a value}"; shift 2 ;;
+    --escalations) ESCALATIONS="${2:?--escalations needs a value}"; shift 2 ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    -h|--help) sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*) echo "unknown option: $1" >&2; exit 64 ;;
+    *) SLUG="$1"; shift ;;
+    esac
+done
+[[ -n "$SLUG" ]] || { echo "usage: escalate <slug> [--planners a,b] [--attempts N] [--escalations N]" >&2; exit 64; }
+
+# shellcheck disable=SC1091
+[[ -f "$REPO_ROOT/.handoff/config.sh" ]] && source "$REPO_ROOT/.handoff/config.sh"
+PLANS_DIR="${HANDOFF_PLANS_DIR:-$REPO_ROOT/.handoff/plans}"
+RUNS_DIR="${HANDOFF_RUNS_DIR:-$REPO_ROOT/.handoff/runs}"
+LADDER="$RUNS_DIR/$SLUG/ladder.md"
+NOTES_REL=".handoff/ladder-notes.md"
+
+IFS=',' read -r -a PLANNER_LIST <<<"$PLANNERS"
+for planner in "${PLANNER_LIST[@]}"; do
+    [[ -f "$HANDOFF_HOME/providers/${planner}.sh" ]] || {
+        echo "unknown planner: $planner" >&2; exit 64; }
+    # Rule 1. `stub` is exempt because it runs no model at all: it cannot have an opinion to
+    # approve, which is the thing independence protects against.
+    if [[ "$planner" == "$IMPLEMENTER" && "$planner" != stub ]]; then
+        echo "the planner and the implementer are both '$planner'." >&2
+        echo "One model writing the plan, the code and the verdict removes the independence that" >&2
+        echo "makes the verdict worth anything. Set HANDOFF_PROVIDER or --planners." >&2
+        exit 64
+    fi
+done
+
+mkdir -p "$(dirname "$LADDER")"
+say() { echo "$*"; echo "$*" >>"$LADDER"; }
+rule() { echo; echo "── $*"; printf '\n## %s\n\n' "$*" >>"$LADDER"; }
+
+: >"$LADDER"
+{
+    echo "# Ladder — $SLUG"
+    echo
+    echo "implementer \`$IMPLEMENTER\`, planners \`$PLANNERS\`, $ATTEMPTS local attempt(s) per plan,"
+    echo "up to $ESCALATIONS escalation(s). Started $(date -u +%Y-%m-%dT%H:%M:%SZ)."
+} >>"$LADDER"
+
+# The score a round achieved, read from the bundle the gates wrote. The report is not consulted.
+score_of() {
+    python3 -c "
+import json,sys
+try: d=json.load(open(sys.argv[1]))
+except Exception: print('?/?  unknown'); raise SystemExit
+print(f\"{d.get('acceptance_passed','?')}/{d.get('acceptance_total','?')}  {d.get('verdict','?')}\"
+      + ('  REGRESSED' if d.get('regressed') else ''))" "$1" 2>/dev/null || echo "?/?  unknown"
+}
+field_of() { python3 -c "
+import json,sys
+try: print(json.load(open(sys.argv[1])).get(sys.argv[2], ''))
+except Exception: print('')" "$1" "$2" 2>/dev/null; }
+
+# What the journal made of the last round. `infra-failed` is the case that must not be treated as
+# a model failure: the round never happened, so re-running the same plan is right and re-specifying
+# it is wrong. Two of seven rounds in one real feature were this.
+last_outcome() {
+    python3 -c "
+import json,sys,pathlib
+p=pathlib.Path(sys.argv[1])
+rows=[json.loads(l) for l in p.read_text().splitlines() if l.strip()] if p.exists() else []
+rows=[r for r in rows if r.get('slug')==sys.argv[2]]
+print(rows[-1].get('outcome','') if rows else '')" \
+        "${HANDOFF_JOURNAL_DIR:-$REPO_ROOT/.handoff/journal}/runs.jsonl" "$1" 2>/dev/null
+}
+
+# Turn the evidence bundle into the flat log tools/render-feedback expects, so the repair message
+# is produced by the same renderer the benchmark uses rather than by a second implementation.
+build_feedback() {
+    local evidence_dir="$1" out="$2"
+    python3 - "$evidence_dir" >"$out.log" <<'PY'
+import json, pathlib, sys
+d = pathlib.Path(sys.argv[1])
+rows = [json.loads(l) for l in (d / "evidence.jsonl").read_text().splitlines() if l.strip()] \
+    if (d / "evidence.jsonl").exists() else []
+n = 0
+for row in rows:
+    if not row["gate"].startswith("acceptance-"):
+        continue
+    n += 1
+    print(f"command {n}: {row.get('command','')}")
+    out = row.get("output_file")
+    if out and pathlib.Path(out).exists():
+        print(pathlib.Path(out).read_text(errors="replace").rstrip())
+    print(f"exit_code: {0 if row.get('status') == 'pass' else 1}")
+PY
+    BENCH_FEEDBACK_DETAIL=full "$HERE/render-feedback" "$out.log" - 0 >"$out"
+}
+
+# --- the planner turn ---------------------------------------------------------------------------
+
+run_planner() {
+    local planner="$1" from_slug="$2" to_slug="$3"
+    local run_dir="$RUNS_DIR/$from_slug"
+    local evidence="$run_dir/evidence/evidence.md"
+    local new_plan_rel="${PLANS_DIR#"$REPO_ROOT"/}/${to_slug}.md"
+
+    local diff_text="(no diff recorded)"
+    if [[ -s "$run_dir/tree-before" && -s "$run_dir/tree-after" ]]; then
+        diff_text="$(git diff-tree -p "$(cat "$run_dir/tree-before")" "$(cat "$run_dir/tree-after")" \
+            -- ':(exclude).handoff/**' | head -c 24000)"
+    fi
+
+    local prompt
+    prompt="You are the planner in a three-part loop. A local model implements; a harness runs the
+plan's own acceptance commands against the tree and decides. It has just rejected this round.
+
+Your job is to write a NEW plan that is more likely to succeed. You are not fixing the code — do
+not edit any source file, do not run the task yourself, and do not modify anything under the
+harness. Write exactly one file:
+
+    $new_plan_rel
+
+If you have a recommendation that is not a plan change — about the tooling, the model, or the task
+being unsuitable — append it to $NOTES_REL instead. Those are the only two paths you may write.
+
+## How to make the new plan better
+
+The failure below is far more often a specification defect than a coding defect. In ~30 real rounds
+on this harness, every defect that shipped originated in a plan.
+
+1. Make it SMALLER. One to two files, three to six criteria, one coherent behaviour. If the
+   rejected plan mixed a service with a view, split them and specify only the first.
+2. One acceptance criterion, exactly one executable command, in the same order. The harness refuses
+   a plan where the counts disagree, and a plan with six criteria and two commands caps the score
+   at 2/6 by construction.
+3. Assert what a stub cannot fake. A criterion a do-nothing tree passes measures nothing.
+4. Any named API that must be used deserves a grep criterion. Prose asking for it has failed here.
+5. Anything you are tempted to state twice, or in bold, needs a command instead. A route-ordering
+   constraint stated in two sections was still violated; an acceptance command returning 404 caught
+   it.
+6. Dictate signatures exactly. Difficulty should mean more work, not more decisions.
+7. Decide what happens to the previous attempt's changes and SAY SO in the plan. The tree still
+   holds them. If the attempt was right as far as it went, keep it and specify only the remaining
+   delta, and make the file-count criterion match. If it was mostly wrong, say the implementer
+   should start from the current state and list what must change.
+
+Required sections: a title, '## Files to touch' as a table, '## Acceptance criteria' as '- [ ]'
+lines, '## Verification' as one fenced bash block with one command per criterion, and
+'## Out of scope'.
+
+## The plan that was rejected
+
+$(cat "$PLANS_DIR/${from_slug}.md" 2>/dev/null || echo "(missing)")
+
+## What the harness found
+
+$(head -c 12000 "$evidence" 2>/dev/null || echo "(no evidence bundle)")
+
+## What the previous attempt actually changed
+
+\`\`\`diff
+$diff_text
+\`\`\`
+"
+
+    local dev="You are planning, not implementing. Write only the plan file you are told to write, and the notes file if you have something to say that is not a plan. Never edit source, never run the task, never touch the harness."
+
+    (
+        # Sourced in a subshell: adapters set environment for their own model, and leaking a
+        # planner's model into the implementer's run would silently change what is being measured.
+        # shellcheck disable=SC1090
+        HANDOFF_ROLE=planner
+        export HANDOFF_ROLE
+        source "$HANDOFF_HOME/providers/${planner}.sh"
+        provider_preflight || exit 1
+        provider_run "$REPO_ROOT" "$HANDOFF_HOME/schemas/handoff.schema.json" \
+            "$RUNS_DIR/$from_slug/planner-$planner.json" \
+            "$RUNS_DIR/$from_slug/planner-$planner.log" "$dev" "$prompt"
+    )
+}
+
+# Rule 2, enforced from the tree. A planner that edited source has stopped being a planner, and a
+# planner that edited the harness has started grading itself.
+planner_touched_only_plan() {
+    local before="$1" allowed_plan="$2" bad=0
+    local after; after="$(
+        idx="$(mktemp)"; rm -f "$idx"
+        GIT_INDEX_FILE="$idx" git add -A >/dev/null 2>&1
+        GIT_INDEX_FILE="$idx" git write-tree; rm -f "$idx"
+    )"
+    while IFS= read -r file; do
+        [[ -n "$file" ]] || continue
+        [[ "$file" == "$allowed_plan" || "$file" == "$NOTES_REL" ]] && continue
+        case "$file" in .handoff/runs/*|.handoff/journal/*|.handoff/scratch/*) continue ;; esac
+        echo "  planner wrote: $file"
+        bad=1
+    done < <(git diff-tree -r --name-only "$before" "$after")
+    return "$bad"
+}
+
+# --- the ladder ---------------------------------------------------------------------------------
+
+CURRENT="$SLUG"
+ESCALATION=0
+ACCEPTED=0
+
+while :; do
+    for (( attempt = 1; attempt <= ATTEMPTS; attempt++ )); do
+        rule "$CURRENT — local attempt $attempt of $ATTEMPTS ($IMPLEMENTER)"
+        FEEDBACK_ARG=()
+        if (( attempt > 1 )); then
+            EV="$RUNS_DIR/$CURRENT/evidence"
+            if [[ -f "$EV/evidence.jsonl" ]]; then
+                build_feedback "$EV" "$RUNS_DIR/$CURRENT/feedback.md"
+                FEEDBACK_ARG=(HANDOFF_FEEDBACK_FILE="$RUNS_DIR/$CURRENT/feedback.md")
+                say "repairing with the $(grep -c '^- FAILED' "$RUNS_DIR/$CURRENT/feedback.md" \
+                    2>/dev/null || echo 0) failing command(s) fed back"
+            fi
+        fi
+
+        if (( DRY_RUN )); then
+            say "(dry run) would run: HANDOFF_PROVIDER=$IMPLEMENTER handoff do $CURRENT"
+        else
+            env "${FEEDBACK_ARG[@]}" HANDOFF_PROVIDER="$IMPLEMENTER" \
+                "$HANDOFF_HOME/bin/handoff" do "$CURRENT"
+        fi
+
+        EVJSON="$RUNS_DIR/$CURRENT/evidence/evidence.json"
+        say "result: $(score_of "$EVJSON")"
+
+        if [[ "$(field_of "$EVJSON" verdict)" == ACCEPT ]]; then
+            ACCEPTED=1
+            break
+        fi
+
+        # A round the infrastructure ate is not evidence about the plan. Re-run it once; do not
+        # spend a hosted escalation on a plan that was never asked.
+        if [[ "$(last_outcome "$CURRENT")" == infra-failed ]]; then
+            say "the round never reached the model — no write was attempted and the adapter errored."
+            say "re-running the same plan rather than re-specifying it."
+            (( attempt-- )) || true
+            continue
+        fi
+
+        # Losing ground is the signal to stop repairing. One real feature went 9/12 then 3/14 on a
+        # resume, by corrupting the file it had nearly finished.
+        if [[ "$(field_of "$EVJSON" regressed)" == True ]]; then
+            say "this attempt scored worse than the last. Stopping the repair loop early."
+            break
+        fi
+    done
+
+    (( ACCEPTED )) && break
+    (( ESCALATION < ESCALATIONS )) || break
+
+    PLANNER="${PLANNER_LIST[$(( ESCALATION % ${#PLANNER_LIST[@]} ))]}"
+    ESCALATION=$(( ESCALATION + 1 ))
+    NEXT="${SLUG}-e${ESCALATION}"
+    rule "escalation $ESCALATION of $ESCALATIONS — $PLANNER re-specifies"
+
+    if (( DRY_RUN )); then
+        say "(dry run) would ask $PLANNER to write ${PLANS_DIR#"$REPO_ROOT"/}/${NEXT}.md"
+        CURRENT="$NEXT"
+        continue
+    fi
+
+    BEFORE_TREE="$(
+        idx="$(mktemp)"; rm -f "$idx"
+        GIT_INDEX_FILE="$idx" git add -A >/dev/null 2>&1
+        GIT_INDEX_FILE="$idx" git write-tree; rm -f "$idx"
+    )"
+    run_planner "$PLANNER" "$CURRENT" "$NEXT"
+
+    NEW_PLAN="$PLANS_DIR/${NEXT}.md"
+    if [[ ! -s "$NEW_PLAN" ]]; then
+        say "$PLANNER produced no plan at $NEW_PLAN. Stopping."
+        break
+    fi
+    if ! planner_touched_only_plan "$BEFORE_TREE" "${NEW_PLAN#"$REPO_ROOT"/}"; then
+        say "$PLANNER wrote outside the plan. Stopping so a person can look at the diff —"
+        say "a planner editing source, or the harness that judges the work, is not a planner."
+        break
+    fi
+    if ! "$HERE/check-plan" "$NEW_PLAN" >"$RUNS_DIR/$CURRENT/check-$NEXT.log" 2>&1; then
+        say "the new plan would be refused by the harness:"
+        sed 's/^/    /' "$RUNS_DIR/$CURRENT/check-$NEXT.log" | head -8 | tee -a "$LADDER"
+        break
+    fi
+    say "new plan accepted by check-plan: ${NEW_PLAN#"$REPO_ROOT"/}"
+    CURRENT="$NEXT"
+done
+
+# --- the handover ---------------------------------------------------------------------------
+
+rule "outcome"
+if (( ACCEPTED )); then
+    say "ACCEPTED on plan '$CURRENT'. The changes are uncommitted; review the diff and commit."
+    say "  handoff diff $CURRENT"
+else
+    say "NOT ACCEPTED after $ESCALATION escalation(s). This is now yours."
+    say ""
+    say "Read in this order:"
+    say "  handoff log $SLUG                     what each round scored"
+    say "  $RUNS_DIR/$CURRENT/evidence/evidence.md   why the last one was rejected"
+    say "  handoff diff $CURRENT                 what the tree holds now"
+    [[ -s "$REPO_ROOT/$NOTES_REL" ]] && say "  $NOTES_REL  what the planners wanted to say"
+    say ""
+    say "Two rounds failing the same way is evidence about the task's shape, not the model's."
+    say "The usual answer is a smaller step, or writing this one yourself."
+fi
+echo
+echo "==> ladder: ${LADDER#"$REPO_ROOT"/}"
+exit $(( ACCEPTED ? 0 : 1 ))

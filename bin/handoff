@@ -8,6 +8,11 @@
 #   handoff init            wire this project up: plans dir, config, gitignore
 #   handoff check <slug>    will the harness accept this plan, before you run it
 #   handoff verify <slug>   run the gates over the tree and print the verdict
+#   handoff log [slug]      every run recorded so far, one line each
+#   handoff stats           how the local model is actually performing, across runs
+#   handoff retro <slug>    ask the model what it thinks went wrong, and record the answer
+#   handoff auto <slug>     the ladder: local tries, a hosted planner re-specifies, local retries
+#   handoff doctor          can this machine run a round right now? read-only
 #
 # `do` verifies automatically when it finishes. HANDOFF_NO_VERIFY=1 suppresses that, for
 # callers running the same gates themselves.
@@ -47,7 +52,7 @@ if [[ "$MODE" == "init" ]]; then
     # Agent state in the working tree breaks any plan that asserts how many files changed, and
     # that check is in most plans. A project's first run was rejected for exactly this.
     added=(); skipped=()
-    for pattern in '.handoff/runs/' '.omc/' '.claude/'; do
+    for pattern in '.handoff/runs/' '.handoff/scratch/' '.handoff/journal/' '.omc/' '.claude/'; do
         grep -qxF "$pattern" "$ROOT/.gitignore" 2>/dev/null && continue
         # Never ignore a path the project tracks, and never ignore the plans directory. A project
         # can legitimately keep plans under .claude, and blanket-ignoring it there would quietly
@@ -70,8 +75,33 @@ if [[ "$MODE" == "init" ]]; then
     exit 0
 fi
 
+# Read-only, needs no slug, and must work before anything else does — so it comes first.
+if [[ "$MODE" == "doctor" ]]; then
+    HANDOFF_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    shift
+    exec "$HANDOFF_HOME/tools/doctor" "$@"
+fi
+
+# The ladder runs the driver repeatedly, so it lives outside it rather than inside the mode switch.
+if [[ "$MODE" == "auto" ]]; then
+    HANDOFF_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    shift
+    exec "$HANDOFF_HOME/tools/escalate" "$@"
+fi
+
+# `log` and `stats` read the journal and need no slug — they are about the history, not one run.
+if [[ "$MODE" == "log" || "$MODE" == "stats" ]]; then
+    HANDOFF_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    REPO_ROOT="$(git rev-parse --show-toplevel)"
+    [[ "$MODE" == "log" ]] &&
+        exec "$HANDOFF_HOME/tools/journal" --repo "$REPO_ROOT" list ${SLUG:+--slug "$SLUG"}
+    shift                       # drop the mode; anything left is a flag for `stats`
+    exec "$HANDOFF_HOME/tools/journal" --repo "$REPO_ROOT" stats "$@"
+fi
+
 if [[ -z "$MODE" || -z "$SLUG" ]]; then
-    echo "usage: handoff {do|check|resume|diff|verify} <slug> | handoff init" >&2
+    echo "usage: handoff {do|check|resume|diff|verify|retro|auto} <slug>" >&2
+    echo "       handoff {init|log|stats|doctor}" >&2
     exit 64
 fi
 
@@ -102,14 +132,40 @@ SCHEMA="$HANDOFF_HOME/schemas/handoff.schema.json"
 PROVIDER="${HANDOFF_PROVIDER:-codex}"
 PROVIDER_FILE="$HANDOFF_HOME/providers/${PROVIDER}.sh"
 [[ -f "$PROVIDER_FILE" ]] || { echo "unknown provider: $PROVIDER" >&2; exit 64; }
+
+# Defaults for the optional half of the provider contract, defined BEFORE the adapter so any
+# adapter can override them. Without these the driver called functions that did not exist and bash
+# printed `provider_capabilities: command not found` in the middle of a run — noise that reads like
+# a harness crash, and that hid the genuinely serious case immediately below.
+provider_capabilities() { :; }
+provider_parse_session_id() { return 1; }
+
 # shellcheck disable=SC1090
 source "$PROVIDER_FILE"
+
+# A provider with no session support cannot resume, and must say so rather than appearing to work.
+#
+# Found while checking a field report that said `resume` exits 0 without verifying. That specific
+# bug was already fixed — resume does verify — but the investigation turned up a worse one wearing
+# the same clothes: with no `provider_resume`, bash printed `command not found`, the driver ran no
+# model at all, and then verified the untouched tree and printed a verdict on it. The verdict was
+# real, the round was not, and the commonest provider here — Cline, whose `--id` is incompatible
+# with `--json` in 3.0.52 — is exactly one of these.
+if [[ "$MODE" == "resume" ]] && ! declare -F provider_resume >/dev/null; then
+    echo "provider '$PROVIDER' cannot resume: it has no session support." >&2
+    echo "Use a repair attempt instead, which needs no session:" >&2
+    echo "  HANDOFF_FEEDBACK_FILE=$RUN_DIR/feedback.md HANDOFF_PROVIDER=$PROVIDER handoff do $SLUG" >&2
+    exit 64
+fi
+
 provider_preflight || exit 1
 
 # Harness scratch state churns on its own during a run and is not the implementer's doing.
 # Excluding it keeps the changed-file list honest for review.
 DIFF_EXCLUDES=(
     ':(exclude).handoff/runs/**'
+    ':(exclude).handoff/journal/**'
+    ':(exclude).handoff/scratch/**'
     ':(exclude).omc/**'
     ':(exclude)storage/logs/**'
     ':(exclude)storage/framework/**'
@@ -288,8 +344,34 @@ verify)
     exit $?
     ;;
 
+retro)
+    # Ask the model what it thinks went wrong, after it has been told what actually did.
+    #
+    # A read-only turn, deliberately: the round is already graded, and a model given a second bite
+    # at a rejected tree would take it. The value here is not the model's self-assessment — it is
+    # the plan defects the self-assessment names, which are the reviewer's to act on.
+    JOURNAL="$HANDOFF_HOME/tools/journal"
+    RETRO_PROMPT_FILE="$RUN_DIR/retro-prompt.txt"
+    "$JOURNAL" --repo "$REPO_ROOT" retro-prompt "$SLUG" >"$RETRO_PROMPT_FILE" || exit 1
+    echo "==> asking $PROVIDER to reflect on '$SLUG' (no edits: this turn is read-only)"
+    set +e
+    provider_run "$REPO_ROOT" "$SCHEMA" "$RUN_DIR/retro.json" "$RUN_DIR/retro.log" \
+        "You are reviewing a finished, already-graded task. Answer the question asked and change nothing. Do not edit files, do not run commands, do not create anything." \
+        "$(cat "$RETRO_PROMPT_FILE")"
+    RETRO_STATUS=$?
+    set -e
+    if [[ -s "$RUN_DIR/retro.json" ]]; then
+        "$JOURNAL" --repo "$REPO_ROOT" attach "$SLUG" --retro "$RUN_DIR/retro.json"
+        echo "==> handoff show: tools/journal show $SLUG"
+    else
+        echo "==> the provider returned nothing (exit $RETRO_STATUS); nothing attached" >&2
+        exit 1
+    fi
+    exit 0
+    ;;
+
 *)
-    echo "unknown mode: $MODE (expected do|check|resume|diff|verify)" >&2
+    echo "unknown mode: $MODE (expected do|check|resume|diff|verify|retro|auto|log|stats|init|doctor)" >&2
     exit 64
     ;;
 esac
@@ -301,6 +383,8 @@ while IFS='=' read -r cap level; do
 done < <(provider_capabilities)
 
 echo "==> handoff $MODE '$SLUG'  provider=$PROVIDER model=${HANDOFF_MODEL:-default} sandbox=${HANDOFF_SANDBOX:-workspace-write}"
+
+STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 set +e
 if [[ "$MODE" == "resume" ]]; then
@@ -351,6 +435,22 @@ if [[ ( "$MODE" == "do" || "$MODE" == "resume" ) && "${HANDOFF_NO_VERIFY:-0}" !=
         echo "==>       but the gates accept this tree. Judging the tree: accepted."
     fi
     STATUS="$VERDICT"
+fi
+
+# Record the round, after the verdict exists so the journal carries it rather than guessing.
+#
+# The run directory is reused by the next round of the same slug, which is how seven rounds of one
+# feature came to leave three surviving logs. This copies the evidence, the plan and a trimmed
+# event stream somewhere immutable before that can happen. HANDOFF_NO_JOURNAL=1 opts out;
+# bench/run keeps its own records and does not need a second set.
+if [[ ( "$MODE" == "do" || "$MODE" == "resume" ) && "${HANDOFF_NO_JOURNAL:-0}" != 1 &&
+      -x "$HANDOFF_HOME/tools/journal" ]]; then
+    "$HANDOFF_HOME/tools/journal" --repo "$REPO_ROOT" record \
+        --run-dir "$RUN_DIR" --slug "$SLUG" --mode "$MODE" --plan "$PLAN_FILE" \
+        --provider "$PROVIDER" --model "${HANDOFF_MODEL:-}" \
+        --reasoning "${HANDOFF_CLINE_THINKING:-}" --context "${HANDOFF_CONTEXT:-}" \
+        --started "$STARTED_AT" --exit-status "$STATUS" \
+        --handoff-home "$HANDOFF_HOME" || true
 fi
 
 exit "$STATUS"

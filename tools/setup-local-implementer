@@ -16,7 +16,11 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
-CONTEXT=65536
+# Chosen from free VRAM below, not fixed. 64k was the documented default and is wrong on any card
+# that also drives a desktop: the weights fit, the KV cache does not, and llama.cpp spills to host
+# RAM rather than refusing. The visible result is a working server that later fills swap and gets
+# OOM-killed along with whatever terminal scope it was started in.
+CONTEXT=""
 MODEL="gpt-oss-20b"
 PORT="${LLAMACPP_PORT:-8071}"
 CACHE="${LLAMACPP_STATE:-$HOME/.cache/agent-handoff}"
@@ -67,6 +71,21 @@ else
     echo "      mv $(dirname "$GGUF")/gpt-oss-20b-mxfp4.gguf $GGUF"
     echo
     die "re-run this script once the weights are in place"
+fi
+
+if [[ -z "$CONTEXT" ]]; then
+    # Free VRAM, not total. An 11.3 GB model plus a 64k q8_0 KV cache needs about 15 GB free;
+    # a desktop session typically holds 2–3 GB of a 16 GB card before this ever starts.
+    FREE_MIB="$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null |
+                head -1 | tr -dc '0-9')"
+    if [[ -n "$FREE_MIB" ]] && (( FREE_MIB < 15000 )); then
+        CONTEXT=32768
+        echo "    note — ${FREE_MIB} MiB free on the GPU, so using 32768 context rather than 65536."
+        echo "           64k needs ~15 GB free; without it the model spills to host RAM and the"
+        echo "           machine can end up swapping until the OOM killer intervenes."
+    else
+        CONTEXT=65536
+    fi
 fi
 
 say "serving it at ${CONTEXT} context"

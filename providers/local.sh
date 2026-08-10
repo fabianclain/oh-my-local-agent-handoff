@@ -15,8 +15,17 @@
 #   Cline              drives its own tool loop, and reaches llama.cpp through `openai-compatible`
 #   reasoning `low`    against `off`, 15 runs each: quality indistinguishable (p >= 0.70) and every
 #                      cost estimate favours `low`. Chosen because nothing points away from it
-#   64k context        the largest window that keeps this model fully GPU-resident on 16 GB. One
-#                      run in fifteen still exceeded it, so treat it as a limit, not headroom
+#   64k context        the largest window that keeps this model fully GPU-resident on 16 GB *free*.
+#                      One run in fifteen still exceeded it, so treat it as a limit, not headroom.
+#
+#                      Read "free" literally. On a card that also drives a desktop, ~2.5 GB is
+#                      already held; an 11.3 GB model plus a 64k q8_0 KV cache does not fit in what
+#                      is left, and llama.cpp does not refuse — it spills to host RAM and keeps
+#                      serving. Measured: 8.9 GB host RSS at 64k against 0.80 GB at 32k, swap at
+#                      7 of 8 GB, load average 128 from page-in stalls, and an OOM kill that took
+#                      the terminal scope and the run with it. **Use 32768 on a desktop machine.**
+#                      `tools/llamacpp-serve start` now warns when the model is not fully resident;
+#                      before that the only symptom was the machine freezing.
 #
 # `providers/lcgptossl.sh` is the same configuration under its benchmark label. This one exists so
 # day-to-day use does not require reading a naming scheme; that one exists so results stay

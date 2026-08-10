@@ -113,6 +113,18 @@ EXCLUDES=(
     # Harness territory, not the implementer's work. The driver reads it and the setup guide tells
     # the user to write it; a plan has no reason to name it.
     ':(exclude).handoff/config.sh'
+    # The run journal — the harness's own records of previous rounds. Counting these as the
+    # implementer's work fails every verification after the first, which is exactly what happened
+    # the first time the journal was wired in.
+    ':(exclude).handoff/journal/**'
+    # The sanctioned scratch directory. Two of seven rounds in one real feature left scratch files
+    # behind, in rounds whose prose explicitly forbade them, and both were the model wanting to
+    # inspect a value with no legitimate way to do it. One of those scripts booted the whole
+    # application against the live database, which is also the most plausible cause of the database
+    # corruption that session. Prose has now failed at this twice; a permitted place to work is
+    # more likely to be used than a prohibition is to be obeyed, and it keeps the mess somewhere
+    # the round is not judged on and `handoff init` already ignores.
+    ':(exclude).handoff/scratch/**'
     # Not the implementer's work, and blaming it for these is a false rejection. The first
     # end-to-end run of `handoff do` in a fresh project was rejected for three "invented" files
     # that were the agent framework's own state directory. bench/run had excluded these for
@@ -363,9 +375,27 @@ fi
 
 # --- render -------------------------------------------------------------------------------------
 python3 - "$EVIDENCE" "$OUT_DIR" <<'PY'
-import json, sys
+import json, os, sys
 evidence_path, out_dir = sys.argv[1], sys.argv[2]
 rows = [json.loads(line) for line in open(evidence_path) if line.strip()]
+
+# The previous round's bundle, read before this one overwrites it.
+#
+# A round is not judged only against the plan; it is also judged against the round before it. One
+# real feature went 9 of 12 acceptance commands, then a resume of the same plan went 3 of 14 by
+# corrupting the file it had nearly finished. Both bundles were correct and neither said the second
+# was worse — the reviewer had to hold the earlier number in their head to notice, and nearly did
+# not. A repair attempt that scores worse than the attempt it repairs is the clearest available
+# signal to stop resuming and take the work over, so it belongs in the header, not in the reader.
+previous = None
+try:
+    with open(f"{out_dir}/evidence.json") as fh:
+        prior = json.load(fh)
+    if prior.get("acceptance_total"):
+        previous = {"passed": prior["acceptance_passed"], "total": prior["acceptance_total"],
+                    "verdict": prior.get("verdict")}
+except (OSError, ValueError, KeyError):
+    previous = None
 
 # What may reject a round, and what may only report.
 #
@@ -400,18 +430,52 @@ skipped = [r for r in rows if r["status"] == "skipped"]
 passed = [r for r in rows if r["status"] == "pass"]
 
 verdict = "REJECT" if failed else "ACCEPT"
+
+# The plan's own criteria, scored separately from the gate count. This is the number a reviewer
+# actually compares between rounds — the gate count moves when a project gains a linter.
+acceptance = [r for r in rows if r["gate"].startswith("acceptance-")]
+acc_total = len(acceptance)
+acc_passed = len([r for r in acceptance if r["status"] == "pass"])
+
+regressed = False
+if previous and acc_total and previous["total"]:
+    regressed = (acc_passed / acc_total) < (previous["passed"] / previous["total"])
+
 json.dump({"verdict": verdict, "passed": len(passed), "failed": len(failed),
            "advisory_failed": len(advisory_failed),
-           "skipped": len(skipped), "gates": rows},
+           "skipped": len(skipped),
+           "acceptance_passed": acc_passed, "acceptance_total": acc_total,
+           "previous": previous, "regressed": regressed, "gates": rows},
           open(f"{out_dir}/evidence.json", "w"), indent=2)
+
+# One line per round, kept across rounds, so the trajectory survives the next overwrite.
+if acc_total:
+    with open(f"{out_dir}/history.jsonl", "a") as fh:
+        fh.write(json.dumps({"verdict": verdict, "acceptance_passed": acc_passed,
+                             "acceptance_total": acc_total, "regressed": regressed}) + "\n")
 
 headline = verdict
 if verdict == "ACCEPT" and advisory_failed:
     headline = "ACCEPT — with advisory findings"
+if regressed:
+    headline = f"{verdict} — REGRESSED"
 
 lines = [f"# Verification evidence — {headline}", "",
          f"{len(passed)} passed, {len(failed)} failed, "
-         f"{len(advisory_failed)} advisory, {len(skipped)} not run.", "",
+         f"{len(advisory_failed)} advisory, {len(skipped)} not run.", ""]
+
+if acc_total:
+    lines += [f"Acceptance criteria: **{acc_passed} of {acc_total}**"
+              + (f", against {previous['passed']} of {previous['total']} last round." if previous
+                 else "."), ""]
+if regressed:
+    lines += ["> **This round scored worse than the one before it.** A repair that loses ground is",
+              "> usually damaging the tree rather than fixing it — the commonest cause here is a",
+              "> partial edit that truncates a file the previous round had nearly finished.",
+              "> Stop resuming. Read the diff, keep whatever is genuinely complete, and write a",
+              "> narrow follow-up for the remaining delta, or take the round over by hand.", ""]
+
+lines += [
          "Produced by running commands against the working tree. The implementer's own report was",
          "not consulted and is not evidence.", "",
          "The verdict is the plan's acceptance commands plus scope. Advisory findings are reported",

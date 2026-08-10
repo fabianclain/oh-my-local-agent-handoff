@@ -7,11 +7,15 @@
 # Every suite here, and no GPU. Run it before trusting a change and before shipping one; each
 # suite's checks are failures that actually happened, not hypotheticals.
 #
+#   smoke-e2e            the whole journey — init, check, do, verify, diff — and the state it leaves
 #   harness-selftest     bench/run end to end, against a provider that runs no model
 #   verifier-selftest    verify-round and bin/handoff — the parts real use touches
 #   feedback-selftest    what a repair attempt is told
 #   patch-shape-selftest the order and hunk-count checks
 #   shim-selftest        the tool-call shim (needs no model either)
+#
+# smoke-e2e runs first and takes two seconds. It is the one to read when something is broken: the
+# others tell you a unit misbehaves, it tells you the pieces are no longer wired together.
 #
 # Then a consistency check the suites cannot make individually: that tools/check-plan still agrees
 # with bench/run about which plans are valid. Those two parse plans with expressions copied
@@ -23,11 +27,17 @@ REPO="$(cd "$HERE/.." && pwd)"
 cd "$REPO"
 FAILED=()
 
-for suite in harness-selftest verifier-selftest feedback-selftest patch-shape-selftest shim-selftest; do
+for suite in smoke-e2e harness-selftest verifier-selftest feedback-selftest patch-shape-selftest shim-selftest; do
     [[ -x "$HERE/$suite" ]] || { echo "SKIP  $suite (missing)"; continue; }
     printf '%-24s ' "$suite"
-    if out="$(timeout 900 "$HERE/$suite" 2>&1)"; then
+    out="$(timeout 900 "$HERE/$suite" 2>&1)"; rc=$?
+    # Exit 2 means a suite could not run at all — a missing interpreter, not a broken harness.
+    # Reporting that as a pass would convert "nothing was checked" into apparent evidence, which
+    # is the exact failure the verifier's `skipped` status exists to avoid.
+    if [[ "$rc" -eq 0 ]]; then
         echo "pass"
+    elif [[ "$rc" -eq 2 ]]; then
+        echo "SKIP  ($(tail -1 <<<"$out"))"
     else
         echo "FAIL"
         FAILED+=("$suite")
