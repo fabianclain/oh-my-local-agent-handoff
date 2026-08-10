@@ -35,7 +35,11 @@ cd "$REPO_ROOT"
 # Sourced BEFORE the paths below are resolved. An earlier version computed them first, so the
 # HANDOFF_PLANS_DIR override that templates/config.sh documents silently did nothing and the
 # driver reported "plan not found" for a plan that existed.
-PROJECT_RULES="(no project rules configured — create .handoff/config.sh)"
+# Addressed to the implementer, so it must not ask for anything. The previous wording — "create
+# .handoff/config.sh" — was written for a human reading the terminal, went into the model's prompt,
+# and got obeyed: the first clean-room run of the quickstart was rejected for an invented file the
+# harness had told it to invent. Setup instructions belong in the setup output, not in the task.
+PROJECT_RULES="(This project has no .handoff/config.sh, so no build, test or formatting conventions were supplied. Follow the conventions visible in the files you are editing. Do not create a config file.)"
 # shellcheck disable=SC1091
 [[ -f "$REPO_ROOT/.handoff/config.sh" ]] && source "$REPO_ROOT/.handoff/config.sh"
 
@@ -118,7 +122,12 @@ run_verification() {
     local slug="$1"
     local plan="$PLANS_DIR/${slug}.md"
     local out="$RUN_DIR/evidence"
-    local verifier="$REPO_ROOT/tools/verify-round"
+    # $HANDOFF_HOME, not $REPO_ROOT. The verifier ships with the harness; REPO_ROOT is the user's
+    # project, which has no reason to contain it. Getting this wrong made verification skip
+    # silently for every real user while the benchmark — which calls verify-round by absolute path
+    # — kept working, so nothing here noticed. Found by running the actual first-use journey in a
+    # scratch project rather than by testing the verifier directly.
+    local verifier="$HANDOFF_HOME/tools/verify-round"
 
     [[ -x "$verifier" ]] || {
         echo "==> no verifier at tools/verify-round — skipping (nothing checked this tree)" >&2
@@ -255,9 +264,23 @@ if [[ "$MODE" == "do" && "${HANDOFF_NO_VERIFY:-0}" != 1 ]]; then
     run_verification "$SLUG"
     VERDICT=$?
     set -e
-    # A provider that exited cleanly over a tree the gates reject is still a failed round, and the
-    # exit status has to say so or a script will commit it.
-    [[ "$STATUS" -ne 0 ]] || STATUS="$VERDICT"
+
+    # The gates decide, in both directions.
+    #
+    # A provider that exited cleanly over a tree the gates reject is a failed round. Less
+    # obviously, a provider that failed over a tree the gates ACCEPT is a successful one: the
+    # commonest provider failure by far is a missing or malformed completion report, which happens
+    # on roughly one run in three and says nothing about the patch. Letting that override the
+    # verdict would make `handoff do` exit non-zero on a third of its successes and teach anyone
+    # scripting it to throw away good work.
+    #
+    # This is the same rule as everywhere else here: judge the tree, and treat the report as
+    # untrusted metadata.
+    if [[ "$STATUS" -ne 0 && "$VERDICT" -eq 0 ]]; then
+        echo "==> NOTE: the provider exited $STATUS — most often a missing or malformed report —"
+        echo "==>       but the gates accept this tree. Judging the tree: accepted."
+    fi
+    STATUS="$VERDICT"
 fi
 
 exit "$STATUS"

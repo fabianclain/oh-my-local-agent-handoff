@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+#
+# setup-local-implementer — get from a fresh clone to a working local implementer.
+#
+#   tools/setup-local-implementer [--context 65536]
+#
+# Every step is idempotent, checks rather than assumes, and refuses rather than half-succeeding.
+# It ends by probing the stack with a real tool call, because in this project the difference
+# between "the server is up" and "the server emits usable tool calls" was months of misattributed
+# results: ollama serves gpt-oss happily and corrupts its tool calls, and nothing upstream notices.
+#
+# What it does NOT do is download 12 GB without asking. If the weights are missing it prints the
+# exact command and stops.
+
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$HERE/.." && pwd)"
+CONTEXT=65536
+MODEL="gpt-oss-20b"
+PORT="${LLAMACPP_PORT:-8071}"
+CACHE="${LLAMACPP_STATE:-$HOME/.cache/agent-handoff}"
+GGUF="${GPTOSS_GGUF:-$CACHE/models/gpt-oss-20b-MXFP4.gguf}"
+CLINE_CONFIG="${HANDOFF_CLINE_CONFIG:-$HOME/.cline-llamacpp}"
+LLAMA_SERVER="${LLAMA_SERVER:-$HOME/.local/opt/llamacpp/llama-b10331/llama-server}"
+
+while (( $# > 0 )); do
+    case "$1" in
+    --context) CONTEXT="${2:?--context needs a value}"; shift 2 ;;
+    --context=*) CONTEXT="${1#*=}"; shift ;;
+    -h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown argument: $1" >&2; exit 64 ;;
+    esac
+done
+
+step=0
+say()  { step=$((step+1)); echo; echo "==> $step. $*"; }
+ok()   { echo "    ok — $*"; }
+die()  { echo "    STOP — $*" >&2; exit 1; }
+
+echo "Setting up the local implementer: $MODEL via llama.cpp, driven by Cline."
+
+say "prerequisites"
+for bin in curl python3 git; do
+    command -v "$bin" >/dev/null || die "$bin is not on PATH"
+done
+command -v cline >/dev/null || die "cline is not on PATH. Install it with: npm i -g cline"
+[[ -x "$LLAMA_SERVER" ]] || die "no llama-server at $LLAMA_SERVER
+    Build or download llama.cpp, then either put it there or set LLAMA_SERVER.
+    A build with GPU support matters: CPU-only will work and will be unusably slow."
+ok "cline $(cline --version 2>/dev/null | head -1), llama-server present"
+
+say "model weights"
+if [[ -f "$GGUF" ]]; then
+    ok "$(du -h "$GGUF" | cut -f1) at $GGUF"
+else
+    echo "    missing: $GGUF"
+    echo
+    echo "    Download it — from Hugging Face, NOT from ollama's blob store. Ollama stores the"
+    echo "    chat template as a separate layer outside the GGUF, so its blobs are"
+    echo "    template-stripped and llama.cpp will either refuse them or serve a model that"
+    echo "    cannot emit tool calls. That cost a full investigation here."
+    echo
+    echo "      mkdir -p $(dirname "$GGUF")"
+    echo "      huggingface-cli download ggml-org/gpt-oss-20b-GGUF \\"
+    echo "        gpt-oss-20b-mxfp4.gguf --local-dir $(dirname "$GGUF")"
+    echo "      mv $(dirname "$GGUF")/gpt-oss-20b-mxfp4.gguf $GGUF"
+    echo
+    die "re-run this script once the weights are in place"
+fi
+
+say "serving it at ${CONTEXT} context"
+if "$HERE/llamacpp-serve" status 2>/dev/null | grep -q "$MODEL"; then
+    ok "already serving"
+else
+    "$HERE/llamacpp-serve" start "$MODEL" "$CONTEXT" || die "llama-server would not start"
+fi
+curl -fsS --max-time 10 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 ||
+    die "nothing answering on :$PORT"
+RESIDENT="$(curl -fsS --max-time 5 "http://127.0.0.1:$PORT/props" 2>/dev/null |
+    python3 -c 'import json,sys; print(json.load(sys.stdin).get("default_generation_settings",{}).get("n_ctx","?"))' 2>/dev/null)"
+ok "serving with n_ctx=$RESIDENT"
+
+say "pointing Cline at it"
+if [[ -f "$CLINE_CONFIG/data/settings/providers.json" ]]; then
+    ok "already configured at $CLINE_CONFIG"
+else
+    cline auth -p openai-compatible -m "$MODEL" \
+        -b "http://127.0.0.1:$PORT/v1" -k dummy --config "$CLINE_CONFIG" >/dev/null 2>&1 ||
+        die "could not configure cline. Try it by hand:
+      cline auth -p openai-compatible -m $MODEL \\
+        -b http://127.0.0.1:$PORT/v1 -k dummy --config $CLINE_CONFIG"
+    ok "configured at $CLINE_CONFIG"
+fi
+
+say "does the stack emit usable tool calls?"
+echo "    This is the check that matters. A server that answers /health can still corrupt every"
+echo "    tool call it returns, and a benchmark cannot tell that apart from a bad model."
+# Captured rather than piped. `cmd | tail` reports tail's exit status, so the pipeline form of
+# this check would have called a FAILED probe a success — announcing a working stack to someone
+# whose tool calls are being corrupted, which is the one thing this step exists to prevent. The
+# repository's own usage notes warn about this and it still got written twice.
+PROBE_OUT="$(mktemp)"
+# --port matters: without it the probe checks 8071 whatever LLAMACPP_PORT says, so a non-default
+# setup would certify a server it never contacted. It passed only because the default matched.
+python3 "$HERE/engine-conformance" --engine llamacpp --model "$MODEL" \
+    --port "$PORT" --repeat 1 >"$PROBE_OUT" 2>&1
+PROBE_STATUS=$?
+tail -4 "$PROBE_OUT"
+rm -f "$PROBE_OUT"
+if [[ "$PROBE_STATUS" -eq 0 ]]; then
+    ok "the tool-call path works"
+else
+    die "conformance failed or was inconclusive (exit $PROBE_STATUS) — read the output above.
+    Do not attribute anything to the model until this is clean."
+fi
+
+say "ready"
+cat <<EOF
+    In the repository you want to work on:
+
+      export PATH="$REPO/bin:\$PATH"
+      mkdir -p .handoff/plans
+      cp $REPO/templates/config.sh .handoff/config.sh    # edit: how your project builds and tests
+      printf '.handoff/runs/\\n.omc/\\n.claude/\\n' >> .gitignore
+
+    That .gitignore line is not optional. Plans assert "exactly N files changed", and any agent
+    framework writing state into your working directory breaks that check — the first end-to-end
+    run of this setup was rejected for three files belonging to the framework, not the model.
+
+    Then write a plan and run it:
+
+      cp $REPO/templates/plan.md .handoff/plans/my-task.md
+      HANDOFF_PROVIDER=local handoff do my-task
+
+    'handoff do' verifies when it finishes and fails if the gates reject the tree, so its exit
+    status is worth checking. Read docs/START-HERE.md before your first plan — the acceptance
+    criteria are what make the verification mean anything.
+EOF

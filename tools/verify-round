@@ -105,6 +105,20 @@ EXCLUDES=(
     ':(exclude).handoff/runs/**'
     ':(exclude).handoff/evidence/**'
     ':(exclude).handoff/plans/**'
+    # Harness territory, not the implementer's work. The driver reads it and the setup guide tells
+    # the user to write it; a plan has no reason to name it.
+    ':(exclude).handoff/config.sh'
+    # Not the implementer's work, and blaming it for these is a false rejection. The first
+    # end-to-end run of `handoff do` in a fresh project was rejected for three "invented" files
+    # that were the agent framework's own state directory. bench/run had excluded these for
+    # months; verify-round had not, and the two disagreeing is exactly the drift that keeps
+    # costing this project findings.
+    ':(exclude).omc/**'
+    ':(exclude).claude/**'
+    ':(exclude)node_modules/**'
+    ':(exclude)vendor/**'
+    ':(exclude)storage/logs/**'
+    ':(exclude)storage/framework/**'
 )
 [[ -z "$OUT_REL" ]] || EXCLUDES+=(":(exclude)$OUT_REL/**")
 

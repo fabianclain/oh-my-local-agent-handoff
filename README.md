@@ -10,6 +10,16 @@ failure modes it exists to catch.
 > with every result carrying the harness commit that produced it. Six provider adapters work.
 > Results and the reasoning behind them are in [bench/COMPARISON.md](bench/COMPARISON.md).
 
+## Using a local model for the implementation
+
+**[docs/START-HERE.md](docs/START-HERE.md)** — clone, one setup command, your first plan, and how
+to read the verdict. Pre-configured for the stack that measured best.
+
+```bash
+tools/setup-local-implementer            # probes the stack with a real tool call, then stops if it is wrong
+HANDOFF_PROVIDER=local handoff do <slug> # implements, verifies, and fails if the gates reject
+```
+
 ## Why
 
 Handing a task to a coding agent and reading the diff works until it doesn't. The failures that
