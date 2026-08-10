@@ -148,6 +148,42 @@ Four rules that decide whether this works:
 4. **Name the files, and say what happens if others change.** That is what makes the scope gate
    mean something.
 
+### Check the plan before you run it
+
+```bash
+tools/check-plan .handoff/plans/my-task.md
+```
+
+It applies the harness's own parsing — the expressions are copied from `bench/run` character for
+character — and tells you whether the plan would be refused, and whether its verdict would mean
+anything.
+
+**Expect existing plans to fail.** On the project this was extracted from, **48 of 48** plans
+written for human review were refused:
+
+| Reason | Plans |
+| --- | ---: |
+| Criteria and commands disagree in number | 38 |
+| No commands in a fenced block under `## Verification` | 10 |
+| No paths in the `## Files to touch` table | 6 |
+| No `- [ ]` criteria at all | 3 |
+
+That is not a defect in those plans. They were written for a workflow where a person reads the
+diff, and a person does not need one executable command per checklist line. Machine verification
+does, and there is no way to infer the missing half.
+
+So budget for rewriting plans, not converting them. The good news is that the rewrite is the part
+that carries the value: a plan whose criteria are each one command is also a plan you have thought
+through properly, which is why the largest measured improvement in this project came from output
+discipline and not from any model setting.
+
+`check-plan` also prints advisories, which do not block a run but decide whether its verdict is
+worth much:
+
+- **a command a do-nothing tree could pass** — `php -l` on an unmodified file succeeds, so a
+  criterion resting on it measures nothing
+- **nothing asserting how many files changed** — then the plan is not enforcing its own scope
+
 ## 5. Run it
 
 ```bash

@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+#
+# check-plan — will the harness accept this plan, and will its verdict mean anything?
+#
+#   tools/check-plan .handoff/plans/my-task.md
+#   tools/check-plan .claude/plans/*.md          # audit a whole directory
+#
+# Run this before `handoff do`, and before migrating a project's existing plans. A plan written for
+# a human reviewer usually fails: of 48 plans on the project this was extracted from, most had a
+# verification block and most had acceptance criteria, and almost none had them in the shape the
+# harness needs.
+#
+# ## Why the counts must match
+#
+# The score's denominator is the checklist and its numerator is the command list. A plan with six
+# criteria and two commands can never score above 2/6, so every model measured on it looks worse
+# than it is. That shipped once here, was read as a model scoring a third of the criteria, and had
+# in fact been passing everything the harness ever ran.
+#
+# ## Parsing
+#
+# Every expression below is copied from bench/run, deliberately and character for character. A
+# checker that parsed plans its own way would approve plans the harness rejects, which is worse
+# than no checker. If bench/run's parsing changes, change it here in the same commit —
+# tools/check-plan-selftest asserts the two agree on the repository's own plans.
+
+set -uo pipefail
+
+FAILED=0
+CHECKED=0
+
+# --- extractors, mirroring bench/run exactly -----------------------------------------------------
+
+criteria_count() { grep -cE '^- \[ \]' "$1" 2>/dev/null; true; }
+
+verification_commands() {
+    awk '
+        /^## Verification[[:space:]]*$/ { in_section=1; next }
+        in_section && /^```/ {
+            if (in_block) exit
+            in_block=1
+            next
+        }
+        in_block && NF { print }
+    ' "$1"
+}
+
+allowed_paths() {
+    awk '
+        /^## Files to touch[[:space:]]*$/ { in_section=1; next }
+        in_section && /^## / { exit }
+        in_section && /^\|/ {
+            split($0, cells, "|")
+            path=cells[2]
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", path)
+            gsub(/`/, "", path)
+            if (path != "Path" && path !~ /^-+$/ && path != "") print path
+        }
+    ' "$1"
+}
+
+# --- report --------------------------------------------------------------------------------------
+
+check_one() {
+    local plan="$1" problems=() notes=()
+    CHECKED=$((CHECKED + 1))
+
+    [[ -f "$plan" ]] || { echo "MISSING  $plan"; FAILED=$((FAILED + 1)); return; }
+
+    local criteria commands paths
+    criteria="$(criteria_count "$plan")"
+    commands="$(verification_commands "$plan" | grep -c .)"
+    paths="$(allowed_paths "$plan" | grep -c .)"
+
+    (( criteria > 0 )) || problems+=("no '- [ ]' checklist criteria")
+    (( commands > 0 )) || problems+=("no commands in a fenced block under '## Verification'")
+    (( paths > 0 ))    || problems+=("no paths in the '## Files to touch' table")
+    if (( criteria > 0 && commands > 0 && criteria != commands )); then
+        problems+=("$criteria criteria against $commands commands — the harness refuses this, and the best achievable score would be $commands/$criteria")
+    fi
+
+    # Advisory. These do not stop a run; they decide whether its verdict is worth anything.
+    if (( commands > 0 )); then
+        # A criterion a do-nothing tree satisfies is not measuring the model. `php -l` on an
+        # unmodified file passes trivially, which is why the empty-diff gate exists at all.
+        local trivial
+        trivial="$(verification_commands "$plan" | grep -cE '^[[:space:]]*(php -l|ls |cat |test -f|test -e)')"
+        (( trivial == 0 )) || notes+=("$trivial command(s) a do-nothing tree could also pass")
+        verification_commands "$plan" | grep -qE 'git (status|diff)' ||
+            notes+=("nothing asserts how many files changed — scope is unenforced by the plan")
+    fi
+    grep -qE '^## Out of scope' "$plan" || notes+=("no '## Out of scope' section")
+
+    if (( ${#problems[@]} > 0 )); then
+        FAILED=$((FAILED + 1))
+        printf 'REJECT   %s\n' "$plan"
+        printf '           - %s\n' "${problems[@]}"
+    else
+        printf 'ok       %s  (%s criteria, %s commands, %s file%s)\n' \
+            "$plan" "$criteria" "$commands" "$paths" "$( ((paths==1)) || echo s)"
+    fi
+    (( ${#notes[@]} == 0 )) || printf '           ~ %s\n' "${notes[@]}"
+}
+
+(( $# > 0 )) || { echo "usage: check-plan <plan.md> [plan.md ...]" >&2; exit 64; }
+for plan in "$@"; do check_one "$plan"; done
+
+echo
+if (( FAILED > 0 )); then
+    echo "$FAILED of $CHECKED plan(s) would be refused by the harness."
+    echo "Each criterion needs exactly one command, in the same order. See templates/plan.md."
+    exit 1
+fi
+echo "$CHECKED plan(s) would be accepted."
+echo "Acceptance is not quality: the verdict is only ever as good as the criteria."

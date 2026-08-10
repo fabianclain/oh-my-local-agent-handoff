@@ -169,6 +169,16 @@ The honest summary of the reasoning question: **no measurable difference, choose
 were the serving engine, one incompatible CLI flag that silently disabled every recovery attempt,
 and whether anything checked the tree afterwards. Spend the time on the plan and the gates.
 
+### Adopting this on a project that already has plans
+
+Run `tools/check-plan` over them first. Every plan on the project this was extracted from was
+refused — 48 of 48 — and the dominant reason was that criteria and commands disagreed in number.
+Plans written for a human reviewer do not carry one executable command per checklist line, because
+a human does not need one.
+
+Rewrite rather than convert. The missing half cannot be inferred, and writing it is the part that
+makes the verdict worth having.
+
 ## The loop
 
 1. Write `.handoff/plans/<slug>.md` from `templates/plan.md`. Fill in **States to handle** and
