@@ -107,6 +107,20 @@ EXCLUDES=(
     ':(exclude).handoff/plans/**'
 )
 [[ -z "$OUT_REL" ]] || EXCLUDES+=(":(exclude)$OUT_REL/**")
+
+# Also exclude any *other* verifier output already in the tree.
+#
+# The excludes above cover this run's out-dir and the two standard locations. A bundle left by an
+# earlier run at a different path is not covered, and the scope gate then reports it as a file the
+# model invented — a verifier failing a round because it had run before. The standard callers
+# (`handoff verify`, `bench/run`) write under .handoff/runs, so this only bites a custom out-dir,
+# which is exactly the case a person debugging by hand will hit.
+#
+# Detected by the marker file rather than by name, so it holds whatever the directory is called.
+while IFS= read -r marker; do
+    [[ -n "$marker" ]] || continue
+    EXCLUDES+=(":(exclude)$(dirname "${marker#./}")/**")
+done < <(cd "$WORKTREE" && find .handoff -name evidence.jsonl -maxdepth 4 2>/dev/null)
 {
     git diff --name-only "$BASE_COMMIT" -- . "${EXCLUDES[@]}"
     git ls-files --others --exclude-standard -- . "${EXCLUDES[@]}"
@@ -252,19 +266,54 @@ import json, sys
 evidence_path, out_dir = sys.argv[1], sys.argv[2]
 rows = [json.loads(line) for line in open(evidence_path) if line.strip()]
 
-failed = [r for r in rows if r["status"] == "fail"]
+# What may reject a round, and what may only report.
+#
+# The verdict comes from the plan's own acceptance commands, plus scope. Everything else is
+# advisory: it appears in the evidence, in full, and does not flip the verdict.
+#
+# That split is measured, not chosen. Across 68 preserved evidence bundles, the harness's own
+# opinions caught exactly one thing the plan's commands had not already caught, and it was scope.
+# `syntax` fired 3 times and `patch-only` twice, never once alone — the plans express both as
+# acceptance commands, so the harness was re-deciding what the plan had already decided.
+# `tree-changed` never fired at all.
+#
+# The reason to care is division of labour. A hosted model writes the plan and reviews the result;
+# it is the thing that should decide what "verified" means for a given change. A verifier that
+# accumulates its own opinions competes with that judgement, drifts from the scoring in bench/run,
+# and grows defects of its own — and in this project nearly every confident wrong conclusion came
+# from harness behaviour nobody had measured.
+#
+# Advisory findings are not demoted to noise. They are what a reviewer reads to decide whether an
+# accepted patch is one they actually want.
+def is_advisory(row):
+    gate = row["gate"]
+    return not (gate == "acceptance" or gate.startswith("acceptance-") or gate == "scope")
+
+for row in rows:
+    row["advisory"] = is_advisory(row)
+
+failed = [r for r in rows if r["status"] == "fail" and not r["advisory"]]
+advisory_failed = [r for r in rows if r["status"] == "fail" and r["advisory"]]
 skipped = [r for r in rows if r["status"] == "skipped"]
 passed = [r for r in rows if r["status"] == "pass"]
 
 verdict = "REJECT" if failed else "ACCEPT"
 json.dump({"verdict": verdict, "passed": len(passed), "failed": len(failed),
+           "advisory_failed": len(advisory_failed),
            "skipped": len(skipped), "gates": rows},
           open(f"{out_dir}/evidence.json", "w"), indent=2)
 
-lines = [f"# Verification evidence — {verdict}", "",
-         f"{len(passed)} passed, {len(failed)} failed, {len(skipped)} not run.", "",
+headline = verdict
+if verdict == "ACCEPT" and advisory_failed:
+    headline = "ACCEPT — with advisory findings"
+
+lines = [f"# Verification evidence — {headline}", "",
+         f"{len(passed)} passed, {len(failed)} failed, "
+         f"{len(advisory_failed)} advisory, {len(skipped)} not run.", "",
          "Produced by running commands against the working tree. The implementer's own report was",
-         "not consulted and is not evidence.", ""]
+         "not consulted and is not evidence.", "",
+         "The verdict is the plan's acceptance commands plus scope. Advisory findings are reported",
+         "in full and do not decide it — judging those is the reviewer's job, not the harness's.", ""]
 
 if failed:
     lines += ["## Failed", ""]
@@ -280,6 +329,17 @@ lines += ["## Passed", ""]
 for row in passed:
     proof = f" (`{row['output_sha256']}`)" if row.get("output_sha256") else ""
     lines.append(f"- {row['gate']} — {row['detail']}{proof}")
+
+if advisory_failed:
+    lines += ["", "## Advisory — reported, not part of the verdict", "",
+              "The plan's checks passed. These did not, and are worth a look before you take the",
+              "patch.", ""]
+    for row in advisory_failed:
+        lines.append(f"- **{row['gate']}** — {row['detail']}")
+        if row.get("command"):
+            lines.append(f"  - `{row['command']}`")
+        if row.get("output_excerpt"):
+            lines += ["  ```", *(f"  {l}" for l in row["output_excerpt"].splitlines()[:12]), "  ```"]
 
 if skipped:
     lines += ["", "## Not checked", "",

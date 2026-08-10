@@ -38,6 +38,10 @@ as general good advice.
   success.
 - Report the exact checks actually performed.
 - If any requested verification could not be performed, report it explicitly as unverified.
+- The plan already tells you how to verify. Run those commands. Do not write your own test file,
+  verification script or scratch harness — not in the repository, not in a temp directory.
+- If you need to check something the plan does not cover, run it inline as a one-off command.
+  Nothing you create for your own checking may survive the run.
 
 ## OUTPUT RULES
 
@@ -54,6 +58,7 @@ Stated for the maintainer, not for the model. The model sees only the rules abov
 
 | Rule | The failure it prevents |
 | --- | --- |
+| Never write your own verification scripts | Measured across the `wide` rounds: 13 invented files — `verify.sh`, `test_rate.php`, `testsuite.php`, `verify_plan.sh` and more. One run produced **seven** of them and never cleaned them up, failing its file-count criterion on all three attempts at 1404s and 68,082 generated tokens. It happens at every reasoning level, so it is not a side effect of thinking too much. "The files you write are deliverables, not scratchpads" was already in these rules and did not land; naming the specific behaviour is the fix. |
 | Never rewrite from scratch | A 421-line service came back as an 11-line fragment. The code was correct; its destination was not. It happened to be a parse error, so a syntax gate caught it — luck. A fragment carrying its own `class` declaration would have been valid PHP and would have deleted 410 working lines with nothing complaining. |
 | Read back after editing | A model patched correctly and deleted the declaration adjacent to its insertion point, on every run. Functional tests passed both times — PHP falls back to a dynamic property, so the class still worked and a suite would be green. |
 | Smallest possible diff | Scope creep is invisible in a passing test run and expensive in review, which is where the hosted-model tokens actually go. |

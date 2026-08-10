@@ -260,10 +260,17 @@ _opencode_prompt_validate() {
     raw="$(mktemp)"; err_file="$(mktemp)"
 
     # Attempt 1.
+    #
+    # The reply is written to the log AS IT ARRIVES, not copied there afterwards. The previous
+    # form — `>"$raw"` then `cat "$raw" >>"$log"` — loses everything when the bench timeout kills
+    # the process group, because the copy never runs. That is how a 30-minute round that wrote
+    # nothing came to preserve no provider log at all, leaving the one run that most needed
+    # diagnosing with no evidence but its own absence. The Cline adapter had the identical bug and
+    # this is the identical fix; the comment there already predicted it was still present here.
     ( cd "$root" && opencode run --format json --dangerously-skip-permissions \
-        "${model_args[@]}" "${resume_args[@]}" -- "$base_prompt" ) </dev/null >"$raw" 2>>"$log"
-    local status=$?
-    cat "$raw" >>"$log"
+        "${model_args[@]}" "${resume_args[@]}" -- "$base_prompt" ) </dev/null \
+        2>>"$log" | tee -a "$log" >"$raw"
+    local status=${PIPESTATUS[0]}
 
     if _opencode_check "$raw" "$schema" "$result" >"$err_file"; then
         rm -f "$raw" "$err_file"
@@ -278,9 +285,9 @@ _opencode_prompt_validate() {
     [[ -n "$retry_session" ]] && retry_args=(-s "$retry_session")
     local retry_prompt; retry_prompt="$(_opencode_retry_prompt "$dev" "$prompt" "$schema" "$(cat "$err_file")")"
     ( cd "$root" && opencode run --format json --dangerously-skip-permissions \
-        "${model_args[@]}" "${retry_args[@]}" -- "$retry_prompt" ) </dev/null >"$raw" 2>>"$log"
-    status=$?
-    cat "$raw" >>"$log"
+        "${model_args[@]}" "${retry_args[@]}" -- "$retry_prompt" ) </dev/null \
+        2>>"$log" | tee -a "$log" >"$raw"
+    status=${PIPESTATUS[0]}
 
     if _opencode_check "$raw" "$schema" "$result" >"$err_file"; then
         rm -f "$raw" "$err_file"

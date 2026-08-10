@@ -5,6 +5,10 @@
 #   handoff do <slug>       fresh run against <plans>/<slug>.md
 #   handoff resume <slug>   continue the same session using runs/<slug>/feedback.md
 #   handoff diff <slug>     exactly what the implementer changed during the run
+#   handoff verify <slug>   run the gates over the tree and print the verdict
+#
+# `do` verifies automatically when it finishes. HANDOFF_NO_VERIFY=1 suppresses that, for
+# callers running the same gates themselves.
 #
 # The implementer never commits. The reviewer owns the commit.
 #
@@ -17,7 +21,7 @@ MODE="${1:-}"
 SLUG="${2:-}"
 
 if [[ -z "$MODE" || -z "$SLUG" ]]; then
-    echo "usage: handoff {do|resume|diff} <slug>" >&2
+    echo "usage: handoff {do|resume|diff|verify} <slug>" >&2
     exit 64
 fi
 
@@ -99,6 +103,48 @@ if [[ -f "$AGENT_RULES_FILE" ]]; then
 $AGENT_RULES"
 fi
 
+# Run the harness's own verifier over the working tree and report its verdict.
+#
+# This is the step that makes a local implementer usable. The model's report is not evidence — in
+# this project runs have claimed `status: complete` over trees they never touched, and between a
+# quarter and two fifths of runs return no report at all while leaving a byte-perfect patch. So the
+# question "did this work?" has to be answered by running commands against the tree, not by reading
+# what the model said about it.
+#
+# It also decides what a hosted reviewer is worth paying for. A rejected round should never reach
+# one: the whole economic case for a local implementer collapses if every attempt costs hosted
+# tokens to triage.
+run_verification() {
+    local slug="$1"
+    local plan="$PLANS_DIR/${slug}.md"
+    local out="$RUN_DIR/evidence"
+    local verifier="$REPO_ROOT/tools/verify-round"
+
+    [[ -x "$verifier" ]] || {
+        echo "==> no verifier at tools/verify-round — skipping (nothing checked this tree)" >&2
+        return 0
+    }
+    [[ -f "$plan" ]] || { echo "plan not found: $plan" >&2; return 1; }
+
+    # The verdict is only about this run if the tree was clean when the run started. Otherwise it
+    # covers pre-existing changes too, which is a different claim, so say so rather than implying
+    # a cleanliness the evidence does not support.
+    if [[ -s "$RUN_DIR/tree-before" ]]; then
+        local head_tree; head_tree="$(git rev-parse HEAD^{tree} 2>/dev/null || true)"
+        if [[ -n "$head_tree" && "$(cat "$RUN_DIR/tree-before")" != "$head_tree" ]]; then
+            echo "==> NOTE: the tree was already modified before this run; the verdict below covers"
+            echo "==>       every uncommitted change, not only what this run did."
+        fi
+    fi
+
+    echo
+    echo "==> verifying against HEAD"
+    "$verifier" "$REPO_ROOT" "$plan" HEAD "$out"
+    local verdict=$?
+    echo "==> evidence: ${out#"$REPO_ROOT"/}/evidence.md"
+    return "$verdict"
+}
+
 case "$MODE" in
 diff)
     if [[ ! -f "$RUN_DIR/tree-before" || ! -f "$RUN_DIR/tree-after" ]]; then
@@ -138,8 +184,7 @@ When you are done, run the verification commands listed in the plan and report t
 
 ## Previous attempt
 
-You already attempted this task and the working tree still holds your changes. These acceptance
-checks FAILED when the harness ran them:
+You already attempted this task and the working tree still holds your changes.
 
 $(cat "$HANDOFF_FEEDBACK_FILE")
 
@@ -161,8 +206,13 @@ ${PROJECT_RULES}
 Leave all changes uncommitted."
     ;;
 
+verify)
+    run_verification "$SLUG"
+    exit $?
+    ;;
+
 *)
-    echo "unknown mode: $MODE (expected do|resume|diff)" >&2
+    echo "unknown mode: $MODE (expected do|resume|diff|verify)" >&2
     exit 64
     ;;
 esac
@@ -197,5 +247,17 @@ echo "==> handoff report: $RUN_DIR/result.json"
 echo "==> changed by this run:"
 git diff-tree -r --name-status \
     "$(cat "$RUN_DIR/tree-before")" "$(cat "$RUN_DIR/tree-after")" -- "${DIFF_EXCLUDES[@]}" || true
+
+# Verify by default. HANDOFF_NO_VERIFY=1 is for callers that run the same gates themselves —
+# bench/run does — so the work is not done twice inside a benchmark.
+if [[ "$MODE" == "do" && "${HANDOFF_NO_VERIFY:-0}" != 1 ]]; then
+    set +e
+    run_verification "$SLUG"
+    VERDICT=$?
+    set -e
+    # A provider that exited cleanly over a tree the gates reject is still a failed round, and the
+    # exit status has to say so or a script will commit it.
+    [[ "$STATUS" -ne 0 ]] || STATUS="$VERDICT"
+fi
 
 exit "$STATUS"
