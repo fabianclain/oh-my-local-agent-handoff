@@ -5,6 +5,7 @@
 #   handoff do <slug>       fresh run against <plans>/<slug>.md
 #   handoff resume <slug>   continue the same session using runs/<slug>/feedback.md
 #   handoff diff <slug>     exactly what the implementer changed during the run
+#   handoff init            wire this project up: plans dir, config, gitignore
 #   handoff check <slug>    will the harness accept this plan, before you run it
 #   handoff verify <slug>   run the gates over the tree and print the verdict
 #
@@ -21,8 +22,56 @@ set -euo pipefail
 MODE="${1:-}"
 SLUG="${2:-}"
 
+if [[ "$MODE" == "init" ]]; then
+    # Everything a project needs before its first run, and nothing else. Idempotent: safe to run
+    # on a project that is already set up, which is what makes it safe for a skill to call.
+    ROOT="$(git rev-parse --show-toplevel)"
+    HOME_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    cd "$ROOT"
+    PLANS="$ROOT/.handoff/plans"
+    # Respect an existing config's choice of plans directory rather than imposing a second one.
+    [[ ! -f "$ROOT/.handoff/config.sh" ]] || PLANS="$(
+        REPO_ROOT="$ROOT"; source "$ROOT/.handoff/config.sh" >/dev/null 2>&1
+        echo "${HANDOFF_PLANS_DIR:-$ROOT/.handoff/plans}"
+    )"
+    mkdir -p "$PLANS" && echo "plans:     ${PLANS#"$ROOT"/}"
+
+    if [[ -f "$ROOT/.handoff/config.sh" ]]; then
+        echo "config:    .handoff/config.sh (kept — edit it to describe how this project builds)"
+    else
+        mkdir -p "$ROOT/.handoff"
+        cp "$HOME_DIR/templates/config.sh" "$ROOT/.handoff/config.sh"
+        echo "config:    .handoff/config.sh (copied from the template — EDIT IT)"
+    fi
+
+    # Agent state in the working tree breaks any plan that asserts how many files changed, and
+    # that check is in most plans. A project's first run was rejected for exactly this.
+    added=(); skipped=()
+    for pattern in '.handoff/runs/' '.omc/' '.claude/'; do
+        grep -qxF "$pattern" "$ROOT/.gitignore" 2>/dev/null && continue
+        # Never ignore a path the project tracks, and never ignore the plans directory. A project
+        # can legitimately keep plans under .claude, and blanket-ignoring it there would quietly
+        # stop new plans from being added. This exact mistake was made against a real repository
+        # that tracks 48 plans under .claude/plans.
+        if [[ "$PLANS" == "$ROOT/${pattern%/}"* ]] ||
+           [[ -n "$(git -C "$ROOT" ls-files -- "${pattern%/}" 2>/dev/null | head -1)" ]]; then
+            skipped+=("${pattern%/}")
+            continue
+        fi
+        printf '%s\n' "$pattern" >> "$ROOT/.gitignore"; added+=("$pattern")
+    done
+    (( ${#added[@]} == 0 )) || echo "gitignore: added ${added[*]}"
+    (( ${#skipped[@]} == 0 )) || echo "gitignore: left ${skipped[*]} alone — tracked content lives there"
+    (( ${#added[@]} + ${#skipped[@]} )) || echo "gitignore: already covered"
+
+    echo
+    echo "Next: write a plan in ${PLANS#"$ROOT"/}, then"
+    echo "  handoff check <slug>   &&  HANDOFF_PROVIDER=local handoff do <slug>"
+    exit 0
+fi
+
 if [[ -z "$MODE" || -z "$SLUG" ]]; then
-    echo "usage: handoff {do|check|resume|diff|verify} <slug>" >&2
+    echo "usage: handoff {do|check|resume|diff|verify} <slug> | handoff init" >&2
     exit 64
 fi
 

@@ -61,11 +61,13 @@ the GGUF, so its blobs are template-stripped and will serve a model that cannot 
 ```bash
 cd ~/your-project
 export PATH="/path/to/oh-my-local-agent-handoff/bin:$PATH"
-
-mkdir -p .handoff/plans
-cp /path/to/oh-my-local-agent-handoff/templates/config.sh .handoff/config.sh
-printf '.handoff/runs/\n.omc/\n.claude/\n' >> .gitignore
+handoff init
 ```
+
+`handoff init` creates the plans directory, copies a config template if there is none, and adds the
+gitignore entries. It is idempotent, and it skips any path the project already tracks — a project
+can legitimately keep plans under `.claude`, and blanket-ignoring it there would quietly stop new
+plans being added.
 
 Edit `.handoff/config.sh` — it carries how your project builds, tests and formats into every
 prompt. Without it the implementer is guessing at your conventions.

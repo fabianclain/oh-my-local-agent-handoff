@@ -41,7 +41,20 @@ Ask about anything that would change the code, and stop asking once the answer w
 and zero cases matter most: "what happens with no rows?" has caught more defects here than any
 other question. Read the files you intend to name.
 
-### 2. Write the plan
+### 2. Make sure the project is wired up
+
+```bash
+handoff init
+```
+
+Idempotent, and safe on a project that is already set up. It creates the plans directory, copies a
+config template if there is none, and adds gitignore entries — skipping any path the project
+already tracks, because a project can legitimately keep plans under `.claude` and ignoring it there
+would quietly stop new plans being added.
+
+If `handoff` is not found, the agent-handoff checkout's `bin/` is not on PATH.
+
+### 3. Write the plan
 
 Plans live where `.handoff/config.sh` says (`HANDOFF_PLANS_DIR`), commonly `.handoff/plans/<slug>.md`
 or `.claude/plans/<slug>.md`. Copy the shape from `templates/plan.md` in the agent-handoff
@@ -59,7 +72,7 @@ Four rules. The first is enforced; the rest decide whether the verdict is worth 
 Write commands that a do-nothing tree would fail. `php -l` on an unmodified file passes and
 measures nothing; make the criterion assert behaviour instead.
 
-### 3. Check it before running
+### 4. Check it before running
 
 ```bash
 handoff check <slug>
@@ -68,7 +81,7 @@ handoff check <slug>
 Fix everything it rejects. Take its advisories seriously — they are the difference between a plan
 that runs and a plan whose verdict means something. Acceptance is not quality.
 
-### 4. Run it
+### 5. Run it
 
 ```bash
 HANDOFF_PROVIDER=local handoff do <slug>
@@ -77,7 +90,7 @@ HANDOFF_PROVIDER=local handoff do <slug>
 Five to twenty minutes. It implements, then verifies, and its **exit status is the harness's
 verdict** — 0 means the gates accepted the tree even if the model's report was missing.
 
-### 5. Report what actually happened
+### 6. Report what actually happened
 
 Read `.handoff/runs/<slug>/evidence/evidence.md` and `handoff diff <slug>`. Then tell the user:
 
@@ -92,7 +105,7 @@ say the patch is good and the report is missing.
 
 The implementer never commits. Leave that to the user.
 
-### 6. When the gates reject
+### 7. When the gates reject
 
 Read the failing command's output in the evidence bundle first. Usual causes, in order: the plan
 was ambiguous, an acceptance command was wrong, or the model got it wrong. Fix the plan and re-run
