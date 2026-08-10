@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+#
+# build-integrations — one procedure, two CLIs, no hand-porting.
+#
+#   tools/build-integrations           regenerate the per-CLI files
+#   tools/build-integrations --check   fail if they are out of date (run by tools/smoke-e2e)
+#   tools/build-integrations --install copy them to ~/.claude/skills and ~/.codex/prompts
+#
+# The driver procedure exists twice — as a Claude Code skill and as a Codex prompt — because the
+# two CLIs want different framing around the same content. The content itself must not diverge.
+# It was hand-ported three times in one session and drifted on the third; this repository has
+# already been bitten by exactly this shape once, when tools/check-plan and bench/run parsed plans
+# with copies of the same expressions.
+#
+#   integrations/procedure.md              /local-implement — writing the plan. Edit THIS.
+#   integrations/drive.md                  /local-drive     — running an existing plan. Edit THIS.
+#   integrations/headers/*.md              per-CLI frontmatter and framing
+#
+# GLM needs no third file: `glm` is Claude Code with z.ai's endpoint in the environment, so it
+# reads the same skill from ~/.claude/skills.
+
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$HERE/.." && pwd)"
+cd "$REPO"
+
+# header : body : target. Two procedures, two CLIs, four generated files.
+#
+# The seats are separate skills on purpose. `local-implement` is for the model that turns a request
+# into a specification; `local-drive` is for the model that gets an existing specification through
+# the gates. Merging them produces a driver that quietly re-plans whenever a round is rejected,
+# which is the failure this split exists to prevent — the planner's judgement is the thing being
+# checked, and an operator that rewrites it has removed the check.
+BUILDS=(
+    "integrations/headers/claude-skill.md:integrations/procedure.md:integrations/claude-skills/local-implement/SKILL.md"
+    "integrations/headers/codex-prompt.md:integrations/procedure.md:integrations/codex-prompts/local-implement.md"
+    "integrations/headers/claude-drive-skill.md:integrations/drive.md:integrations/claude-skills/local-drive/SKILL.md"
+    "integrations/headers/codex-drive-prompt.md:integrations/drive.md:integrations/codex-prompts/local-drive.md"
+)
+
+MODE="${1:-build}"
+STATUS=0
+
+for build in "${BUILDS[@]}"; do
+    IFS=':' read -r header body target <<<"$build"
+    [[ -f "$header" ]] || { echo "missing header: $header" >&2; exit 1; }
+    [[ -f "$body" ]] || { echo "missing body: $body" >&2; exit 1; }
+    generated="$(cat "$header" "$body")"
+
+    case "$MODE" in
+    --check)
+        if [[ "$generated" != "$(cat "$target" 2>/dev/null)" ]]; then
+            echo "OUT OF DATE: $target"
+            echo "  edit $body (or its header) and run tools/build-integrations"
+            diff <(printf '%s\n' "$generated") "$target" | head -6 | sed 's/^/    /'
+            STATUS=1
+        fi
+        ;;
+    build|--install)
+        mkdir -p "$(dirname "$target")"
+        printf '%s\n' "$generated" >"$target"
+        echo "wrote $target"
+        ;;
+    *)
+        echo "usage: build-integrations [--check|--install]" >&2
+        exit 64
+        ;;
+    esac
+done
+
+if [[ "$MODE" == "--install" ]]; then
+    mkdir -p "$HOME/.claude/skills" "$HOME/.codex/prompts"
+    cp -r integrations/claude-skills/local-implement "$HOME/.claude/skills/"
+    cp -r integrations/claude-skills/local-drive "$HOME/.claude/skills/"
+    cp integrations/codex-prompts/local-implement.md "$HOME/.codex/prompts/"
+    cp integrations/codex-prompts/local-drive.md "$HOME/.codex/prompts/"
+    echo
+    echo "installed for:"
+    echo "  claude  /local-implement  — write the plan   (glm too: it is claude with z.ai's endpoint)"
+    echo "  codex   /local-drive      — run the plan"
+    echo
+    echo "Both skills are installed for both CLIs. The split that matters is the seat, not the CLI:"
+    echo "whoever writes the plan must not be the one who decides a rejected round is fine."
+fi
+
+exit "$STATUS"

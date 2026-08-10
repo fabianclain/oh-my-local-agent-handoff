@@ -57,6 +57,12 @@ rendering tests.
 About one run in three produces a correct patch with no report at all. That is normal. Judge the
 tree.
 
+**On greenfield work, expect much worse.** One real feature — new service, new Livewire view,
+aggregate SQL — went **0 accepted in 7 rounds**, best round 9 of 12 criteria. The reviewer then
+wrote the same service by hand and it passed 8/8 first run. Reach for this on mechanical change to
+code that exists; on greenfield design, expect to write the hard part yourself and hand the model
+the mechanical remainder.
+
 ## The procedure
 
 ### 1. Understand the request before specifying it
@@ -130,6 +136,13 @@ edit them:
 
 The harness fails the round if a file listed there comes back modified.
 
+**When step N produces a structure step N+1 consumes, assert its complete shape in step N.** Not
+just the values the step's own criteria happen to read — every field, spelled as the later step
+will spell it. A service was accepted on aggregates that were all correct; three fields the view
+needed had been silently dropped and one renamed. Step 1 would have passed, and step 2 would then
+have failed on a guarantee step 1 was supposed to provide. One assertion listing the full key set
+costs a line and closes the gap.
+
 ### 5. Write the plan
 
 Plans go where `.handoff/config.sh` says. Shape from `templates/plan.md`.
@@ -143,7 +156,12 @@ Plans go where `.handoff/config.sh` says. Shape from `templates/plan.md`.
    several independent strings, a computed value, and the *absence* of placeholder markers.
 4. **Name every file**, and assert the count:
    `test "$(git status --porcelain -- . ':(exclude).handoff' | wc -l)" -eq N`
-5. **Anything you are tempted to repeat or bold needs a command instead.** Prose emphasis is not a
+5. **Any named API that must be used deserves a grep criterion.** "Use `deduplicatedQueries()`"
+   was prose; the model injected the dependency, never called it, and queried the table directly —
+   which against real data would have inflated every count, because that method exists precisely to
+   remove duplicate captures. `grep -q 'deduplicatedQueries' src/Foo.php` catches it in a second.
+   The same applies to any constraint prose has already failed at once, "no scratch files" included.
+6. **Anything you are tempted to repeat or bold needs a command instead.** Prose emphasis is not a
    control. A route-ordering constraint stated twice, in two sections, was still violated; what
    caught it was an acceptance command returning 404. If you find yourself writing "remember to",
    you have found a missing criterion.
@@ -183,6 +201,65 @@ the gates accept and the report is missing, say the patch is good and the report
 
 The implementer never commits.
 
+### 8b. Check whether the round happened at all before diagnosing it
+
+```bash
+handoff log <slug>          # outcome, criteria score, writes, adapter errors — one line per round
+```
+
+If the **writes** column is 0, the model never attempted the task: an adapter fault or a context
+overflow ate the round. Re-run the same plan once; do not re-specify it. Backfilling three real
+runs found a context overflow in all three, which had been read as the model failing.
+
+`handoff stats` aggregates this across every run in the project, and `handoff retro <slug>` asks
+the model — read-only, after it has been shown the verdict — what it would change about the plan.
+Treat its answers as leads to check, not findings.
+
+### 8a. Or hand the running to an operator
+
+You are the expensive model, and the expensive part of your job is the specification, not watching
+rounds go by. Once the plans are written and `handoff check` accepts them, another agent can run
+them:
+
+```bash
+codex          # then: /local-drive feature-1-service feature-2-view
+```
+
+`/local-drive` is the operator half of this pair. It checks the machine, runs each plan, reads the
+verdicts, repairs once, escalates narrowly, commits accepted steps, and comes back with a report.
+It is told in its own words that it may narrow a plan but may not redesign one, and that a plan
+which is *wrong* rather than unclear is a finding to bring back to you rather than something to fix.
+
+Before you hand over, make sure the plans can stand without you in the room:
+
+- Every step's criteria are counted and commanded — `handoff check` on each one.
+- The order is explicit, and each step says what it assumes about the ones before it.
+- Reviewer-written tests exist and are listed under `## Files to read, not modify`.
+- Anything you would have said out loud is in the plan. The operator will not know it otherwise.
+
+Then say plainly what you want back: which steps, in what order, what to commit, and what to bring
+to you rather than solve. The report you get is the input to your next round of planning.
+
+### 8c. Or let the ladder do the retrying
+
+```bash
+handoff auto <slug>            # local ×2 → a hosted planner re-specifies → local ×2 → stop
+```
+
+`handoff auto` runs the loop below without you: the local model implements, repairs once against
+the exact failing commands, and if it is still rejected a hosted planner (`codex` and `glm`,
+alternating) writes a new, narrower plan and the local model tries that. It stops the moment the
+gates accept, and hands back `.handoff/runs/<slug>/ladder.md` when they do not.
+
+Use it for a step you have already specified well and expect to need a retry or two. Do the
+diagnosis yourself — step 9 — when the failure looks like it is about the *task* rather than the
+plan, because that is the judgement the ladder cannot make. Two rounds failing the same way is that
+signal.
+
+The ladder will not let the planner be the implementer, will not run a plan `check-plan` refuses,
+stops as soon as a round scores worse than the round before it, and stops if a planner edits
+anything except its own plan file.
+
 ### 9. When the gates reject — diagnose, then re-specify narrowly
 
 **Never re-run the same plan.** The harness already retried it internally up to three times, handing
@@ -208,6 +285,13 @@ judgement. Keep it on your side.
 | The command tests something the plan never asked for | Your acceptance command is wrong | Fix the command, not the code |
 | The code is a stub that satisfies weaker criteria | The criteria were too coarse | Sharpen the assertions — the commonest case in view work |
 | The code attempts the right thing and gets it wrong | A genuine model error | Narrow the step until the mistake has nowhere to hide |
+| Empty diff, no writes attempted, often a report claiming success | Infrastructure failed; the plan was never exercised | **Re-run the same plan once**, then fix the adapter. Do not re-specify |
+
+That last row is the exception to "never re-run the same plan", and it matters because the default
+is exactly wrong when the plan was never asked. Recognise it by the tool calls, not the report: one
+round made 44 calls, every one a read or a search, not a single write, finished in 35 seconds on
+1336 output tokens, and reported `"status": "partial"`. Check `.handoff/runs/<slug>/stdout.log` for
+tool-call format errors before concluding anything about the plan.
 
 **Re-specify, do not re-ask.** Write a *new, smaller* plan covering only what failed — often a
 single criterion. If step 3 of 5 failed one of its four criteria, the retry is a one-criterion step,
@@ -225,6 +309,10 @@ and every plan asserts how many files changed:
   sharpened plan from a clean base. Usually correct.
 - **Keep and follow up** only when the attempt was right as far as it went. The follow-up must then
   describe the *remaining* delta, and its file-count criterion must match what will actually change.
+  This earns its keep: one round produced a complete, correct 162-line template whose PHP component
+  block was malformed, and reverting would have thrown all of it away. When you keep work, protect
+  it with a command rather than an instruction — "do not regenerate the template" is prose, while a
+  criterion counting the bars it must still contain is enforcement.
 
 **After two failures on the same step, split the step rather than attempting a third.** Two rounds
 failing the same way is evidence about the task's shape, not about the model. This is where a
@@ -237,4 +325,6 @@ other plausible improvements to the retry path already were.
 ## Setup
 
 `tools/setup-local-implementer` from the agent-handoff checkout. `llama-server` does not survive a
-reboot: `tools/llamacpp-serve start gpt-oss-20b 65536`. Full guide: `docs/START-HERE.md`.
+reboot: `tools/llamacpp-serve start gpt-oss-20b 32768`. Use 32768 on any machine whose GPU also
+drives a desktop — 64k needs ~15 GB *free*, and llama.cpp spills to host RAM rather than refusing,
+which ends in swap thrashing and an OOM kill. Full guide: `docs/START-HERE.md`.
