@@ -940,3 +940,59 @@ deterministic sampling helps, and some suggestion it hurts.
 **The default is restored to llama.cpp's own**, since every established result was measured there
 and nothing here argues for moving.
 
+### Round 10 — the report as a tool call
+
+`wide`, `lcgptossltool`, 12 runs. The completion report arrives as arguments to an MCP tool whose
+`inputSchema` is the report schema, rather than as the model's final assistant message.
+
+| | control (message) | tool call |
+| --- | ---: | ---: |
+| **No final report** | 4/15 (27%) | **1/12 (8%)** |
+| **Turns ending with no text block** | **33%** | **17%** |
+| Accepted — tree *and* report | 10/15 (67%) | **9/12 (75%)** |
+| Usable tree | 14/15 | 10/12 |
+| Seconds, median | 253 | 293 (1.16x, p = 0.70) |
+
+**The mechanism moved in the predicted direction and roughly halved.** That is the first prediction
+in this project to be confirmed rather than overturned, and it is still only p = 0.34 — this data
+cannot distinguish it from chance.
+
+**Where it did not help.** Two runs were damaged, both by littering unrelated to the report
+channel, so `usable tree` went slightly the wrong way. And one run produced no report *despite* the
+tool being available, so the channel does not eliminate the failure class; it reduces it.
+
+**A cost it may carry.** The reports are thinner. One accepted run reported `files_changed: []` on a
+six-file change — structurally valid, substantively empty. Delivery improved; substance may have
+degraded. That is a different measurement and nobody has taken it.
+
+**A confound to fix, not explain away.** The control ran under harness `cf66901` and this arm under
+`5ff3ad6`. Round 11 re-runs the control under the current harness so the comparison is clean.
+
+### The scoreboard, everything measured on `wide`
+
+Every arm served by llama.cpp, so all of it is valid. Ranked by usable-tree rate.
+
+| Configuration | n | Usable | Accepted | No report | Damaged | Median s | **s / usable patch** |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| reasoning **off** | 15 | 14/15 | 8 | 6 | 1 | 314 | 433 |
+| **the default** — message, low, 64k, temp 0.8 | 15 | 14/15 | 10 | 4 | 1 | 253 | **344** |
+| report via MCP **tool** | 12 | 10/12 | **9** | **1** | 2 | 293 | 551 |
+| retry given tree facts | 15 | 11/15 | 8 | 3 | 4 | 471 | 757 |
+| feedback = full | 12 | 8/12 | 5 | 3 | 4 | 248 | 439 |
+| deterministic sampling | 12 | 8/12 | 6 | 2 | 4 | 299 | 526 |
+
+**The default wins, and that is the finding.** It is cheapest per usable patch by a clear margin,
+and tied for the best usable-tree rate. Every deliberate improvement below it — richer feedback,
+a better-informed retry, deterministic sampling — ranks *worse* than the thing it was meant to
+improve, and three of the four were built on reasoning that seemed sound at the time.
+
+**The one exception worth pursuing** is the tool channel, and only on a specific axis: it has the
+highest *accepted* rate of any arm (75%) and a quarter of the control's missing-report rate,
+because it targets a failure that was diagnosed rather than guessed at. It costs more per usable
+patch today, but two of its three non-accepted runs were littering, which the channel has nothing
+to do with.
+
+**None of these differences is statistically significant.** Every pairwise comparison returns
+`chance` at these sample sizes. The scoreboard is a ranking of point estimates, and the overnight
+queue exists to give the top two enough repetitions to separate — or to establish that they do not.
+
