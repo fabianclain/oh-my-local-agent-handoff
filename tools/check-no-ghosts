@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+#
+# check-no-ghosts — refuse to start a round while an agent CLI from a previous one is still alive.
+#
+#   tools/check-no-ghosts [--kill] [pattern]
+#
+# An agent process whose working directory has been deleted is a leftover from a finished run. It
+# still holds a model loaded, still issues requests, and nothing attributes them to anything. This
+# has cost this project twice already: an orphaned Cline outliving a timeout competed with the next
+# repetition for the same GPU model, and the following runs produced empty diffs and unparseable
+# reports that read as a model collapsing. An opencode process outliving its parent separately held
+# the bench lock for a full 600-second wait.
+#
+# It is worse now than it was then. Token accounting reads llama-server's log by byte offset and
+# attributes everything in the region to the run that was open, so a ghost's generation is charged
+# to whichever benchmark happens to be running — silently, and in the one number the project exists
+# to measure.
+#
+# A deleted working directory is the signal because it is unambiguous: bench/run removes each
+# worktree when its repetition ends, so a live process still sitting in one cannot belong to any
+# round that is still going.
+#
+# Set BENCH_ALLOW_GHOSTS=1 to proceed anyway, for the case where the process is known to be idle
+# and killing it is inconvenient. It is deliberately an environment variable and not a flag, so it
+# has to be a decision rather than a habit.
+
+#
+# --kill sweeps them instead of refusing, which is what bench/run does. Refusing turned out to be
+# the wrong default for the harness itself: Cline starts a hub daemon per working directory and it
+# outlives the run, so the first round leaves a ghost and every round after it would be blocked by
+# the previous one's litter. A sweep is the fix; the refusal is for a human at a prompt.
+
+set -uo pipefail
+
+KILL=0
+if [[ "${1:-}" == --kill ]]; then
+    KILL=1
+    shift
+fi
+
+PATTERN="${1:-cline|opencode|codex}"
+FOUND=0
+GHOST_PIDS=()
+KILLED=0
+
+for status in /proc/[0-9]*/status; do
+    pid="${status%/status}"
+    pid="${pid#/proc/}"
+
+    # Own process tree excluded: this script's shell matches any pattern naming its own arguments.
+    [[ "$pid" != "$$" && "$pid" != "$PPID" ]] || continue
+
+    # Braced so the redirection failure is silenced too: a process that exits between the glob and
+    # this read is normal, and bash reports the missing path itself, not tr.
+    cmdline="$( { tr '\0' ' ' <"/proc/$pid/cmdline"; } 2>/dev/null )" || continue
+    [[ -n "$cmdline" ]] || continue
+    grep -qE "$PATTERN" <<<"$cmdline" || continue
+
+    # readlink on a deleted directory reports the old path with a " (deleted)" suffix. Testing the
+    # suffix rather than the path's existence also catches a directory replaced by a new one at the
+    # same path, which is exactly what happens when repetition N+1 reuses a worktree name.
+    cwd="$(readlink "/proc/$pid/cwd" 2>/dev/null)" || continue
+    [[ "$cwd" == *" (deleted)" ]] || continue
+
+    if [[ "$FOUND" -eq 0 ]]; then
+        if [[ "$KILL" -eq 1 ]]; then
+            echo "sweeping agent processes left in deleted working directories:" >&2
+        else
+            echo "agent processes are still running in deleted working directories:" >&2
+        fi
+    fi
+    FOUND=$(( FOUND + 1 ))
+    printf '  pid %s  cwd %s\n    %s\n' "$pid" "$cwd" "${cmdline:0:160}" >&2
+
+    if [[ "$KILL" -eq 1 ]]; then
+        kill -TERM "$pid" 2>/dev/null
+        GHOST_PIDS+=("$pid")
+    fi
+done
+
+if [[ "$FOUND" -gt 0 && "$KILL" -eq 1 ]]; then
+    # TERM, then confirm. A ghost that ignores TERM gets KILL — leaving one alive would defeat the
+    # sweep silently, and the whole point is that nothing generates outside a round's accounting.
+    sleep 2
+    for pid in "${GHOST_PIDS[@]}"; do
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "  pid $pid ignored TERM; sending KILL" >&2
+            kill -KILL "$pid" 2>/dev/null
+            KILLED=$(( KILLED + 1 ))
+        fi
+    done
+    sleep 1
+    SURVIVORS=0
+    for pid in "${GHOST_PIDS[@]}"; do
+        kill -0 "$pid" 2>/dev/null && SURVIVORS=$(( SURVIVORS + 1 ))
+    done
+    if [[ "$SURVIVORS" -gt 0 ]]; then
+        echo "$SURVIVORS ghost(s) survived KILL; refusing rather than measuring alongside them" >&2
+        exit 1
+    fi
+    echo "swept $FOUND ghost process(es)" >&2
+    exit 0
+fi
+
+if [[ "$FOUND" -gt 0 ]]; then
+    if [[ "${BENCH_ALLOW_GHOSTS:-0}" == 1 ]]; then
+        echo "BENCH_ALLOW_GHOSTS=1 — continuing, and any tokens they generate will be" >&2
+        echo "attributed to this round." >&2
+        exit 0
+    fi
+    echo >&2
+    echo "Kill them before benchmarking, or set BENCH_ALLOW_GHOSTS=1 to accept the contamination." >&2
+    exit 1
+fi

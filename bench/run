@@ -96,12 +96,38 @@ BENCH_TIMEOUT_SECONDS="${BENCH_TIMEOUT_SECONDS:-3600}"
 BENCH_VERIFY_TIMEOUT_SECONDS="${BENCH_VERIFY_TIMEOUT_SECONDS:-120}"
 # Attempts per repetition, including the first. 3 means one run plus two repairs.
 BENCH_MAX_ATTEMPTS="${BENCH_MAX_ATTEMPTS:-3}"
+# How much a repair attempt is told about the attempt before it.
+#
+#   commands  the failing command lines, and nothing else. The measured baseline.
+#   full      also the harness's captured output for each failing command, and the diff of what
+#             the previous attempts actually changed.
+#
+# This is a variable rather than a change in behaviour because richer feedback is a hypothesis,
+# not an improvement. It may as easily distract: reasoning at `medium` already made a model write
+# its own verification scripts instead of running the plan's, and a longer failure narrative
+# pushes in that same direction. The two settings exist so the question can be measured on
+# attempts-to-green rather than argued.
+BENCH_FEEDBACK_DETAIL="${BENCH_FEEDBACK_DETAIL:-commands}"
+BENCH_FEEDBACK_OUTPUT_LINES="${BENCH_FEEDBACK_OUTPUT_LINES:-12}"
+BENCH_FEEDBACK_DIFF_BYTES="${BENCH_FEEDBACK_DIFF_BYTES:-24000}"
 [[ "$BENCH_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || {
     echo "BENCH_TIMEOUT_SECONDS must be a positive integer" >&2
     exit 64
 }
 [[ "$BENCH_VERIFY_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || {
     echo "BENCH_VERIFY_TIMEOUT_SECONDS must be a positive integer" >&2
+    exit 64
+}
+[[ "$BENCH_FEEDBACK_DETAIL" == commands || "$BENCH_FEEDBACK_DETAIL" == full ]] || {
+    echo "BENCH_FEEDBACK_DETAIL must be 'commands' or 'full'" >&2
+    exit 64
+}
+[[ "$BENCH_FEEDBACK_OUTPUT_LINES" =~ ^[0-9]+$ ]] || {
+    echo "BENCH_FEEDBACK_OUTPUT_LINES must be a non-negative integer" >&2
+    exit 64
+}
+[[ "$BENCH_FEEDBACK_DIFF_BYTES" =~ ^[1-9][0-9]*$ ]] || {
+    echo "BENCH_FEEDBACK_DIFF_BYTES must be a positive integer" >&2
     exit 64
 }
 [[ "$BENCH_MAX_ATTEMPTS" =~ ^[1-9][0-9]*$ ]] || {
@@ -116,7 +142,44 @@ RESULTS_DIR="$BENCH_HOME/results/$PLAN"
 WORK_DIR="$BENCH_HOME/.work"
 BASE_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 
+# Which harness produced this result.
+#
+# Benchmarks run from a clone, and the clone drifted from the working checkout without anything
+# noticing. A fix for Cline's retry path — `--id` is incompatible with `--json` plus a prompt
+# argument, so every prompt-validate retry died instantly on an empty prompt — was written, tested
+# and left in the working repository while 25 of 61 recorded runs went on exercising the broken
+# path. Sixteen of those produced a byte-correct tree and were scored down because the recovery
+# that should have salvaged the report never ran.
+#
+# Nothing in a result said which harness it came from, so the drift was invisible for as long as
+# nobody diffed two checkouts by hand. Now every metrics file carries it.
+HARNESS_COMMIT="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+if [[ -n "$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null)" ]]; then
+    HARNESS_DIRTY=1
+else
+    HARNESS_DIRTY=0
+fi
+
 [[ -f "$PLAN_FILE" ]] || { echo "plan not found: bench/plans/$PLAN.md" >&2; exit 1; }
+
+# Checked once here rather than discovered mid-round. A missing renderer would abort under `set -e`
+# somewhere inside the repair loop, after hours of runs, and the partial matrix left behind would
+# look like a model that stopped responding.
+FEEDBACK_RENDERER="$REPO_ROOT/tools/render-feedback"
+[[ -x "$FEEDBACK_RENDERER" ]] || {
+    echo "feedback renderer missing or not executable: tools/render-feedback" >&2
+    exit 1
+}
+
+# An agent process left over from an earlier round still holds the model and still generates, and
+# nothing attributes what it generates to anything. Twice here that has read as a model collapsing.
+# It is worse now that tokens are counted by log region: a ghost's output is charged to whichever
+# round is open. Checked at startup, when it can still be fixed cheaply.
+GHOST_SWEEP="$REPO_ROOT/tools/check-no-ghosts"
+[[ -x "$GHOST_SWEEP" ]] || GHOST_SWEEP=""
+if [[ -n "$GHOST_SWEEP" ]]; then
+    "$GHOST_SWEEP" --kill || exit 1
+fi
 
 # An incomplete old directory is still evidence from an earlier attempt. Refusing existing paths
 # prevents a rerun from quietly mixing new artifacts with a partial prior matrix.
@@ -329,6 +392,15 @@ write_metrics() {
     printf '%s\n' \
         "status=$status" \
         "outcome=$outcome" \
+        "harness_commit=$HARNESS_COMMIT" \
+        "harness_dirty=$HARNESS_DIRTY" \
+        "feedback_detail=$PROVIDER_FEEDBACK_DETAIL" \
+        "prompt_tokens=$PROMPT_TOKENS" \
+        "generated_tokens=$GENERATED_TOKENS" \
+        "model_requests=$MODEL_REQUESTS" \
+        "usage_unattributable=$USAGE_UNATTRIBUTABLE" \
+        "truncated_requests=$TRUNCATED_REQUESTS" \
+        "context_overflows=$CONTEXT_OVERFLOWS" \
         "criteria_total=$CRITERIA_TOTAL" \
         "criteria_met=$criteria_met" \
         "scope_violations=$scope" \
@@ -418,6 +490,20 @@ for provider in "${PROVIDER_LIST[@]}"; do
         RESULT_DIR="$RESULTS_DIR/$provider/$repetition"
         mkdir -p "$RESULT_DIR"
 
+        # Initialised here rather than beside the attempt loop, because the preflight and
+        # missing-adapter paths below write metrics without ever entering it.
+        PROMPT_TOKENS=0
+        GENERATED_TOKENS=0
+        MODEL_REQUESTS=0
+        USAGE_UNATTRIBUTABLE=0
+        # A run whose conversation was truncated against the context window is a configuration
+        # result, not a model result. One run of round 6 was truncated at 65535 tokens and scored
+        # as though it had its whole history; nothing in the harness noticed, and it was found by
+        # reading the serving log by hand.
+        TRUNCATED_REQUESTS=0
+        CONTEXT_OVERFLOWS=0
+        PROVIDER_FEEDBACK_DETAIL="$BENCH_FEEDBACK_DETAIL"
+
         ACTIVE_WORKTREE="$WORK_DIR/$PLAN-$provider-$repetition"
         [[ ! -e "$ACTIVE_WORKTREE" ]] || {
             echo "worktree path already exists: ${ACTIVE_WORKTREE#"$REPO_ROOT"/}" >&2
@@ -453,6 +539,26 @@ for provider in "${PROVIDER_LIST[@]}"; do
             remove_active_worktree "$RESULT_DIR" "$PLAN/$provider/$repetition"
             continue
         fi
+
+        # An adapter may pin its own feedback level, and that pin wins over the environment.
+        #
+        # Without this, a provider named for a condition can quietly run under a different one: the
+        # A/B arm `lcgptosslfull` would produce `commands` results the moment someone forgot the
+        # env var, and the results path would still say `full`. A label that can disagree with the
+        # behaviour it names is worse than no label, because it is believed.
+        PROVIDER_FEEDBACK_DETAIL="$BENCH_FEEDBACK_DETAIL"
+        FEEDBACK_OVERRIDE="$(
+            source "$PROVIDER_FILE"
+            declare -F provider_feedback_detail >/dev/null && provider_feedback_detail
+        )" || FEEDBACK_OVERRIDE=""
+        case "$FEEDBACK_OVERRIDE" in
+        commands | full) PROVIDER_FEEDBACK_DETAIL="$FEEDBACK_OVERRIDE" ;;
+        "") ;;
+        *)
+            echo "provider $provider requested an unknown feedback level: $FEEDBACK_OVERRIDE" >&2
+            exit 64
+            ;;
+        esac
 
         # Record the serving stack alongside the result. Optional: adapters that do not define
         # provider_manifest simply produce no file, so this cannot break an existing provider.
@@ -494,8 +600,19 @@ for provider in "${PROVIDER_LIST[@]}"; do
         rm -f "$FEEDBACK_FILE"
         ATTEMPTS=0
         FIRST_TREE_BEFORE=""
+        # Token accounting is summed over every attempt, from the counters zeroed above. A run that
+        # needed three attempts cost three attempts' worth of generation, and cost to an accepted
+        # patch is the number this project exists to optimise.
         while : ; do
         ATTEMPTS=$(( ATTEMPTS + 1 ))
+
+        USAGE_MARK="$(
+            source "$PROVIDER_FILE"
+            declare -F provider_usage_mark >/dev/null && provider_usage_mark
+        )" || USAGE_MARK=""
+        # Sourcing an adapter pulls in its whole chain, and anything on that chain printing to
+        # stdout would end up here. A mark that is not a plain number is not a mark.
+        [[ "$USAGE_MARK" =~ ^[0-9]+$ ]] || USAGE_MARK=""
 
         # Run the driver in its own process group and kill the GROUP on timeout.
         #
@@ -521,7 +638,7 @@ for provider in "${PROVIDER_LIST[@]}"; do
         setsid --wait bash -c '
             echo $$ >"$5"
             cd "$1" || exit 1
-            HANDOFF_PROVIDER="$2" HANDOFF_FEEDBACK_FILE="$6" \
+            HANDOFF_PROVIDER="$2" HANDOFF_FEEDBACK_FILE="$6" HANDOFF_NO_VERIFY=1 \
                 timeout -k 15 "$3" ./bin/handoff do "$4"
         ' _ "$ACTIVE_WORKTREE" "$provider" "$BENCH_TIMEOUT_SECONDS" "$PLAN" "$PGID_FILE" \
             "$FEEDBACK_FILE" >>"$RESULT_DIR/driver.log" 2>&1
@@ -538,6 +655,32 @@ for provider in "${PROVIDER_LIST[@]}"; do
         fi
         rm -f "$PGID_FILE"
         set -e
+
+        # An adapter with no usage hooks must not leave `prompt_tokens=0` looking like a
+        # measurement. Zero tokens and no accounting are different claims.
+        if [[ -z "$USAGE_MARK" ]]; then
+            USAGE_UNATTRIBUTABLE=1
+        else
+            ATTEMPT_USAGE="$(
+                source "$PROVIDER_FILE"
+                declare -F provider_usage_since >/dev/null && provider_usage_since "$USAGE_MARK"
+            )" || ATTEMPT_USAGE=""
+            # Always yields a number: an empty substitution inside $(( )) is a syntax error, and
+            # an adapter that reports nothing must not abort the round.
+            usage_field() {
+                awk -F= -v k="$1" '$1 == k { print $2 + 0; found = 1 } END { if (!found) print 0 }' \
+                    <<<"$ATTEMPT_USAGE"
+            }
+            if [[ "$(usage_field usage_tokens_unattributable)" == 1 ]]; then
+                USAGE_UNATTRIBUTABLE=1
+            else
+                PROMPT_TOKENS=$(( PROMPT_TOKENS + $(usage_field prompt_tokens) ))
+                GENERATED_TOKENS=$(( GENERATED_TOKENS + $(usage_field generated_tokens) ))
+                MODEL_REQUESTS=$(( MODEL_REQUESTS + $(usage_field model_requests) ))
+                TRUNCATED_REQUESTS=$(( TRUNCATED_REQUESTS + $(usage_field truncated_requests) ))
+                CONTEXT_OVERFLOWS=$(( CONTEXT_OVERFLOWS + $(usage_field context_overflows) ))
+            fi
+        fi
 
         FINISHED_AT="$(date +%s)"
         ELAPSED=$(( FINISHED_AT - STARTED_AT ))
@@ -631,15 +774,23 @@ for provider in "${PROVIDER_LIST[@]}"; do
             break
         fi
 
-        {
-            awk '
-                /^command [0-9]+: / { cmd = $0 }
-                /^exit_code: / {
-                    if ($2 != 0) { sub(/^command [0-9]+: /, "", cmd); print "- FAILED: `" cmd "`" }
-                }
-            ' "$RESULT_DIR/verification.log"
-            [[ "$DID_NOTHING" -eq 0 ]] || echo "- You changed no files at all. The task is not done."
-        } >"$FEEDBACK_FILE"
+        # Rendered by tools/render-feedback rather than here, so that tools/feedback-selftest
+        # exercises this exact code path instead of a copy of it.
+        BENCH_FEEDBACK_DETAIL="$PROVIDER_FEEDBACK_DETAIL" \
+        BENCH_FEEDBACK_OUTPUT_LINES="$BENCH_FEEDBACK_OUTPUT_LINES" \
+        BENCH_FEEDBACK_DIFF_BYTES="$BENCH_FEEDBACK_DIFF_BYTES" \
+            "$FEEDBACK_RENDERER" \
+                "$RESULT_DIR/verification.log" \
+                "$RESULT_DIR/tree.diff" \
+                "$DID_NOTHING" >"$FEEDBACK_FILE"
+        # Preserve exactly what the next attempt was told.
+        #
+        # Round 7 compared two feedback levels and could not inspect the feedback afterwards: it
+        # lived in the worktree, which is deleted when the repetition ends. Diagnosing that round
+        # meant re-rendering it from other artifacts and hoping the inputs matched. For an
+        # experiment whose independent variable *is* this file, not keeping it was the obvious
+        # omission only in hindsight.
+        cp "$FEEDBACK_FILE" "$RESULT_DIR/feedback-attempt-$(( ATTEMPTS + 1 )).md" 2>/dev/null || true
         printf '==> attempt %s did not pass; retrying\n' "$ATTEMPTS" >>"$RESULT_DIR/driver.log"
         done
 
@@ -826,7 +977,30 @@ for provider in "${PROVIDER_LIST[@]}"; do
             "$DEVIATIONS" "$BLOCKERS" "$ROUNDS" "$ELAPSED" "$DRIVER_STATUS" \
             "$REWRITES" "$DID_NOTHING" "$LITTER" "$OUTCOME"
 
+        # Kill the writers BEFORE deleting what they are writing to.
+        #
+        # This used to run after the removal, and a process that outlived it recreated the
+        # directory: round 8 left `bench/.work/wide-lcgptosslfix-3/test_order.php` behind — an
+        # invented verification script written after `git worktree remove` had already succeeded.
+        # The next round with that provider would then refuse to start, because bench/run declines
+        # to reuse an existing worktree path.
+        #
+        # Cline starts a hub daemon per working directory and it outlives the repetition, keeping
+        # the model warm and generating into the same server log the next repetition's token
+        # accounting reads. Left to accumulate, a fifteen-repetition round ends with fifteen.
+        if [[ -n "$GHOST_SWEEP" ]]; then
+            "$GHOST_SWEEP" --kill >>"$RESULT_DIR/worktree.log" 2>&1 || true
+        fi
+
         remove_active_worktree "$RESULT_DIR" "$PLAN/$provider/$repetition"
+
+        # Whatever git left, or a straggler recreated. Bounded to the worktree path this repetition
+        # owns, so it cannot reach anything else even if the variable were somehow wrong.
+        if [[ -n "$WORK_DIR" && -d "$WORK_DIR/$PLAN-$provider-$repetition" ]]; then
+            echo "residue after worktree removal:" >>"$RESULT_DIR/worktree.log"
+            find "$WORK_DIR/$PLAN-$provider-$repetition" -type f >>"$RESULT_DIR/worktree.log" 2>&1
+            rm -rf -- "${WORK_DIR:?}/$PLAN-$provider-$repetition"
+        fi
     done
 done
 

@@ -101,6 +101,26 @@ render_report() {
             echo
             echo "Artifacts: ${RUN_DIR#"$REPO_ROOT"/}/"
 
+            # Provenance, on its own line rather than as more columns.
+            #
+            # Which harness produced a result was not recorded until a clone drifted from the
+            # working checkout and 25 of 61 runs exercised an already-fixed adapter bug without
+            # anything noticing. Token counts are here for the same reason the summary charges
+            # failures to successes: wall clock alone does not say what a patch cost.
+            HARNESS="$(metric_value "$metrics" harness_commit)"
+            if [[ -n "$HARNESS" ]]; then
+                DIRTY=""
+                [[ "$(metric_value "$metrics" harness_dirty)" != 1 ]] || DIRTY=" (uncommitted changes)"
+                printf 'Harness: %s%s, feedback %s\n' \
+                    "$HARNESS" "$DIRTY" "$(metric_or_dash "$metrics" feedback_detail)"
+            fi
+            if [[ "$(metric_value "$metrics" usage_unattributable)" == 0 ]]; then
+                printf 'Tokens: %s generated, %s prompt, over %s model requests\n' \
+                    "$(metric_or_dash "$metrics" generated_tokens)" \
+                    "$(metric_or_dash "$metrics" prompt_tokens)" \
+                    "$(metric_or_dash "$metrics" model_requests)"
+            fi
+
             if [[ -s "$RUN_DIR/note.txt" ]]; then
                 while IFS= read -r note; do
                     printf '> Note: %s\n' "$note"

@@ -80,6 +80,74 @@ print(json.dumps({
 '
 }
 
+# Token accounting, read from llama-server's own timing records.
+#
+# Wall clock alone cannot say *why* one configuration is slower, and for the reasoning sweep that
+# is the whole question: a model that thinks less should generate fewer tokens, and generated
+# tokens are a far quieter measurement than seconds. Five runs of wall clock did not separate
+# reasoning `low` from `off`; token counts measure the same claim without the noise of prompt
+# cache hits, disk, and the client's own latency.
+#
+# The mark is a byte offset into the server log, and the count is taken over the region appended
+# between two marks. That attribution is only sound because exactly one benchmark runs at a time
+# on this machine — which the bench lock enforces. A second client talking to the same server
+# would be counted into whichever run happened to be open.
+_lcpp_log_path() { echo "${LLAMACPP_STATE:-$HOME/.cache/agent-handoff}/llamacpp.log"; }
+
+provider_usage_mark() {
+    local log; log="$(_lcpp_log_path)"
+    [[ -f "$log" ]] && wc -c <"$log" | tr -d ' ' || echo 0
+}
+
+provider_usage_since() {
+    local log mark
+    log="$(_lcpp_log_path)"
+    mark="${1:-0}"
+    [[ -f "$log" ]] || return 0
+    LCPP_LOG="$log" LCPP_MARK="$mark" python3 -c '
+import os, re, sys
+
+path, mark = os.environ["LCPP_LOG"], int(os.environ["LCPP_MARK"] or 0)
+size = os.path.getsize(path)
+# A log that shrank was rotated or the server restarted mid-round; the offset no longer refers to
+# the region it was taken in, and a silently wrong token count is worse than none.
+if size < mark:
+    print("usage_tokens_unattributable=1")
+    sys.exit(0)
+
+prompt_re = re.compile(r"prompt eval time =\s*[\d.]+ ms /\s*(\d+) tokens")
+gen_re = re.compile(r"\|\s+eval time =\s*[\d.]+ ms /\s*(\d+) tokens")
+# A request that filled the window and lost history, and one the server refused outright. Both are
+# configuration results rather than model results, and both were invisible until someone read this
+# log by hand: one run of round 6 was truncated at 65535 tokens and scored as though it had its
+# whole conversation.
+truncated_re = re.compile(r"truncated = 1")
+overflow_re = re.compile(r"exceeds the available context size")
+prompt_tokens = gen_tokens = requests = truncated = overflowed = 0
+with open(path, "rb") as handle:
+    handle.seek(mark)
+    for raw in handle.read().decode("utf-8", "replace").splitlines():
+        if truncated_re.search(raw):
+            truncated += 1
+        if overflow_re.search(raw):
+            overflowed += 1
+        found = prompt_re.search(raw)
+        if found:
+            prompt_tokens += int(found.group(1))
+            requests += 1
+            continue
+        found = gen_re.search(raw)
+        if found:
+            gen_tokens += int(found.group(1))
+
+print(f"prompt_tokens={prompt_tokens}")
+print(f"generated_tokens={gen_tokens}")
+print(f"model_requests={requests}")
+print(f"truncated_requests={truncated}")
+print(f"context_overflows={overflowed}")
+'
+}
+
 _lcpp_cline_preflight() { :; }
 eval "_lcpp_cline_preflight() { $(declare -f provider_preflight | tail -n +2) }"
 

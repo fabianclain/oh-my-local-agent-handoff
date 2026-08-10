@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+#
+# sync-bench-clone — copy the working harness into the clone the benchmarks run from.
+#
+#   tools/sync-bench-clone <clone-path>
+#
+# Benchmarks run from a clone rather than the working checkout, for two reasons. Each attempt runs
+# in a `git worktree` created from HEAD, so the harness a run uses is the *committed* one — and the
+# working checkout must stay uncommitted for review. The clone is where harness changes can be
+# committed without touching the branch under review.
+#
+# Refuses while a benchmark is running. bash reads a script incrementally as it executes, so
+# overwriting bench/run underneath a live round can make it resume in the middle of a statement it
+# never started.
+
+set -euo pipefail
+
+CLONE="${1:?usage: sync-bench-clone <clone-path>}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SOURCE="$(git -C "$HERE" rev-parse --show-toplevel)"
+
+[[ -d "$CLONE/.git" ]] || { echo "not a git repository: $CLONE" >&2; exit 1; }
+
+if ! flock -n "${TMPDIR:-/tmp}/agent-handoff-bench.lock" true 2>/dev/null; then
+    echo "a benchmark is running; syncing now could corrupt it mid-round" >&2
+    exit 1
+fi
+
+# Results and worktrees belong to the clone and must survive. Everything else comes from source.
+rsync -a --delete \
+    --exclude '.git/' \
+    --exclude 'bench/results/' \
+    --exclude 'bench/.work/' \
+    --exclude '.handoff/runs/' \
+    "$SOURCE"/ "$CLONE"/
+
+cd "$CLONE"
+if git diff --quiet && git diff --cached --quiet && [[ -z "$(git status --porcelain)" ]]; then
+    echo "clone already matches the working harness"
+    exit 0
+fi
+
+git add -A
+git -c user.email=bench@example.invalid -c user.name=bench \
+    commit --quiet -m "harness under test: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo "clone synced and committed at $(git rev-parse --short HEAD)"
