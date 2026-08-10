@@ -184,6 +184,21 @@ worth much:
   criterion resting on it measures nothing
 - **nothing asserting how many files changed** — then the plan is not enforcing its own scope
 
+### Or drive it from Claude Code
+
+`skills/local-implement/SKILL.md` is a Claude Code skill that does all of the above: it interviews
+you about the change, writes the plan in verifiable form, checks it, runs it, and reports the
+harness's verdict rather than the model's account of itself.
+
+```bash
+mkdir -p ~/.claude/skills
+cp -r skills/local-implement ~/.claude/skills/     # available in every project on the machine
+```
+
+Then ask for a feature in plain language and it takes it from there. The division of labour is the
+point: the hosted model writes the specification, which is the part the local model cannot do and
+the part that decides whether verification means anything.
+
 ## 5. Run it
 
 ```bash

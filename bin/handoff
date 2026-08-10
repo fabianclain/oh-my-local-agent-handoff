@@ -5,6 +5,7 @@
 #   handoff do <slug>       fresh run against <plans>/<slug>.md
 #   handoff resume <slug>   continue the same session using runs/<slug>/feedback.md
 #   handoff diff <slug>     exactly what the implementer changed during the run
+#   handoff check <slug>    will the harness accept this plan, before you run it
 #   handoff verify <slug>   run the gates over the tree and print the verdict
 #
 # `do` verifies automatically when it finishes. HANDOFF_NO_VERIFY=1 suppresses that, for
@@ -21,7 +22,7 @@ MODE="${1:-}"
 SLUG="${2:-}"
 
 if [[ -z "$MODE" || -z "$SLUG" ]]; then
-    echo "usage: handoff {do|resume|diff|verify} <slug>" >&2
+    echo "usage: handoff {do|check|resume|diff|verify} <slug>" >&2
     exit 64
 fi
 
@@ -215,13 +216,27 @@ ${PROJECT_RULES}
 Leave all changes uncommitted."
     ;;
 
+check)
+    # Reachable from any project, which tools/check-plan is not: only bin/ is on PATH, and asking
+    # someone to know where the harness is checked out defeats the point of checking at all.
+    CHECKER="$HANDOFF_HOME/tools/check-plan"
+    [[ -x "$CHECKER" ]] || { echo "no checker at tools/check-plan" >&2; exit 1; }
+    [[ -f "$PLAN_FILE" ]] || {
+        echo "plan not found: $PLAN_FILE" >&2
+        echo "plans for this project live in ${PLANS_DIR#"$REPO_ROOT"/}" >&2
+        exit 1
+    }
+    "$CHECKER" "$PLAN_FILE"
+    exit $?
+    ;;
+
 verify)
     run_verification "$SLUG"
     exit $?
     ;;
 
 *)
-    echo "unknown mode: $MODE (expected do|resume|diff|verify)" >&2
+    echo "unknown mode: $MODE (expected do|check|resume|diff|verify)" >&2
     exit 64
     ;;
 esac
