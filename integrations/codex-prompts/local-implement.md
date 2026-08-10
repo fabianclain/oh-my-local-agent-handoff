@@ -32,7 +32,11 @@ claim is mechanically checkable. That is the measured bottleneck.
 method with specified behaviour, threading a parameter through, a pure service class, anything
 where "did it work?" is answered by running a command.
 
-**Split it, do not attempt it whole** — greenfield work, and anything mixing a service with a view.
+**Almost everything should be split.** One large round is rarely the right shape; a sequence of
+one-file steps usually is. See step 3 — decomposing is the default, not a fallback for when
+something fails.
+
+**Split it especially** — greenfield work, and anything mixing a service with a view.
 The measured figures below come from a six-file *refactor*; creating new files from a spec is a
 different shape with more freedom and far more surface to fake. Views are the worst case: a
 three-line template can satisfy a text assertion while containing nothing real. Do the pure,
@@ -64,7 +68,48 @@ cases matter most. Read the files you intend to name.
 
 `handoff init` — idempotent, safe on a configured project.
 
-### 3. Write the tests yourself, before the run
+### 3. Break the work into the smallest steps that each stand alone
+
+**Default to decomposing.** If the user brings you a plan or a feature description, your first job
+is to turn it into a *sequence* of small rounds, not one large one. One step should be something
+you could describe in a sentence and verify in three commands.
+
+Rough sizing, from what has been measured: **one to two files, three to six criteria, one
+coherent behaviour.** A step touching six files is a round; a step touching one is a step.
+
+**Be honest about what this buys.** It does *not* make the model more likely to succeed per step —
+the six-file plan actually scored slightly better on first attempt (87%) than the four-file one
+(80%). What it buys is:
+
+- **Cheap failure.** A rejected step wastes one step. A rejected six-file round wastes everything,
+  and a three-attempt failure costs three times a large run rather than three times a small one.
+- **Localised diagnosis.** When a big plan fails you learn that *something* was wrong. When step 3
+  of 5 fails you know exactly what.
+- **Criteria a stub cannot fake.** This is the real prize. Narrow scope lets each criterion assert
+  something specific; a six-file plan's criteria are necessarily coarser, and coarse criteria are
+  what a stub slips past.
+- **Banked progress.** Steps 1 and 2 are committed and safe while step 3 is retried.
+
+**How to cut.** In order of preference:
+
+1. **Pure logic before anything that renders.** A service class is close to an ideal fit; a view is
+   the easiest thing in a codebase to fake past a text assertion. Never in the same step.
+2. **One file per step** where the files are genuinely independent.
+3. **One method or one behaviour per step** when a single file is doing several things.
+4. **Data before presentation, and each layer gated on its own tests.**
+
+Name them in order: `<slug>-1-service`, `<slug>-2-view`. Write every plan up front so the user can
+review the whole sequence, then run them one at a time.
+
+**Commit between steps.** This is mechanical, not stylistic: the implementer leaves changes
+uncommitted, and every plan asserts how many files changed. If step 1's changes are still sitting
+in the tree, step 2's file-count criterion counts them and fails. So after each accepted step, show
+the user the diff and have them commit before the next one starts.
+
+**Stop on the first rejection.** Do not run step 4 because step 3 failed — fix step 3's plan and
+re-run it. Later steps usually assume the earlier ones landed.
+
+### 4. Write the tests yourself, before the run
 
 **This is the highest-leverage rule here.** If the implementer writes both the code and the test
 that judges it, they agree with each other and are wrong together. A hand-written expectation of
@@ -85,7 +130,7 @@ edit them:
 
 The harness fails the round if a file listed there comes back modified.
 
-### 4. Write the plan
+### 5. Write the plan
 
 Plans go where `.handoff/config.sh` says. Shape from `templates/plan.md`.
 
@@ -103,11 +148,11 @@ Plans go where `.handoff/config.sh` says. Shape from `templates/plan.md`.
    caught it was an acceptance command returning 404. If you find yourself writing "remember to",
    you have found a missing criterion.
 
-### 5. Check it
+### 6. Check it
 
 `handoff check <slug>`. Fix what it rejects; read the advisories. Acceptance is not quality.
 
-### 6. Run it
+### 7. Run it
 
 ```bash
 HANDOFF_PROVIDER=local handoff do <slug> >/tmp/run.log 2>&1; echo "verdict exit=$?"
@@ -127,7 +172,7 @@ git worktree add ../scratch-<slug> -b <slug>
 
 and work there. Nothing in the harness does this for you.
 
-### 7. Report what actually happened
+### 8. Report what actually happened
 
 Read `.handoff/runs/<slug>/evidence/evidence.md` and `handoff diff <slug>`. Report the verdict,
 which gates failed, what changed from the diff, any **advisory** findings, and anything under
@@ -138,13 +183,13 @@ the gates accept and the report is missing, say the patch is good and the report
 
 The implementer never commits.
 
-### 8. When the gates reject
+### 9. When the gates reject
 
 Read the failing command's output first. Usual causes in order: the plan was ambiguous, an
 acceptance command was wrong, the model got it wrong. Fix the plan and re-run rather than patching
 by hand.
 
-**After two failed rounds, split the task rather than attempting a third.** Two rounds failing the
+**After two failed rounds, split that step further rather than attempting a third.** Two rounds failing the
 same way is evidence about the task's shape, not about the model.
 
 ## Setup

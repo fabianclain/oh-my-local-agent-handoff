@@ -186,6 +186,22 @@ worth much:
   criterion resting on it measures nothing
 - **nothing asserting how many files changed** — then the plan is not enforcing its own scope
 
+### Prefer a sequence of small steps to one large plan
+
+A step should be one to two files, three to six criteria, one coherent behaviour. Write the whole
+sequence up front, run them one at a time, and **commit between steps** — the implementer leaves
+changes uncommitted and every plan asserts how many files changed, so step 1's leftovers will fail
+step 2's file count.
+
+Be clear about what this buys, because it is not what it looks like. Smaller steps are **not**
+measurably more likely to succeed: the six-file plan scored 87% on first attempt against the
+four-file plan's 80%. What they buy is cheap failure, localised diagnosis, banked progress — and
+most importantly criteria a stub cannot fake, because narrow scope is what lets each criterion
+assert something specific.
+
+Cut pure logic away from anything that renders. A service class is close to an ideal fit; a view is
+the easiest thing in a codebase to satisfy with three lines that mean nothing.
+
 ### Or drive it from Claude Code
 
 `skills/local-implement/SKILL.md` is a Claude Code skill that does all of the above: it interviews
