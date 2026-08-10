@@ -900,3 +900,43 @@ work, and both made outcomes worse or no better. The local model is good at impl
 specification and bad at everything adjacent to assessing what it did — so the useful direction is
 to give it *less* judgement, not better inputs for judging.
 
+### Round 9 — deterministic sampling does not quiet the benchmark
+
+The serving stack had been running at llama.cpp's defaults throughout — temperature 0.8, top_p
+0.95, top_k 40, random seed — a creative-writing profile for a task whose signatures are dictated
+and whose acceptance is mechanical. It had never been varied. The prediction was that it accounted
+for much of the run-to-run spread that has made every comparison in this project hard to resolve.
+
+`wide`, `lcgptossl0` (`--temp 0 --top-p 1 --top-k 1 --seed 42`), 12 runs, against round 6's
+`lcgptossl` arm.
+
+| | temp 0.8 | temp 0 |
+| --- | ---: | ---: |
+| Seconds — median, range | 253, 142–826 (**5.8x**) | 299, 121–1157 (**9.6x**) |
+| Seconds CV | **61%** | **76%** |
+| Generated tokens — range | 5.2x | 7.0x |
+| Generated tokens CV | 56% | 62% |
+| Usable tree | 14/15 | 8/12 (p = 0.14) |
+| Damaged | 1/15 | 4/12 (p = 0.14) |
+
+**Spread got wider, not narrower.** Every dispersion measure moved the wrong way, and the longest
+run of the entire project — 1157s — happened under the setting meant to make runs uniform.
+
+**Why the prediction was wrong.** Greedy decoding with a fixed seed makes each *request*
+deterministic. It does not make the *trajectory* deterministic. The agentic loop diverges at the
+first tool call — which file the model reads, in what order, what the directory listing returns —
+and everything downstream is conditioned on that. Determinism at the token level does not survive
+contact with a loop whose inputs it does not control.
+
+So the run-to-run variance here is a property of the agent loop, not of token sampling, and it
+cannot be turned off by fixing the sampler. Comparisons on this plan need repetitions; there is no
+configuration shortcut.
+
+**A hint worth not over-reading.** Damage went 1/15 to 4/12 and usable trees 93% to 67%, both at
+p = 0.14. Greedy decoding locking a model into a bad trajectory with no way out is a plausible
+mechanism, and n=12 is not enough to claim it. What can be said is that there is no evidence
+deterministic sampling helps, and some suggestion it hurts.
+
+**The default is restored to llama.cpp's own**, since every established result was measured there
+and nothing here argues for moving.
+

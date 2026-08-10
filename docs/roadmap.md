@@ -440,6 +440,27 @@ measurable rather than anecdotal.
 
 ---
 
+## 6b. Sampling is settled: it is not the source of the spread
+
+Tested in round 9 and the answer is no. `--temp 0 --top-p 1 --top-k 1 --seed 42` against the
+default 0.8/0.95/40/random, 12 runs on `wide`: seconds CV went **61% to 76%**, range **5.8x to
+9.6x**, and the longest run in the project's history — 1157s — happened under the deterministic
+setting. Every dispersion measure moved the wrong way.
+
+**The reason, which generalises.** Greedy decoding with a fixed seed makes each *request*
+deterministic; it does not make the *trajectory* deterministic. The loop diverges at the first tool
+call — which file gets read, in what order, what a listing returns — and everything after is
+conditioned on that. Token-level determinism does not survive a loop whose inputs it does not
+control.
+
+So there is no configuration shortcut to a quieter benchmark. Comparisons on this plan need
+repetitions, and the ~35-runs-per-arm figure for resolving a 26% effect stands.
+
+Do not re-test this without a new mechanism to propose. The default is restored, and every
+established number was measured there.
+
+---
+
 ## 7. Method notes from an unattended run
 
 Small things that cost real time tonight, recorded so they cost nothing next time.
