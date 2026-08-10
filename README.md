@@ -5,9 +5,10 @@ One coding agent writes the plan and verifies the result. Another writes the cod
 It is a few hundred lines of bash. The value is not the code — it is the protocol, and the
 failure modes it exists to catch.
 
-> **Status: early.** Extracted from ~30 real rounds on a production Laravel codebase. One
-> provider adapter (Codex) works today; the provider seam exists so others can be added without
-> touching the driver.
+> **Status: early, but measured.** Extracted from ~30 real rounds on a production Laravel
+> codebase, then put under a benchmark harness of its own: ~90 recorded runs across nine rounds,
+> with every result carrying the harness commit that produced it. Six provider adapters work.
+> Results and the reasoning behind them are in [bench/COMPARISON.md](bench/COMPARISON.md).
 
 ## Why
 
@@ -24,7 +25,8 @@ That single observation drives every design decision here.
 ## What it does
 
 ```
-handoff do <slug>       implement .handoff/plans/<slug>.md
+handoff do <slug>       implement .handoff/plans/<slug>.md, then verify it
+handoff verify <slug>   re-run the gates over the working tree
 handoff resume <slug>   feed back review comments, same session
 handoff diff <slug>     exactly what changed during the run
 ```
@@ -39,8 +41,15 @@ returns **schema-enforced JSON**, not prose:
   "deviations": [...], "blockers": [...], "follow_ups": [...] }
 ```
 
-The implementer never commits. The reviewer reads the diff, re-runs the tests, and owns the
-commit.
+The implementer never commits. **The harness verifies before a human or a hosted model looks at
+anything**: `handoff do` runs the plan's acceptance commands against the tree when it finishes and
+folds the verdict into its exit status, so a round the gates reject fails even when the model
+exited cleanly. The reviewer reads the evidence bundle — every gate, its command, its exit code —
+and owns the commit.
+
+That ordering is not a nicety. Measured over 30 clean runs of a six-file task, **a third of correct
+patches arrive with no report at all**, and reports have historically claimed success over trees
+the model never touched. The self-report cannot be the signal.
 
 ## Four mechanisms, each from a specific failure
 
@@ -101,8 +110,26 @@ Copy `commands/*.md` into `.claude/commands/` if you drive this from Claude Code
 ## Benchmark harness
 
 `bench/` runs the same self-contained plan in isolated worktrees and preserves raw per-run
-evidence. Its methodology and commands are documented in `bench/METHODOLOGY.md`; no comparison
-results are published yet.
+evidence. Methodology is in `bench/METHODOLOGY.md`, results in `bench/COMPARISON.md`.
+
+```bash
+bench/run --plan wide --providers lcgptossl --repeat 15
+bench/report        # every run individually — combining them hides the variance
+bench/summary       # cost per usable patch, failed runs charged to the successes
+bench/compare wide <control> <arm>    # is the difference real?
+```
+
+`bench/compare` exists because two dramatic findings here dissolved under it. It runs Fisher and
+Mann-Whitney, and — for a variable that only acts on repair — scores attempt 1 separately, where
+the arms are identical by construction. One comparison showed a 27-point gap of which 20 points
+were already present before the variable applied.
+
+The harness has its own tests, none of which need a GPU:
+
+```bash
+tools/harness-selftest      # bench/run end to end, against a provider that runs no model
+tools/feedback-selftest tools/patch-shape-selftest tools/shim-selftest
+```
 
 ## Providers
 
@@ -132,8 +159,34 @@ tools/llamacpp-serve start gpt-oss-20b 65536
 HANDOFF_PROVIDER=lcgptossl handoff do <slug>
 ```
 
-On a four-file architectural task with a semantic trap, that stack scored **15/15**, every run
-first-attempt, on a 16 GB card.
+**How reliable, on 30 clean runs of a six-file task** (95% confidence intervals, because the
+spread here is wide enough that point estimates mislead):
+
+| | |
+| --- | ---: |
+| Met every acceptance criterion | 29/30 |
+| Green on the first attempt | **78%** (59–89%) |
+| Usable patch within three attempts | **93%** (79–98%) |
+| Correct patch but **no report at all** | 1 in 3 |
+| Typical cost | ~5 min, ~15k generated tokens, free at inference |
+
+**The code is the reliable part; the envelope is not.** When it finishes, the work is correct. What
+fails is everything adjacent to reporting on it — which is why the harness judges the tree and the
+report is recorded as untrusted metadata.
+
+**The tail is heavy.** Median 279s but p90 at 644s and a worst case of 1404s — a 9.9x range. Budget
+for the tail. That spread is a property of the agent loop, not of sampling: setting temperature to
+0 with a fixed seed made it *wider*, because token-level determinism does not survive a loop whose
+first tool call it does not control.
+
+**Reasoning level is not the lever it looks like.** `low` against `off`, 15 runs each: both
+delivered a reviewable patch 14 times in 15, and every quality difference is inside chance
+(p ≥ 0.70). Use `low` because nothing points away from it, not because it was shown to win.
+
+An earlier version of this section reported **15/15** on the four-file task. That was accurate
+about acceptance criteria and hid that three of those fifteen runs changed files the plan never
+named. Corrected rather than deleted, because which numbers turned out to be incomplete is part of
+what this repository is for.
 
 **Use llama.cpp, not ollama, for gpt-oss.** Same weights, same tool schema, same conversation:
 ollama returns HTTP 500 for tool calls its own model generated — 2/5 malformed against 8/8, and
@@ -145,6 +198,21 @@ Three things gate a local model, and each has produced a wrong verdict when skip
 engine serves it**, whether it emits native tool calls, and whether the window you want keeps it
 100% GPU-resident. Read the chat template and the stop list before concluding anything about
 capability — three models tested here were blocked by packaging, not ability.
+
+```bash
+tools/engine-conformance --engine llamacpp --model gpt-oss-20b
+```
+
+Run that whenever the engine build, GGUF, template, client version, context size or tool schema
+changes. A benchmark cannot tell an engine regression from a model regression; not having this
+check is why every ollama-served gpt-oss result had to be thrown away.
+
+**The most useful thing in this repository is the record of what turned out to be wrong.** Ten
+harness defects have been found here and six were mistaken for model behaviour first — a retry
+disabled by an incompatible CLI flag for 25 of 61 runs, a "the model goes quiet" mystery that was
+three stacked bugs, a dramatic finding that was noise present before the variable applied. That
+register is in [docs/local-models.md](docs/local-models.md) and
+[bench/COMPARISON.md](bench/COMPARISON.md), kept as prominent as the results.
 
 ## Licence
 

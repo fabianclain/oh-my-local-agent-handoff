@@ -636,6 +636,55 @@ Ranked by measured effect, not by how good the idea sounded.
 
 ---
 
+## 8b. The register of wrong conclusions
+
+Kept as prominently as the results, because it is the most reusable thing here. Every entry was
+believed, several were written down as findings, and each was overturned by measurement rather
+than by argument.
+
+### Wrong about the model, when it was the plumbing
+
+| Believed | Actually |
+| --- | --- |
+| qwen2.5-coder fabricated a blocker to look diligent | Served at a 4,096-token default; it could not see the plan and said so |
+| gpt-oss is client-fragile | Ollama returns HTTP 500 for tool calls its own model generated. Same weights through llama.cpp: 8/8 valid |
+| gemma fails through the shim | The shim was single-threaded and wedged by the first idle keep-alive connection |
+| The model sometimes goes quiet | Three stacked defects — it does stop talking, the retry meant to catch that never ran, and once running it answers `{}` because its prompt carries no schema and no account of the work |
+| Devstral at 85% residency proves partial offload is fatal | gpt-oss at 84% produced a byte-perfect patch in 60s |
+
+### Wrong about what would help
+
+| Predicted | Measured |
+| --- | --- |
+| Reasoning `off` should be cheaper — the planner already did the thinking | Nominally **26% dearer**, and no better on any axis. Direction backwards |
+| Less reasoning means fewer missing final messages | The opposite: 33% at `low`, 40% at `off` |
+| Giving the retry ground truth about the tree lets it report honestly | Damage went 1/15 to 4/15. A retry told not to edit any file edits files |
+| Richer repair feedback should reduce attempts | Inconclusive — and 20 of the 27-point "effect" was present before the variable applied |
+| Token counts will be a lower-variance instrument than wall clock | They are not. Throughput holds a 5.4% band while wall clock spans 4.9x |
+| Sampling temperature explains the run-to-run spread | Deterministic sampling made spread **wider**: CV 61% to 76% |
+| Asserting original lines keep their order closes the mis-placed-insertion hole | It does not. Nothing is deleted or reordered by an insertion; a hunk bound is what constrains it |
+
+### Wrong about the harness, by the harness's own author
+
+Written the same day, each caught by testing the guard against the exact failure it targets:
+
+- A conformance probe that printed `CONFORMANCE OK` over **zero tool calls** — the precise failure
+  it existed to catch, one level up.
+- A line-boundary assertion in a selftest that passed vacuously; the check that caught the mutation
+  was a different one.
+- A process-group kill that signalled the wrong pid, and a test that passed because the process had
+  detached rather than because it had died.
+- Two `pgrep -f` waiters that matched their own command line and could never exit; the same mistake
+  as `pkill -f` killed a shell.
+- A verifier that failed a round because it had run before, counting its own earlier output as a
+  file the model invented.
+
+**The pattern worth extracting.** Every one of these was found by asking *could something other
+than the model have produced this?* — and none by inspection or reasoning. A guard that has not
+been run against the failure it was written for is an assumption wearing a test's clothes.
+
+---
+
 ## 9. Harness improvements
 
 ### Landed
@@ -658,17 +707,30 @@ Ranked by measured effect, not by how good the idea sounded.
 | `harness_commit` / `harness_dirty` in every metrics file, and `tools/sync-bench-clone` | The clone benchmarks run from drifted from the working checkout for hours; 25 of 61 runs exercised a bug already fixed elsewhere, and no result said which harness produced it |
 | `tools/check-no-ghosts`, run before every round | An agent process left in a deleted worktree still holds the model and still generates — twice read as a model collapsing, and now it would also be charged to another run's token count |
 | `tools/engine-conformance` — is the stack emitting usable tool calls, before the round starts | A benchmark cannot tell an engine regression from a model regression; not having this is why every ollama-served gpt-oss result is void |
+| `bench/compare` — Fisher, Mann-Whitney, and the attempt-1 control | Two dramatic findings dissolved under it. Significance is the wrong test for the control: a 20-point noise floor at p = 0.36 was three quarters of a "result" |
+| `bench/summary` — cost per usable patch, failures charged to the successes | "15/15 correct" read as uniform when one run cost 5.7x the others and three had changed files the plan never named |
+| `tools/final-turn-shape` — why a run produced no report | Turned the project's longest-standing unexplained outcome into a mechanism: the turn ends with no text block at all |
+| Verifier verdict narrowed to the plan's commands plus scope | Across 68 bundles the harness's own gates caught one thing the plan had not. The rest were re-deciding what the plan already decided |
+| `handoff do` verifies on completion and folds the verdict into its exit status | The benchmark had a gate the actual tool did not: real runs printed a diff and exited with whatever the provider returned |
+| Agent rules ban self-written verification scripts | 13 invented across the rounds; one run produced seven and never cleaned them up |
+| `tools/llamacpp-serve` takes sampling flags | The stack had served at a creative-writing profile — temp 0.8, random seed — for every measurement ever taken here, unexamined |
 
 ### Open
 
 Moved to [docs/roadmap.md](roadmap.md), which carries enough reasoning on each to pick it up cold.
 Summarised here so this section is not a dead end:
 
-1. converge `verify-round` and `bench/run` into one gate implementation
-2. a conformance gate for the serving stack
-3. byte-identical cannot see a mis-placed insertion
-4. measure whether the richer repair feedback actually reduces attempts — it is built and
-   switchable, and unmeasured feedback is a hypothesis, not an improvement
+1. ask for the report through the channel that works — built, opt-in, unmeasured. The model emits
+   tool calls reliably and final text unreliably; this is the largest available win
+2. converge `verify-round` and `bench/run` into one gate implementation — lower priority than it
+   looked, since the two agreed on 22 of 23 runs carrying an evidence bundle
+3. run `bench/plans/semantic.md` against a model. Written and validated, never run. It is the only
+   plan here where a plausible wrong answer survives review, and therefore the real test of the
+   gates
+4. a plan the model reliably fails once, so an A/B on the repair loop has more than a handful of
+   informative runs
+5. `bench/validate-plan`, so the reference/trap/do-nothing check the methodology requires is a
+   command rather than a good intention
 
 ### Previously listed here, in detail
 

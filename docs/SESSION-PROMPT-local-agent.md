@@ -1,5 +1,16 @@
 # Session prompt: local model as an implementation agent
 
+> **Superseded.** Kept because its framing of the task still holds, but the state of the world it
+> describes is out of date. For a current session use
+> [SESSION-PROMPT-benchmark-run.md](SESSION-PROMPT-benchmark-run.md), and for what is actually
+> known see [local-models.md](local-models.md) and [../bench/COMPARISON.md](../bench/COMPARISON.md).
+>
+> Two things in here will not resolve. The `.handoff/bin/*` scripts — `setup-local-model`,
+> `gemma-round`, `watch-local` — lived in the host project this was extracted from and are not part
+> of this repository; their jobs are now done by `tools/engine-conformance`, `bench/run` and
+> `bench/summary`. And the runs it points at were taken through ollama, which corrupts this model's
+> tool calls, so those numbers are void.
+
 Paste this to start a session focused only on driving local models through agent-handoff.
 
 ---
