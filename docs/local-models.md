@@ -11,6 +11,12 @@ which confident conclusions turned out to be harness bugs.
 
 ## The short version
 
+> **Reasoning level is not the lever it was assumed to be.** `low` against `off` on the six-file
+> plan, 15 runs each: both delivered a reviewable patch 14 times out of 15, and every quality
+> difference is inside chance (p ≥ 0.70). `off` was nominally ~26% *more* expensive per usable
+> patch, not less, though that does not reach significance either (p = 0.18–0.22). The theory that
+> the implementer should not think, because the planner already did, is dismissed — see round 6.
+
 > **The serving engine is a gate, not an implementation detail.** gpt-oss through ollama scored
 > 1/3 with malformed tool calls; the same official weights through llama.cpp scored 4/4, and then
 > **4/4 on a nine-criteria multi-file task, every run first-attempt** — a plan gemma scores 0/9 on.
@@ -549,6 +555,44 @@ Each was plausible, each was measured, each failed:
 The lesson is the project's own rule, applied to a component rather than a run: a symptom seen
 only through a client says nothing about where the defect lives until it is reproduced without one.
 
+### And a fifth: "the model sometimes returns no final message"
+
+This one survived longest because it looked like model behaviour and appeared under two different
+models. Runs kept producing a byte-perfect tree and no usable report, and the working theory was
+that the model occasionally just stopped talking.
+
+**It is three things, and the theory was closest to the first.** `tools/final-turn-shape` reads
+Cline's event stream and reports whether a `text` block arrived in each attempt. Over the first
+nine runs of round 6 the split is perfect — 11 attempts ending `tool, text, reasoning` all
+completed, 3 ending `reasoning, tool, reasoning` all errored:
+
+1. **The model does stop talking.** It ends its last turn having produced reasoning and a tool
+   call and *no text block at all*. Cline reports *"does not match the expected peg-native
+   format"*, which reads like a malformed reply and is really an absence. So the original theory
+   was right about the symptom and wrong about it being unfixable.
+2. **The retry that exists to recover from that never ran** — `--id` is incompatible with `--json`
+   plus a prompt argument, so it died instantly on an empty prompt. 25 of 61 runs.
+3. **With the retry running, it answers with `{}`** — because its prompt carries the validation
+   error and nothing else, to a fresh session: no schema, no task, no account of the work. The
+   `opencode` adapter rebuilds all three; the Cline adapter does not.
+
+Each layer hid the one below it. Only fixing (2) made (3) observable, and only measuring (3) made
+(1) provable rather than assumed.
+
+It is an adapter defect. Cline's `--id` is incompatible with `--json` plus a prompt argument in
+3.0.52, the adapter passed it on the retry, and the retry died instantly on *"JSON output mode
+requires a prompt argument or piped stdin"* — an empty-prompt error, reproduced directly against
+the CLI with no harness involved. The prompt-validate retry never ran, not once, so a malformed
+final message was always terminal.
+
+**25 of 61 runs with a preserved provider log hit it, and 16 of those had a correct tree.** What
+the model actually does is produce output Cline's parser rejects (*"does not match the expected
+peg-native format"*), which a working retry is specifically designed to recover from.
+
+The fix existed in the working checkout while every benchmark ran from a clone that never received
+it. That is the real finding: two copies of the harness, no provenance recorded anywhere in a
+result, and nothing to notice the difference.
+
 ---
 
 ## 8. What has been tried, and what it was worth
@@ -607,17 +651,24 @@ Ranked by measured effect, not by how good the idea sounded.
 | Repair loop, capped at 3 attempts, fed the harness's own failing-command list | First-pass success was the only thing measurable |
 | Per-result `manifest.json` — engine, build, model digest, context, KV, client, reasoning | "gpt-oss" names several serving stacks that behave differently |
 | Byte-identical criterion on unnamed regions | Catches collateral damage that functional tests pass straight through |
+| Outcome taxonomy derived from the tree, not the report | A byte-perfect patch with no final message scored identically to a run that changed nothing |
+| Repair feedback rendered by `tools/render-feedback`, with an optional `full` level | The retry saw only exit codes: not the error text, and not what it had already changed |
+| Token accounting per run, summed across attempts, from llama-server's own timing records | Cost to an accepted patch had every input except the one that varies most |
+| `tools/harness-selftest` — the whole harness end to end against a provider that runs no model | Harness bugs presented as model failures, which is what cost this project its longest investigation |
+| `harness_commit` / `harness_dirty` in every metrics file, and `tools/sync-bench-clone` | The clone benchmarks run from drifted from the working checkout for hours; 25 of 61 runs exercised a bug already fixed elsewhere, and no result said which harness produced it |
+| `tools/check-no-ghosts`, run before every round | An agent process left in a deleted worktree still holds the model and still generates — twice read as a model collapsing, and now it would also be charged to another run's token count |
+| `tools/engine-conformance` — is the stack emitting usable tool calls, before the round starts | A benchmark cannot tell an engine regression from a model regression; not having this is why every ollama-served gpt-oss result is void |
 
 ### Open
 
 Moved to [docs/roadmap.md](roadmap.md), which carries enough reasoning on each to pick it up cold.
 Summarised here so this section is not a dead end:
 
-1. give the repair loop the diff and a reading of where it failed
-2. converge `verify-round` and `bench/run` into one gate implementation
-3. compute cost to an accepted patch
-4. a conformance gate for the serving stack
-5. byte-identical cannot see a mis-placed insertion
+1. converge `verify-round` and `bench/run` into one gate implementation
+2. a conformance gate for the serving stack
+3. byte-identical cannot see a mis-placed insertion
+4. measure whether the richer repair feedback actually reduces attempts — it is built and
+   switchable, and unmeasured feedback is a hypothesis, not an improvement
 
 ### Previously listed here, in detail
 
@@ -714,8 +765,17 @@ cline auth -p openai-compatible -m <model> -b http://127.0.0.1:8071/v1 -k dummy 
   --config ~/.cline-llamacpp
 
 # 4. probe before benchmarking: a real tool call, after a tool result, with a large argument
-python3 tools/repro-ollama-toolcall-500.py <model> 10   # engine-neutral; expect 0 failures
+tools/engine-conformance --engine llamacpp --model <model> --repeat 2
 ```
+
+`engine-conformance` is the one to run. It covers a first-turn call, a call after a 20 KB tool
+result, a ~1 KB `apply_patch` argument, a streamed turn and a reused connection, and it fails
+loudly rather than quietly when the engine never produced a tool call at all — a state its own
+first version reported as a pass. `repro-ollama-toolcall-500.py` remains as the minimal
+reproduction of ollama's specific defect, for filing upstream.
+
+Expect on llama.cpp b10331 with gpt-oss-20b MXFP4: `CONFORMANCE OK`, 14 turns, 12 of them
+`apply_patch`.
 
 > **Ollama's blobs are not portable.** Its `gpt-oss:20b` declares model architecture `gptoss`, and
 > llama.cpp rejects it with `unknown model architecture`. The Hugging Face build declares

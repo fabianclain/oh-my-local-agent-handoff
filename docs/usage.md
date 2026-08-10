@@ -116,7 +116,12 @@ handoff do <slug>                              # default provider (codex)
 HANDOFF_PROVIDER=glm handoff do <slug>         # same plan, GLM implements
 HANDOFF_PROVIDER=glm handoff resume <slug>     # feed back review comments
 handoff diff <slug>                            # exactly what changed
+handoff verify <slug>                          # re-run the gates over the tree
 ```
+
+`do` verifies when it finishes and folds the verdict into its exit status, so a round the gates
+reject exits non-zero even when the provider exited cleanly. `HANDOFF_NO_VERIFY=1` suppresses it,
+for callers that run the same gates themselves.
 
 Provider is chosen per invocation, so you can mix freely across rounds — but **resume must use
 the same provider as the original run**, since the session id belongs to that provider.
@@ -144,16 +149,54 @@ HANDOFF_MODEL=gpt-5.3-codex-spark handoff do <slug>   # faster, mechanical work
 HANDOFF_EFFORT=low handoff do <slug>
 ```
 
+### Settings for a local implementer
+
+Measured on gpt-oss-20b via llama.cpp, 30 runs of a six-file plan plus 15 earlier on a four-file
+one. Short version: **reasoning `low`, and stop tuning it.**
+
+| Setting | Recommendation | What the evidence says |
+| --- | --- | --- |
+| Reasoning | **`low`** | `low` vs `off`, n=15 each: quality indistinguishable (p ≥ 0.70 on every outcome). `off` was nominally 26% *dearer* per usable patch, not cheaper, and not significantly so (p = 0.18–0.22). Every point estimate favours `low`; none favours `off`. |
+| | not `off` | The theory that the implementer needs no reasoning because the planner did it is not supported. `off` also had the higher no-report rate (40% vs 33%) and produced the single worst run seen — seven invented verification scripts, never cleaned up. |
+| | not `medium` | Indistinguishable on quality, and it is where "writes its own verification scripts instead of running the plan's" was first seen. |
+| Engine | **llama.cpp, not ollama** | Not a preference. Ollama corrupts this model's tool calls; every result taken through it is void. Run `tools/engine-conformance` after any engine, GGUF, template or client change. |
+| Context | 64k, and know it is tight | One run in fifteen on the six-file plan exceeded it and silently lost history. Bigger costs GPU residency, so the fix is detection first. |
+
+The honest summary of the reasoning question: **no measurable difference, choose on architecture.**
+`low` is the recommendation because nothing points away from it, not because it was shown to win.
+
+**Where the effort actually pays.** Reasoning level bought nothing. The things that changed outcomes
+were the serving engine, one incompatible CLI flag that silently disabled every recovery attempt,
+and whether anything checked the tree afterwards. Spend the time on the plan and the gates.
+
 ## The loop
 
 1. Write `.handoff/plans/<slug>.md` from `templates/plan.md`. Fill in **States to handle** and
    **Fixtures** — skipping those is where defects come from.
 2. `handoff do <slug>`
-3. Read `.handoff/runs/<slug>/result.json`. **Then verify it yourself.** Re-run every command in
-   `tests_run`; a claimed pass you did not observe does not count.
+3. **Read the verdict, not the report.** `do` prints one and writes the evidence to
+   `.handoff/runs/<slug>/evidence/evidence.md`: every gate, the command, its exit code, an excerpt.
+   `result.json` is the model's account of itself and is recorded as untrusted metadata.
 4. `handoff diff <slug>` and compare against the plan's *Files to touch*.
 5. Not right? Write `.handoff/runs/<slug>/feedback.md`, then `handoff resume <slug>`.
 6. Right? Commit. The implementer never commits; you do.
+
+### Why the verdict and not the report
+
+Measured on this harness, over hundreds of runs:
+
+- Runs have reported `status: complete`, with invented file paths, over a tree they never touched.
+- Between **a quarter and two fifths** of local-model runs return **no report at all** while
+  leaving a byte-perfect patch. The tree is fine; the envelope is missing.
+- A report that does arrive can claim a test passed that was never run.
+
+None of that makes the model unusable — it makes *its self-assessment* unusable. The gates read the
+tree instead, and they catch the case that matters most: a wrong answer that parses cleanly and
+reads plausibly. A patch returning `4` where the plan said `5` is rejected on the acceptance
+command, not on appearances.
+
+This is also the economics. A rejected round should never reach a hosted reviewer; if every attempt
+costs hosted tokens to triage, the case for a local implementer collapses.
 
 ## Two things that will bite you
 
