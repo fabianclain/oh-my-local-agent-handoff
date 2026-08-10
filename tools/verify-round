@@ -30,6 +30,11 @@ WORKTREE="${1:?usage: verify-round <worktree> <plan.md> <base-commit> [out-dir]}
 PLAN_FILE="${2:?plan file required}"
 BASE_COMMIT="${3:?base commit required}"
 OUT_DIR="${4:-$WORKTREE/.handoff/evidence}"
+# Optional git tree object captured before the run. Without it an untracked file has no baseline
+# to compare against, and the read-only gate can only say "it exists now", which is not the
+# question. A reviewer-written test is usually untracked, and reporting it as modified renders as
+# "the model tampered with its judge" — which it had not.
+RUN_START_TREE="${5:-}"
 
 # The verifier must not appear in its own results.
 #
@@ -237,19 +242,47 @@ awk '
 
 if [[ -s "$PROTECTED" ]]; then
     PROT_OUT="$OUT_DIR/protected.log"; : >"$PROT_OUT"; TOUCHED_PROTECTED=0
+    UNBASELINED=0
     while IFS= read -r file; do
         [[ -n "$file" ]] || continue
-        if grep -Fqx -- "$file" "$CHANGED"; then
+        # Content, not presence. "Appears in the changed list" is true of every untracked file,
+        # so the first version of this gate failed every reviewer-written test on sight.
+        BASELINE=""
+        if [[ -n "$RUN_START_TREE" ]] &&
+           git cat-file -e "$RUN_START_TREE:$file" 2>/dev/null; then
+            BASELINE="$(git rev-parse "$RUN_START_TREE:$file")"
+        elif git cat-file -e "$BASE_COMMIT:$file" 2>/dev/null; then
+            BASELINE="$(git rev-parse "$BASE_COMMIT:$file")"
+        fi
+
+        if [[ -z "$BASELINE" ]]; then
+            # Untracked at the base and no snapshot: nothing to compare against. Saying "unchanged"
+            # would be a claim the evidence does not support.
+            echo "no baseline to compare against: $file" >>"$PROT_OUT"
+            UNBASELINED=$(( UNBASELINED + 1 ))
+            continue
+        fi
+        if [[ ! -f "$WORKTREE/$file" ]]; then
+            echo "deleted, but the plan marked it read-only: $file" >>"$PROT_OUT"
+            TOUCHED_PROTECTED=$(( TOUCHED_PROTECTED + 1 ))
+            continue
+        fi
+        CURRENT="$(git hash-object -- "$WORKTREE/$file")"
+        if [[ "$CURRENT" != "$BASELINE" ]]; then
             echo "changed, but the plan marked it read-only: $file" >>"$PROT_OUT"
             TOUCHED_PROTECTED=$(( TOUCHED_PROTECTED + 1 ))
         fi
     done <"$PROTECTED"
+    PROT_TOTAL="$(grep -c . "$PROTECTED")"
     if [[ "$TOUCHED_PROTECTED" -gt 0 ]]; then
         record "read-only" "fail" \
             "$TOUCHED_PROTECTED file(s) the plan marked read-only were modified" "" "$PROT_OUT"
+    elif [[ "$UNBASELINED" -gt 0 ]]; then
+        record "read-only" "skipped" \
+            "$UNBASELINED of $PROT_TOTAL read-only file(s) had no baseline to compare against" \
+            "" "$PROT_OUT"
     else
-        record "read-only" "pass" \
-            "$(grep -c . "$PROTECTED") file(s) marked read-only came back untouched"
+        record "read-only" "pass" "$PROT_TOTAL file(s) marked read-only came back untouched"
     fi
 fi
 

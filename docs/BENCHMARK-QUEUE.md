@@ -35,6 +35,27 @@ a restart cannot affect results already recorded, and conformance is re-probed a
 size is part of the stack, and a stack that stops emitting usable tool calls must never be
 attributed to the model.
 
+## Queued from real use — the editing-failure batch
+
+Five rounds on a greenfield Laravel task produced 0 accepted, against documented figures of 78%
+first-attempt. **File corruption ended the two most promising rounds** — a docblock running into a
+method body, parse error, both times on files over 150 lines being edited a second time. That is an
+editing failure, not a reasoning failure, and nothing in the harness targets it.
+
+| Round | Arm | n | What it settles | Est. |
+| --- | --- | ---: | --- | ---: |
+| 15 | `lcgptosslwhole` — whole-file writes under ~400 lines | 15 | Does rewriting the file wholesale eliminate mis-anchored partial edits? Targets the #1 observed failure | ~1.5h |
+| 16 | `lcgptosslsyntax` — linter as a post-write hook | 15 | Does feeding a parse error back immediately let the model repair a truncation, instead of building on a broken file for the rest of its budget? | ~1.5h |
+
+Both are measurable against `wide` with round 11's arm as control, and both should be run before
+anyone trusts a read of five rounds — including the read that produced them.
+
+**A conflict to resolve before round 15.** The patch-only gate exists because a 421-line service
+came back as an 11-line fragment; whole-file writes are exactly what it was built to catch. It is
+now advisory rather than verdict-bearing, so it will not reject the arm, but the tension is real:
+truncation is the shared failure mode of both approaches, and what actually distinguishes them is
+whether a syntax check runs before the round is spent. Round 16 may matter more than round 15.
+
 ## Considered and not queued, with the reason
 
 | Not running | Why not |

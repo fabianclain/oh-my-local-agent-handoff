@@ -23,6 +23,19 @@ On a six-file refactoring task, 30 runs, gpt-oss-20b on a 16 GB card:
 **The code is the reliable part.** When it finishes, the work is correct. What is unreliable is
 everything around reporting on it — which is why the harness reads the tree and not the report.
 
+**Those figures are a six-file refactor of code that already existed.** On a greenfield Laravel
+task — new service, new view, aggregate SQL — the same stack went **0 accepted in 5 rounds**. Do
+not carry the numbers above across task shapes; carry the method instead.
+
+| | six-file refactor | greenfield + aggregate SQL |
+| --- | ---: | ---: |
+| Rounds accepted | 93% within three attempts | **0 of 5** |
+| Best single round | — | 9 of 12 criteria |
+
+What broke there, in order: file corruption on a second edit of a long file (2 of 5, both fatal),
+invented conditions the plan never mentioned (3 of 5), scratch files despite prose forbidding them
+(2 of 5), and silently dropped fields in a contract a later step depended on.
+
 **This is a specific slice, not a general coding agent.** It works for well-specified, mechanically
 checkable changes. It is unproven on ambiguous work, on design decisions, and on tasks where a
 plausible wrong answer looks identical to a right one. Section "Where this stops working" below is

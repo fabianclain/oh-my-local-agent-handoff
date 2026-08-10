@@ -198,7 +198,11 @@ run_verification() {
 
     echo
     echo "==> verifying against HEAD"
-    "$verifier" "$REPO_ROOT" "$plan" HEAD "$out"
+    # The run-start snapshot gives untracked read-only files a baseline. Without it the gate can
+    # only see that they exist, not whether they changed.
+    local snapshot=""
+    [[ ! -s "$RUN_DIR/tree-before" ]] || snapshot="$(cat "$RUN_DIR/tree-before")"
+    "$verifier" "$REPO_ROOT" "$plan" HEAD "$out" "$snapshot"
     local verdict=$?
     echo "==> evidence: ${out#"$REPO_ROOT"/}/evidence.md"
     return "$verdict"
@@ -323,7 +327,9 @@ git diff-tree -r --name-status \
 
 # Verify by default. HANDOFF_NO_VERIFY=1 is for callers that run the same gates themselves —
 # bench/run does — so the work is not done twice inside a benchmark.
-if [[ "$MODE" == "do" && "${HANDOFF_NO_VERIFY:-0}" != 1 ]]; then
+# resume verifies too. It did not, and exited 0 regardless, so a resumed round that the gates
+# would have rejected looked like a pass — and was nearly reported as one.
+if [[ ( "$MODE" == "do" || "$MODE" == "resume" ) && "${HANDOFF_NO_VERIFY:-0}" != 1 ]]; then
     set +e
     run_verification "$SLUG"
     VERDICT=$?
