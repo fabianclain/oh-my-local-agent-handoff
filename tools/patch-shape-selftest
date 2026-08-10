@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+#
+# patch-shape-selftest — check tools/patch-shape against the edits it must accept and reject.
+#
+#   tools/patch-shape-selftest
+#
+# Each case is a specific edit, not a general notion of correctness. Case 5 is the important one:
+# it documents a hole that order-preservation does not close, and shows which guard does.
+
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SHAPE="$HERE/patch-shape"
+WORK="$(mktemp -d)"
+FAILURES=0
+trap 'rm -rf "$WORK"' EXIT
+
+pass() { echo "    PASS: $1"; }
+fail() { echo "    FAIL: $1"; FAILURES=$(( FAILURES + 1 )); }
+
+REPO="$WORK/repo"
+mkdir -p "$REPO"
+cd "$REPO" || exit 1
+git init --quiet .
+git config user.email selftest@example.invalid
+git config user.name selftest
+
+cat >file.php <<'PHP'
+<?php
+
+class Totals
+{
+    private array $lines = [];
+
+    public function addLine(string $name, int $qty): void
+    {
+        $this->lines[] = [$name, $qty];
+    }
+
+    public function subtotal(): int
+    {
+        $total = 0;
+        foreach ($this->lines as [$name, $qty]) {
+            $total += $qty;
+        }
+
+        return $total;
+    }
+}
+PHP
+git add file.php
+git commit --quiet -m base
+BASE="$(git rev-parse HEAD)"
+
+restore() { git checkout --quiet -- file.php; }
+
+echo "==> 1/6 a clean surgical edit is accepted"
+python3 - <<'PY'
+import pathlib
+p = pathlib.Path("file.php")
+s = p.read_text()
+s = s.replace("    private array $lines = [];",
+              "    private array $lines = [];\n\n    private float $rate = 0.0;")
+s = s.replace("        return $total;", "        return (int) ($total * (1 - $this->rate));")
+p.write_text(s)
+PY
+if "$SHAPE" "$BASE" file.php --max-hunks 3 --allow-changed '        return $total;'; then
+    pass "an added property and one changed return line"
+else
+    fail "a legitimate surgical edit was rejected"
+fi
+restore
+
+echo "==> 2/6 deleting an original line is rejected"
+sed -i '/public function addLine/,+3d' file.php
+if "$SHAPE" "$BASE" file.php --allow-changed '        return $total;' 2>"$WORK/err2"; then
+    fail "a deleted method was accepted"
+else
+    grep -q 'removed, altered or reordered' "$WORK/err2" &&
+        pass "reported as removed" || fail "rejected, but not for the right reason"
+fi
+restore
+
+echo "==> 3/6 reordering methods is rejected — the old grep-per-line check passed this"
+python3 - <<'PY'
+import pathlib, re
+p = pathlib.Path("file.php")
+s = p.read_text()
+add = re.search(r"    public function addLine.*?\n    \}\n", s, re.S).group(0)
+sub = re.search(r"    public function subtotal.*?\n    \}\n", s, re.S).group(0)
+p.write_text(s.replace(add, "@@ADD@@").replace(sub, add).replace("@@ADD@@", sub))
+PY
+# Every original line is still present, so a per-line grep sees nothing wrong.
+MISSING=0
+while IFS= read -r l; do grep -qxF -- "$l" file.php || MISSING=1; done < <(git show "$BASE":file.php)
+if [[ "$MISSING" -ne 0 ]]; then
+    fail "the fixture does not reproduce the order-blind case"
+elif "$SHAPE" "$BASE" file.php 2>/dev/null; then
+    fail "a reordered file was accepted"
+else
+    pass "rejected, where a per-line grep sees every line present"
+fi
+restore
+
+echo "==> 4/6 deleting one of two identical lines is rejected"
+printf '\n$x = 0;\n$x = 0;\n' >>file.php
+git add file.php && git commit --quiet -m dup
+DUP_BASE="$(git rev-parse HEAD)"
+python3 -c "
+import pathlib
+p = pathlib.Path('file.php'); s = p.read_text()
+p.write_text(s.replace('\$x = 0;\n\$x = 0;', '\$x = 0;'))"
+MISSING=0
+while IFS= read -r l; do grep -qxF -- "$l" file.php || MISSING=1; done < <(git show "$DUP_BASE":file.php)
+if [[ "$MISSING" -ne 0 ]]; then
+    fail "the fixture does not reproduce the duplicate-blind case"
+elif "$SHAPE" "$DUP_BASE" file.php 2>/dev/null; then
+    fail "a dropped duplicate line was accepted"
+else
+    pass "rejected, where a per-line grep sees the line still present"
+fi
+git checkout --quiet -- file.php
+git reset --quiet --hard "$BASE"
+
+echo "==> 5/6 an insertion between two lines passes the order check — as documented"
+# The failure that motivated all of this: a signature separated from its body, altering neither
+# line. Nothing is removed and nothing is reordered, so order-preservation cannot see it.
+python3 -c "
+import pathlib
+p = pathlib.Path('file.php'); s = p.read_text()
+p.write_text(s.replace('    public function subtotal(): int\n    {',
+                       '    public function subtotal(): int\n\n    // stray comment\n\n    {'))"
+if "$SHAPE" "$BASE" file.php; then
+    pass "order-preservation does not catch it — the limit is real and recorded"
+else
+    fail "it was caught, so the documented limit is wrong and the comment should be corrected"
+fi
+restore
+
+echo "==> 6/6 a scattered change is caught by the hunk bound instead"
+python3 - <<'PY'
+import pathlib
+p = pathlib.Path("file.php")
+lines = p.read_text().splitlines()
+# Six separate insertion points, none of them touching an existing line.
+out = []
+for i, line in enumerate(lines):
+    out.append(line)
+    if i in (2, 4, 6, 9, 12, 15):
+        out.append("    // scattered")
+p.write_text("\n".join(out) + "\n")
+PY
+if "$SHAPE" "$BASE" file.php 2>/dev/null; then
+    : # order check alone accepts it, which is the point of the previous case
+else
+    fail "the order check rejected a pure-insertion change, contradicting case 5"
+fi
+if "$SHAPE" "$BASE" file.php --max-hunks 3 2>"$WORK/err6"; then
+    fail "six insertion points passed a three-hunk bound"
+else
+    grep -q 'changed in [0-9]* places' "$WORK/err6" &&
+        pass "the hunk bound catches what order-preservation cannot" ||
+        fail "rejected, but not by the hunk bound"
+fi
+restore
+
+echo
+if [[ "$FAILURES" -eq 0 ]]; then
+    echo "all checks passed"
+else
+    echo "$FAILURES check(s) failed"
+fi
+exit $(( FAILURES > 0 ? 1 : 0 ))

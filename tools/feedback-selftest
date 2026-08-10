@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+#
+# feedback-selftest — check tools/render-feedback against the failures it exists to avoid.
+#
+#   tools/feedback-selftest
+#
+# Every check below targets one specific way richer repair feedback can go wrong, not "does it
+# broadly work". The distinction matters here: three guards in this harness passed a first test
+# that never reproduced the failure they were written for, and all three were wrong.
+#
+#   1. baseline is unchanged  — `commands` must emit the failing command lines and nothing else.
+#                               If output leaks into the default, every measurement taken before
+#                               this feature becomes incomparable without anyone noticing.
+#   2. failing commands only  — `full` must not quote the output of commands that passed. A wide
+#                               plan runs eleven checks; echoing all of them back buries the one
+#                               that matters.
+#   3. output is capped       — a `php -l` sweep over a broken tree emits hundreds of lines. The
+#                               cap must hold and must say how much it dropped, because a silent
+#                               cut reads as "that was the whole error".
+#   4. diff cuts on a line    — truncating mid-hunk produces a diff that does not apply and does
+#                               not parse. A model handed one tries to reconcile the tree against
+#                               a hunk that never existed.
+#   5. the fence always closes— a diff not ending in a newline once glued the closing fence to its
+#                               last line, which silently swallows the rest of the prompt.
+#   6. no-op is still said    — the "you changed no files" line must survive in both modes; it is
+#                               the only feedback a do-nothing attempt gets.
+#   7. bad settings are loud  — a typo in BENCH_FEEDBACK_DETAIL must fail the run, not silently
+#                               select the baseline and quietly invalidate an A/B arm.
+
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RENDER="$HERE/render-feedback"
+WORK="$(mktemp -d)"
+FAILURES=0
+
+trap 'rm -rf "$WORK"' EXIT
+
+pass() { echo "    PASS: $1"; }
+fail() { echo "    FAIL: $1"; FAILURES=$(( FAILURES + 1 )); }
+
+[[ -x "$RENDER" ]] || { echo "render-feedback is not executable: $RENDER" >&2; exit 1; }
+
+# A verification log in the exact shape bench/run writes: one passing command whose output must
+# never be quoted, and one failing command with more output than the cap allows.
+LOG="$WORK/verification.log"
+{
+    echo 'command 1: php -l ok.php'
+    echo 'No syntax errors detected in ok.php'
+    echo 'exit_code: 0'
+    echo
+    echo 'command 2: php -r "require 1.php;"'
+    for i in $(seq 1 20); do echo "PHP Parse error line $i"; done
+    echo 'exit_code: 1'
+    echo
+} >"$LOG"
+
+DIFF="$WORK/tree.diff"
+{
+    echo 'diff --git a/a.php b/a.php'
+    echo 'index 1111111..2222222 100644'
+    echo '--- a/a.php'
+    echo '+++ b/a.php'
+    echo '@@ -1,3 +1,4 @@'
+    for i in $(seq 1 200); do echo "+    \$line$i = $i;"; done
+} >"$DIFF"
+
+echo "==> 1/7 commands mode emits no captured output"
+OUT="$("$RENDER" "$LOG" "$DIFF" 0 2>&1)"
+if grep -q 'PHP Parse error' <<<"$OUT"; then
+    fail "captured output leaked into the default mode"
+elif grep -q 'What your previous attempt actually changed' <<<"$OUT"; then
+    fail "the diff leaked into the default mode"
+elif grep -qF -- '- FAILED: `php -r "require 1.php;"`' <<<"$OUT"; then
+    pass "only the failing command line, exactly as before"
+else
+    fail "the failing command line is missing"
+    printf '%s\n' "$OUT" | sed 's/^/        /'
+fi
+
+echo "==> 2/7 full mode quotes the failing command's output and not the passing one's"
+OUT="$(BENCH_FEEDBACK_DETAIL=full "$RENDER" "$LOG" "$DIFF" 0 2>&1)"
+if grep -q 'No syntax errors detected' <<<"$OUT"; then
+    fail "a passing command's output was quoted back"
+elif ! grep -q 'PHP Parse error line 1$' <<<"$OUT"; then
+    fail "the failing command's output was not quoted"
+else
+    pass "output is attached to the failure and only the failure"
+fi
+
+echo "==> 3/7 output is capped and says how much it dropped"
+OUT="$(BENCH_FEEDBACK_DETAIL=full BENCH_FEEDBACK_OUTPUT_LINES=5 "$RENDER" "$LOG" "$DIFF" 0 2>&1)"
+SHOWN="$(grep -c 'PHP Parse error line' <<<"$OUT")"
+if [[ "$SHOWN" -ne 5 ]]; then
+    fail "cap of 5 produced $SHOWN quoted lines"
+elif ! grep -q '\.\.\. 15 more lines of output' <<<"$OUT"; then
+    fail "the truncation was silent"
+else
+    pass "5 lines shown, 15 declared dropped"
+fi
+
+echo "==> 4/7 a truncated diff is cut on a line boundary and declared"
+# 300 bytes lands mid-line in the generated diff, which is the point.
+OUT="$(BENCH_FEEDBACK_DETAIL=full BENCH_FEEDBACK_DIFF_BYTES=300 "$RENDER" "$LOG" "$DIFF" 0 2>&1)"
+BODY="$(sed -n '/^```diff$/,/^```$/p' <<<"$OUT" | sed '1d;$d')"
+# Every generated diff line ends in a semicolon, so any added line that does not is a line the
+# cut sliced through. Checked against the body with the marker line removed, otherwise the marker
+# itself would be the finding and a genuine partial line above it would go unnoticed.
+# '^+ ' rather than '^+', so the `+++ b/a.php` file header is not counted as a sliced line.
+PARTIAL="$(sed '$d' <<<"$BODY" | grep -c '^+ .*[^;]$' || true)"
+if ! grep -q 'diff truncated: 300 of [0-9]* bytes shown' <<<"$OUT"; then
+    fail "the diff was truncated without saying so"
+elif [[ "$PARTIAL" -ne 0 ]]; then
+    fail "the cut left $PARTIAL partial line(s) in the diff body"
+elif [[ "$(tail -n 1 <<<"$BODY")" != "... diff truncated: 300 of $(wc -c <"$DIFF" | tr -d ' ') bytes shown" ]]; then
+    fail "the truncation marker is not the last line of the diff body"
+else
+    pass "cut on a line boundary, with the byte counts stated"
+fi
+
+echo "==> 5/7 the closing fence survives a diff with no trailing newline"
+printf 'diff --git a/x b/x\n+no trailing newline' >"$WORK/nonl.diff"
+OUT="$(BENCH_FEEDBACK_DETAIL=full "$RENDER" "$LOG" "$WORK/nonl.diff" 0 2>&1)"
+if grep -q 'no trailing newline```' <<<"$OUT"; then
+    fail "the fence was glued onto the last diff line"
+elif [[ "$(tail -n 1 <<<"$OUT")" != '```' ]]; then
+    fail "the block does not end with a fence"
+else
+    pass "fence closes on its own line"
+fi
+
+echo "==> 6/7 a do-nothing attempt is told so, in both modes"
+CMD_OUT="$("$RENDER" "$LOG" "$DIFF" 1 2>&1)"
+FULL_OUT="$(BENCH_FEEDBACK_DETAIL=full "$RENDER" "$LOG" "$DIFF" 1 2>&1)"
+if ! grep -q 'You changed no files at all' <<<"$CMD_OUT"; then
+    fail "commands mode dropped the no-op line"
+elif ! grep -q 'You changed no files at all' <<<"$FULL_OUT"; then
+    fail "full mode dropped the no-op line"
+else
+    pass "the no-op line is present in both"
+fi
+
+echo "==> 7/7 an invalid setting fails loudly"
+if BENCH_FEEDBACK_DETAIL=verbose "$RENDER" "$LOG" "$DIFF" 0 >/dev/null 2>&1; then
+    fail "an unknown detail level was accepted"
+elif BENCH_FEEDBACK_DIFF_BYTES=0 BENCH_FEEDBACK_DETAIL=full \
+        "$RENDER" "$LOG" "$DIFF" 0 >/dev/null 2>&1; then
+    fail "a zero diff cap was accepted"
+else
+    pass "unknown detail level and zero cap are both rejected"
+fi
+
+echo
+if [[ "$FAILURES" -eq 0 ]]; then
+    echo "all checks passed"
+else
+    echo "$FAILURES check(s) failed"
+fi
+exit $(( FAILURES > 0 ? 1 : 0 ))

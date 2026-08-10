@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+#
+# patch-shape — assert that a change to a tracked file has the shape a surgical plan asked for.
+#
+#   tools/patch-shape <base-ref> <path> [--max-hunks N] [--allow-changed <line>]...
+#
+# Plans currently assert "nothing else changed" with a loop that greps each original line out of
+# the modified file. That check has three holes, and this replaces it:
+#
+#   1. It is order-blind. A file whose methods were shuffled passes, because every line is still
+#      somewhere in it.
+#   2. It is duplicate-blind. A file with two identical lines passes after one of them is deleted.
+#   3. It is quadratic — one grep per original line, over a growing file.
+#
+# The order check here is a diff instead: the original lines that the longest-common-subsequence
+# could not match, in order, must be exactly the lines the plan permitted to change.
+#
+# ---
+#
+# What order-preservation does NOT catch, and why --max-hunks exists.
+#
+# The failure that motivated this was a model splitting a method signature from its body by
+# inserting between two lines, altering neither. Order preservation passes that: nothing was
+# deleted, nothing was reordered, an insertion simply happened in a bad place. So the remedy
+# originally proposed for it does not address it, and saying otherwise would have left the hole
+# open behind a guard that looked like it was closed.
+#
+# What does bound it is the number of insertion points. A plan that asks for a property, a method
+# and one changed return line is asking for a handful of hunks; a change scattered across a dozen
+# places in the file is not that change, whatever the tests say. --max-hunks makes the plan state
+# the number, and the harness enforce it.
+
+set -uo pipefail
+
+usage() {
+    echo "usage: patch-shape <base-ref> <path> [--max-hunks N] [--allow-changed <line>]..." >&2
+}
+
+BASE_REF="${1:-}"
+TARGET="${2:-}"
+[[ -n "$BASE_REF" && -n "$TARGET" ]] || { usage; exit 64; }
+shift 2
+
+MAX_HUNKS=""
+ALLOWED_FILE="$(mktemp)"
+trap 'rm -f "$ALLOWED_FILE" "${ORIGINAL_FILE:-}" "${REMOVED_FILE:-}"' EXIT
+: >"$ALLOWED_FILE"
+
+while (( $# > 0 )); do
+    case "$1" in
+    --max-hunks)
+        [[ $# -ge 2 ]] || { echo "--max-hunks requires a number" >&2; exit 64; }
+        MAX_HUNKS="$2"
+        shift 2
+        ;;
+    --allow-changed)
+        [[ $# -ge 2 ]] || { echo "--allow-changed requires a line" >&2; exit 64; }
+        printf '%s\n' "$2" >>"$ALLOWED_FILE"
+        shift 2
+        ;;
+    *)
+        echo "unknown argument: $1" >&2
+        usage
+        exit 64
+        ;;
+    esac
+done
+
+[[ -z "$MAX_HUNKS" || "$MAX_HUNKS" =~ ^[0-9]+$ ]] || {
+    echo "--max-hunks must be a non-negative integer" >&2
+    exit 64
+}
+[[ -f "$TARGET" ]] || { echo "patch-shape: no such file: $TARGET" >&2; exit 1; }
+
+git cat-file -e "$BASE_REF:$TARGET" 2>/dev/null || {
+    echo "patch-shape: $TARGET is not tracked at $BASE_REF" >&2
+    exit 1
+}
+
+ORIGINAL_FILE="$(mktemp)"
+REMOVED_FILE="$(mktemp)"
+git show "$BASE_REF:$TARGET" >"$ORIGINAL_FILE"
+
+# Original lines the diff could not match in place: deleted, altered, or moved. Insertions produce
+# nothing here, which is the documented limit of this check.
+diff --old-line-format='%L' --new-line-format='' --unchanged-line-format='' \
+    "$ORIGINAL_FILE" "$TARGET" >"$REMOVED_FILE"
+
+STATUS=0
+
+while IFS= read -r line; do
+    [[ -n "${line//[[:space:]]/}" ]] || continue
+    grep -qxF -- "$line" "$ALLOWED_FILE" && continue
+    if [[ "$STATUS" -eq 0 ]]; then
+        echo "patch-shape: original lines were removed, altered or reordered in $TARGET:" >&2
+    fi
+    printf '  %s\n' "$line" >&2
+    STATUS=1
+done <"$REMOVED_FILE"
+
+if [[ -n "$MAX_HUNKS" ]]; then
+    # --unified=0 so adjacent edits are not merged into one hunk by shared context, which would
+    # let a scattered change report a small number.
+    HUNKS="$(git diff --unified=0 "$BASE_REF" -- "$TARGET" | grep -c '^@@' || true)"
+    if (( HUNKS > MAX_HUNKS )); then
+        echo "patch-shape: $TARGET changed in $HUNKS places, at most $MAX_HUNKS allowed" >&2
+        STATUS=1
+    fi
+fi
+
+exit "$STATUS"

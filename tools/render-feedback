@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+#
+# render-feedback — build the message a repair attempt is given about the attempt before it.
+#
+#   tools/render-feedback <verification.log> <tree.diff|-> <did-nothing 0|1>
+#
+# Reads BENCH_FEEDBACK_DETAIL, BENCH_FEEDBACK_OUTPUT_LINES and BENCH_FEEDBACK_DIFF_BYTES from the
+# environment and writes the feedback to stdout.
+#
+# This lives outside bench/run so that tools/feedback-selftest exercises the code the benchmark
+# actually runs. Several guards in this project passed their first test vacuously because the test
+# checked a transcription of the logic rather than the logic, and each of those was wrong.
+#
+# Everything rendered here is harness-owned: commands the harness ran, output it captured, and a
+# diff it took from the tree. The model's own report is deliberately excluded. It is the least
+# reliable artifact in a run, and quoting it back invites the model to believe its earlier claims
+# about work it did not do.
+
+set -euo pipefail
+
+VERIFICATION_LOG="${1:?usage: render-feedback <verification.log> <tree.diff|-> <did-nothing>}"
+TREE_DIFF="${2:--}"
+DID_NOTHING="${3:-0}"
+
+DETAIL="${BENCH_FEEDBACK_DETAIL:-commands}"
+OUTPUT_LINES="${BENCH_FEEDBACK_OUTPUT_LINES:-12}"
+DIFF_BYTES="${BENCH_FEEDBACK_DIFF_BYTES:-24000}"
+
+[[ "$DETAIL" == commands || "$DETAIL" == full ]] || {
+    echo "BENCH_FEEDBACK_DETAIL must be 'commands' or 'full'" >&2
+    exit 64
+}
+[[ "$OUTPUT_LINES" =~ ^[0-9]+$ ]] || {
+    echo "BENCH_FEEDBACK_OUTPUT_LINES must be a non-negative integer" >&2
+    exit 64
+}
+[[ "$DIFF_BYTES" =~ ^[1-9][0-9]*$ ]] || {
+    echo "BENCH_FEEDBACK_DIFF_BYTES must be a positive integer" >&2
+    exit 64
+}
+[[ -r "$VERIFICATION_LOG" ]] || {
+    echo "verification log not readable: $VERIFICATION_LOG" >&2
+    exit 1
+}
+
+echo "These acceptance checks FAILED when the harness ran them:"
+echo
+
+# The log is a flat sequence of `command N: ...`, its output, then `exit_code: N`. Output is
+# buffered per command and printed only for the ones that failed, so a passing command's noise
+# never reaches the model.
+awk -v detail="$DETAIL" -v maxlines="$OUTPUT_LINES" '
+    /^command [0-9]+: / {
+        cmd = $0
+        sub(/^command [0-9]+: /, "", cmd)
+        captured = 0
+        next
+    }
+    /^exit_code: / {
+        if ($2 != 0) {
+            print "- FAILED: `" cmd "`"
+            if (detail == "full") {
+                shown = (captured > maxlines ? maxlines : captured)
+                for (i = 1; i <= shown; i++) { print "      " line[i] }
+                if (captured > shown) {
+                    printf "      ... %d more lines of output\n", captured - shown
+                }
+            }
+        }
+        captured = 0
+        next
+    }
+    NF { line[++captured] = $0 }
+' "$VERIFICATION_LOG"
+
+[[ "$DID_NOTHING" -eq 0 ]] || echo "- You changed no files at all. The task is not done."
+
+# The diff is evidence, not instruction. A model that reads it as "here is your work, preserve it"
+# will defend a broken approach rather than replace it, so the framing states what it is and
+# explicitly declines to require anything of it.
+if [[ "$DETAIL" == full && "$TREE_DIFF" != - && -s "$TREE_DIFF" ]]; then
+    TOTAL="$(wc -c <"$TREE_DIFF" | tr -d ' ')"
+    echo
+    echo "## What your previous attempt actually changed"
+    echo
+    echo "This is the working tree diffed against the commit you started from — what you did, as"
+    echo "opposed to what you believe you did. It is evidence, not instruction; nothing here has"
+    echo "to be kept."
+    echo
+    echo '```diff'
+    if (( TOTAL > DIFF_BYTES )); then
+        # Cut on a line boundary. A half-written hunk header reads as a corrupt diff, and a model
+        # that treats it as real will try to reconcile the tree against a hunk that never existed.
+        head -c "$DIFF_BYTES" "$TREE_DIFF" | sed '$d'
+        printf '... diff truncated: %s of %s bytes shown\n' "$DIFF_BYTES" "$TOTAL"
+    else
+        cat "$TREE_DIFF"
+        # A diff whose final byte is not a newline would otherwise have the closing fence glued
+        # onto its last line, which makes the fence invisible and the rest of the prompt part of
+        # the code block.
+        [[ "$(tail -c 1 "$TREE_DIFF" | od -An -tx1 | tr -d ' \n')" == 0a ]] || echo
+    fi
+    echo '```'
+fi
