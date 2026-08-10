@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""handoff-report-mcp — receive the completion report as a tool call, not as text.
+
+An MCP server exposing exactly one tool, `submit_handoff_report`, whose input schema *is* the
+handoff report schema. Registered with Cline once:
+
+    cline mcp install handoff-report --yes --transport stdio --config <dir> \\
+        -- python3 /path/to/tools/handoff-report-mcp
+
+## Why this exists
+
+The largest non-success outcome measured in this project is a correct patch with no report: on the
+six-file plan it happens to roughly one run in three. The cause is not the model failing to write
+JSON — it is the model ending its turn without emitting a text block at all. Meanwhile the same
+model emits tool calls reliably: 14 of 14 well formed at the engine level, including a ~1 KB
+freeform payload after a 20 KB tool result.
+
+So the report should travel by the mechanism that works.
+
+## Why a tool and not a file
+
+Writing the report to a file with the ordinary file tool — the first version of this idea — moves
+the *transport* onto the tool-call path but leaves the payload as free text the model still has to
+get right. A dedicated tool puts the report schema in the tool's `inputSchema`, so the arguments
+are structured by construction and the server receives an object rather than a string it has to
+hope parses.
+
+## Where the report goes
+
+`HANDOFF_REPORT_PATH` if set, otherwise `.handoff/runs/mcp-report.json` under the working
+directory. The server writes it and nothing else; deciding whether the work is acceptable belongs
+to the harness, which reads the tree.
+
+The file is deleted by the caller before each attempt, never by this server — a stale report that
+survived into the next attempt would credit the model for one it never wrote, which is the exact
+fabrication the gates exist to catch.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import sys
+
+PROTOCOL_VERSION = "2024-11-05"
+
+SCHEMA_PATH = pathlib.Path(__file__).resolve().parent.parent / "schemas" / "handoff.schema.json"
+
+
+def report_path() -> pathlib.Path:
+    override = os.environ.get("HANDOFF_REPORT_PATH")
+    if override:
+        return pathlib.Path(override)
+    return pathlib.Path.cwd() / ".handoff" / "runs" / "mcp-report.json"
+
+
+def load_schema() -> dict:
+    try:
+        return json.loads(SCHEMA_PATH.read_text())
+    except Exception:
+        # Degrade to accepting an object rather than refusing to start. A server that will not
+        # come up removes the tool entirely, and the model then silently falls back to prose —
+        # the failure this exists to prevent.
+        return {"type": "object"}
+
+
+def send(message: dict) -> None:
+    sys.stdout.write(json.dumps(message) + "\n")
+    sys.stdout.flush()
+
+
+def result(request_id, payload: dict) -> None:
+    send({"jsonrpc": "2.0", "id": request_id, "result": payload})
+
+
+def main() -> int:
+    schema = load_schema()
+    tool = {
+        "name": "submit_handoff_report",
+        "description": (
+            "Submit your completion report for this task. Call this exactly once, when the "
+            "implementation work is finished and you have run the plan's verification commands. "
+            "Report only what you actually observed: never claim a command passed unless you ran "
+            "it and saw it pass."
+        ),
+        "inputSchema": schema,
+    }
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            message = json.loads(line)
+        except ValueError:
+            continue
+
+        method = message.get("method")
+        request_id = message.get("id")
+
+        if method == "initialize":
+            # Echo the client's protocol version when it names one. A server that insists on its
+            # own version is refused by clients that speak a newer one, and the tool vanishes
+            # without an error anyone sees.
+            asked = (message.get("params") or {}).get("protocolVersion") or PROTOCOL_VERSION
+            result(request_id, {
+                "protocolVersion": asked,
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "handoff-report", "version": "1.0.0"},
+            })
+        elif method == "tools/list":
+            result(request_id, {"tools": [tool]})
+        elif method == "tools/call":
+            params = message.get("params") or {}
+            if params.get("name") != "submit_handoff_report":
+                result(request_id, {
+                    "content": [{"type": "text", "text": f"unknown tool: {params.get('name')}"}],
+                    "isError": True,
+                })
+                continue
+            arguments = params.get("arguments")
+            if not isinstance(arguments, dict):
+                result(request_id, {
+                    "content": [{"type": "text",
+                                 "text": "arguments must be an object matching the report schema"}],
+                    "isError": True,
+                })
+                continue
+            target = report_path()
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(json.dumps(arguments, indent=2))
+            except OSError as error:
+                result(request_id, {
+                    "content": [{"type": "text", "text": f"could not write the report: {error}"}],
+                    "isError": True,
+                })
+                continue
+            result(request_id, {
+                "content": [{"type": "text", "text": "Report received. The task is complete; stop here."}]
+            })
+        elif request_id is not None:
+            # Any other request gets a well-formed empty result rather than silence, so a client
+            # probing for capabilities does not hang waiting.
+            result(request_id, {})
+        # Notifications carry no id and get no response, by protocol.
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

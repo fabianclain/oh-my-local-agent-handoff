@@ -128,6 +128,7 @@ _cline_assert_repo_root() {
 #
 #   message  (default)  the model's final assistant message must be the JSON object
 #   file                the model writes the JSON to a path with its file tool
+#   tool                the model calls an MCP tool whose input schema IS the report schema
 #
 # The case for `file` is mechanical rather than aesthetic. This model emits tool calls reliably —
 # 14 of 14 well formed at the engine level, including a ~1 KB freeform payload after a 20 KB tool
@@ -149,6 +150,15 @@ _cline_build_prompt() {
     local dev="$1" prompt="$2" schema="$3" report_rel="${4:-}"
     local compact
     compact="$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])),separators=(",",":")))' "$schema")"
+
+    if [[ "$report_rel" == "tool:"* ]]; then
+        # The schema is carried by the tool's inputSchema, so it is not repeated here. Restating
+        # it invites the model to answer in prose that happens to match, which is the failure the
+        # tool channel exists to remove.
+        printf '%s\n\n%s\n\nWhen the work is finished, report by calling the `submit_handoff_report` tool. Its arguments are the report. Do not put the report in your reply, and do not write it to a file — one call to that tool ends the task.\n' \
+            "$dev" "$prompt"
+        return
+    fi
 
     if [[ -n "$report_rel" ]]; then
         # The path is under .handoff/runs, which every scope and litter gate already excludes, so
@@ -244,12 +254,23 @@ _cline_prompt_validate() {
     # which every scope and litter gate excludes. Removed first: a stale file from a previous
     # attempt would otherwise be read as this attempt's report — the model would get credit for a
     # report it never wrote, which is precisely the fabrication the gates exist to catch.
-    local report_abs="" report_rel=""
-    if [[ "$(_cline_report_channel)" == file ]]; then
+    local report_abs="" report_rel="" channel
+    channel="$(_cline_report_channel)"
+    case "$channel" in
+    file)
         report_abs="$(dirname "$result")/agent-report.json"
         report_rel="${report_abs#"$root"/}"
         rm -f "$report_abs"
-    fi
+        ;;
+    tool)
+        # The MCP server writes here. Exported rather than passed, because Cline spawns the server
+        # and it inherits the environment — verified before this path was relied on.
+        report_abs="$(dirname "$result")/agent-report.json"
+        report_rel="tool:"
+        rm -f "$report_abs"
+        export HANDOFF_REPORT_PATH="$report_abs"
+        ;;
+    esac
 
     local base_prompt; base_prompt="$(_cline_build_prompt "$dev" "$prompt" "$schema" "$report_rel")"
     CLINE_LIVE_LOG="$log" _cline_invoke "$root" "$raw" "$base_prompt" "$session"
