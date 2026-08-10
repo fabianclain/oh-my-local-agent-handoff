@@ -233,7 +233,7 @@ CRITERIA_TOTAL="$(wc -l <"$CRITERIA_FILE" | tr -d ' ')"
 # Verification commands are executable plan data. Restrict extraction to the fenced block under
 # its heading so examples elsewhere in a plan can never be run by accident.
 awk '
-    /^## Verification[[:space:]]*$/ { in_section=1; next }
+    /^## Verification([[:space:]]+commands)?[[:space:]]*$/ { in_section=1; next }
     in_section && /^```/ {
         if (in_block) exit
         in_block=1
@@ -434,7 +434,7 @@ capture_tree_artifacts() {
         cp "$after" "$result_dir/tree-after"
         git -C "$tree" diff-tree -r -p --binary "$(cat "$before")" "$(cat "$after")" -- \
             . "${excludes[@]}" >"$result_dir/tree.diff"
-        git -C "$tree" diff-tree -r --name-only "$(cat "$before")" "$(cat "$after")" -- \
+        git -C "$tree" -c core.quotePath=false diff-tree -r --name-only "$(cat "$before")" "$(cat "$after")" -- \
             . "${excludes[@]}" | sort -u >"$result_dir/tree-files.txt"
         return
     fi
@@ -445,10 +445,10 @@ capture_tree_artifacts() {
         ':(exclude).handoff/runs/**' \
         ":(exclude).handoff/plans/$PLAN.md" >"$result_dir/tree.diff"
     {
-        git -C "$tree" diff --name-only "$BASE_COMMIT" -- . \
+        git -C "$tree" -c core.quotePath=false diff --name-only "$BASE_COMMIT" -- . \
             ':(exclude).handoff/runs/**' \
             ":(exclude).handoff/plans/$PLAN.md"
-        git -C "$tree" ls-files --others --exclude-standard |
+        git -C "$tree" -c core.quotePath=false ls-files --others --exclude-standard |
             awk -v plan=".handoff/plans/$PLAN.md" '
                 $0 != plan && $0 !~ /^\.handoff\/runs\// { print }
             '

@@ -35,7 +35,7 @@ criteria_count() { grep -cE '^- \[ \]' "$1" 2>/dev/null; true; }
 
 verification_commands() {
     awk '
-        /^## Verification[[:space:]]*$/ { in_section=1; next }
+        /^## Verification([[:space:]]+commands)?[[:space:]]*$/ { in_section=1; next }
         in_section && /^```/ {
             if (in_block) exit
             in_block=1

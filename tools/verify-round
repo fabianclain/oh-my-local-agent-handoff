@@ -136,8 +136,18 @@ while IFS= read -r marker; do
     EXCLUDES+=(":(exclude)$(dirname "${marker#./}")/**")
 done < <(cd "$WORKTREE" && find .handoff -name evidence.jsonl -maxdepth 4 2>/dev/null)
 {
-    git diff --name-only "$BASE_COMMIT" -- . "${EXCLUDES[@]}"
-    git ls-files --others --exclude-standard -- . "${EXCLUDES[@]}"
+# -c core.quotePath=false, on every command whose OUTPUT is a path.
+#
+# git quotes non-ASCII bytes as octal escapes and wraps the path in double quotes, so a file named
+# ⚡rankings.blade.php comes back as "resources/views/pages/\342\232\241rankings.blade.php" and
+# matches nothing in the plan's Files-to-touch list. Reported from real use: every Livewire page in
+# that project is named ⚡*.blade.php, so any UI plan had its own new view reported as invented.
+#
+# This does not make the output fully safe — a path containing a space or a newline is still
+# quoted — but those cannot be expressed in the plan's table either, so they are a separate
+# problem. Non-ASCII filenames are ordinary and were silently broken.
+    git -c core.quotePath=false diff --name-only "$BASE_COMMIT" -- . "${EXCLUDES[@]}"
+    git -c core.quotePath=false ls-files --others --exclude-standard -- . "${EXCLUDES[@]}"
 } 2>/dev/null | sort -u >"$CHANGED"
 
 if [[ ! -s "$CHANGED" ]]; then
@@ -165,7 +175,7 @@ fi
 # --- the plan's own acceptance commands -------------------------------------------------------
 VERIFY_CMDS="$OUT_DIR/commands.txt"
 awk '
-    /^## Verification[[:space:]]*$/ { in_section=1; next }
+    /^## Verification([[:space:]]+commands)?[[:space:]]*$/ { in_section=1; next }
     in_section && /^```/ { if (in_block) exit; in_block=1; next }
     in_block && NF { print }
 ' "$PLAN_FILE" >"$VERIFY_CMDS"
@@ -201,11 +211,55 @@ awk '
     }
 ' "$PLAN_FILE" >"$ALLOWED"
 
+# Files the plan names as present-but-off-limits.
+#
+# `## Files to touch` is overloaded: it means both "may change" and "should change", and there was
+# no way to say "this file is relevant and must not be edited". Reported from real use — a reviewer
+# who writes the tests before the run had to list them as touchable purely to stop the scope gate
+# calling them invented, which then licensed the implementer to edit the very tests judging it.
+#
+# A file listed here may exist and be read, and MUST come back byte-identical.
+PROTECTED="$OUT_DIR/protected.txt"
+awk '
+    /^## Files to read, not modify[[:space:]]*$/ { in_section=1; next }
+    in_section && /^## / { exit }
+    in_section && /^\|/ {
+        split($0, cells, "|"); path=cells[2]
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", path); gsub(/`/, "", path)
+        if (path != "Path" && path !~ /^-+$/ && path != "") print path
+    }
+    in_section && /^- / {
+        path=$0; sub(/^- +/, "", path); gsub(/`/, "", path)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", path)
+        if (path != "") print path
+    }
+' "$PLAN_FILE" >"$PROTECTED"
+
+if [[ -s "$PROTECTED" ]]; then
+    PROT_OUT="$OUT_DIR/protected.log"; : >"$PROT_OUT"; TOUCHED_PROTECTED=0
+    while IFS= read -r file; do
+        [[ -n "$file" ]] || continue
+        if grep -Fqx -- "$file" "$CHANGED"; then
+            echo "changed, but the plan marked it read-only: $file" >>"$PROT_OUT"
+            TOUCHED_PROTECTED=$(( TOUCHED_PROTECTED + 1 ))
+        fi
+    done <"$PROTECTED"
+    if [[ "$TOUCHED_PROTECTED" -gt 0 ]]; then
+        record "read-only" "fail" \
+            "$TOUCHED_PROTECTED file(s) the plan marked read-only were modified" "" "$PROT_OUT"
+    else
+        record "read-only" "pass" \
+            "$(grep -c . "$PROTECTED") file(s) marked read-only came back untouched"
+    fi
+fi
+
 if [[ -s "$ALLOWED" ]]; then
     SCOPE_OUT="$OUT_DIR/scope.log"; : >"$SCOPE_OUT"; OUT_OF_SCOPE=0; LITTER=0
     while IFS= read -r file; do
         [[ -n "$file" ]] || continue
         grep -Fqx -- "$file" "$ALLOWED" && continue
+        # Named read-only: not invented, and already judged by the read-only gate above.
+        grep -Fqx -- "$file" "$PROTECTED" 2>/dev/null && continue
         OUT_OF_SCOPE=$(( OUT_OF_SCOPE + 1 ))
         if git cat-file -e "$BASE_COMMIT:$file" 2>/dev/null; then
             echo "modified out of scope: $file" >>"$SCOPE_OUT"
@@ -301,7 +355,8 @@ rows = [json.loads(line) for line in open(evidence_path) if line.strip()]
 # accepted patch is one they actually want.
 def is_advisory(row):
     gate = row["gate"]
-    return not (gate == "acceptance" or gate.startswith("acceptance-") or gate == "scope")
+    return not (gate == "acceptance" or gate.startswith("acceptance-")
+                or gate == "scope" or gate == "read-only")
 
 for row in rows:
     row["advisory"] = is_advisory(row)

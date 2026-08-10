@@ -10,114 +10,130 @@ You design and specify. A local model (gpt-oss-20b on this machine) writes the c
 decides whether the result is acceptable — not you, and never the model's own report.
 
 Your job is the part the local model cannot do: turning a request into a specification whose every
-claim is mechanically checkable. That is the whole value here, and the measured bottleneck.
+claim is mechanically checkable. That is the measured bottleneck.
 
 ## When this is the right tool
 
-**Good fit** — well-specified, mechanically checkable changes: adding a method with dictated
-behaviour, threading a parameter through, a contained refactor, anything where "did it work?" can
-be answered by running a command.
+**Good fit** — a contained change to code that already exists, with dictated signatures: adding a
+method with specified behaviour, threading a parameter through, a pure service class, anything
+where "did it work?" is answered by running a command.
 
-**Bad fit** — say so and offer to do it yourself instead:
+**Split it, do not attempt it whole** — greenfield work, and anything mixing a service with a view.
+The measured figures below come from a six-file *refactor*; creating new files from a spec is a
+different shape with more freedom and far more surface to fake. Views are the worst case: a
+three-line template can satisfy a text assertion while containing nothing real. Do the pure,
+testable part as one round gated on its own tests, then the view as a second round gated on
+rendering tests.
+
+**Do it yourself instead** — and say so:
 
 - Ambiguous requirements, or work needing design decisions. The implementer executes; it does not
   design. Difficulty must mean *more work*, not *more decisions*.
-- Anything where a plausible wrong answer looks identical to a right one: money, dates, aggregate
-  SQL, permissions, concurrency. This has never been measured and is where a local model is most
+- Anything where a plausible wrong answer is indistinguishable from a right one: money, dates,
+  aggregate SQL, permissions, concurrency. Never measured here, and where a local model is most
   dangerous.
-- Sprawling changes with no clear file list.
 
-## What to expect, measured
+## What to expect
 
-~78% work on the first attempt, ~93% within three, roughly five minutes each. About **one run in
-three produces a correct patch with no report at all** — that is normal, not a failure. Judge the
+~78% work on the first attempt, ~93% within three, roughly five minutes each — **on refactors**.
+About one run in three produces a correct patch with no report at all. That is normal. Judge the
 tree.
 
 ## The procedure
 
 ### 1. Understand the request before specifying it
 
-Ask about anything that would change the code, and stop asking once the answer would not. Boundary
-and zero cases matter most: "what happens with no rows?" has caught more defects here than any
-other question. Read the files you intend to name.
+Ask about anything that would change the code; stop when the answer would not. Boundary and zero
+cases matter most. Read the files you intend to name.
 
-### 2. Make sure the project is wired up
+### 2. Wire the project up
 
-```bash
-handoff init
+`handoff init` — idempotent, safe on a configured project.
+
+### 3. Write the tests yourself, before the run
+
+**This is the highest-leverage rule here.** If the implementer writes both the code and the test
+that judges it, they agree with each other and are wrong together. A hand-written expectation of
+`fresh: 6, stale: 1` caught an invented freshness rule; a model-authored test would have asserted
+`fresh: 0, stale: 7` and passed green.
+
+For anything numeric or stateful, write the assertions first, with the numbers you worked out
+yourself. Then list those files under `## Files to read, not modify` so the implementer cannot
+edit them:
+
+```markdown
+## Files to read, not modify
+
+| Path | Why |
+| --- | --- |
+| `tests/Feature/RankingTest.php` | written by the reviewer; it judges this change |
 ```
 
-Idempotent, and safe on a project that is already set up. It creates the plans directory, copies a
-config template if there is none, and adds gitignore entries — skipping any path the project
-already tracks, because a project can legitimately keep plans under `.claude` and ignoring it there
-would quietly stop new plans being added.
+The harness fails the round if a file listed there comes back modified.
 
-If `handoff` is not found, the agent-handoff checkout's `bin/` is not on PATH.
+### 4. Write the plan
 
-### 3. Write the plan
+Plans go where `.handoff/config.sh` says. Shape from `templates/plan.md`.
 
-Plans live where `.handoff/config.sh` says (`HANDOFF_PLANS_DIR`), commonly `.handoff/plans/<slug>.md`
-or `.claude/plans/<slug>.md`. Copy the shape from `templates/plan.md` in the agent-handoff
-checkout.
-
-Four rules. The first is enforced; the rest decide whether the verdict is worth anything:
-
-1. **One acceptance criterion, exactly one executable command, same order.** The harness refuses a
-   plan whose counts disagree — a plan with six criteria and two commands caps every run at 2/6.
-2. **Dictate the signatures.** Give exact method names, parameters and return types.
-3. **Cover the boundary and the zero case**, each as its own criterion.
-4. **Name every file in `## Files to touch`**, and assert the count in a command:
+1. **One acceptance criterion, exactly one executable command, same order.** Enforced.
+2. **Dictate the signatures** — exact names, parameters, return types.
+3. **Assert against a stub, not against nothing.** The bar is not "would a do-nothing tree fail" —
+   it is "would a *stub* fail". Four of ten criteria once passed against a three-line blade whose
+   own comment said it only needed to render the string above. A single `assertSee('Rankings v2')`
+   is indistinguishable from a real page. Assert what a stub cannot fake: the component type,
+   several independent strings, a computed value, and the *absence* of placeholder markers.
+4. **Name every file**, and assert the count:
    `test "$(git status --porcelain -- . ':(exclude).handoff' | wc -l)" -eq N`
+5. **Anything you are tempted to repeat or bold needs a command instead.** Prose emphasis is not a
+   control. A route-ordering constraint stated twice, in two sections, was still violated; what
+   caught it was an acceptance command returning 404. If you find yourself writing "remember to",
+   you have found a missing criterion.
 
-Write commands that a do-nothing tree would fail. `php -l` on an unmodified file passes and
-measures nothing; make the criterion assert behaviour instead.
+### 5. Check it
 
-### 4. Check it before running
+`handoff check <slug>`. Fix what it rejects; read the advisories. Acceptance is not quality.
 
-```bash
-handoff check <slug>
-```
-
-Fix everything it rejects. Take its advisories seriously — they are the difference between a plan
-that runs and a plan whose verdict means something. Acceptance is not quality.
-
-### 5. Run it
+### 6. Run it
 
 ```bash
-HANDOFF_PROVIDER=local handoff do <slug>
+HANDOFF_PROVIDER=local handoff do <slug> >/tmp/run.log 2>&1; echo "verdict exit=$?"
 ```
 
-Five to twenty minutes. It implements, then verifies, and its **exit status is the harness's
-verdict** — 0 means the gates accepted the tree even if the model's report was missing.
+**Redirect; do not pipe.** `handoff do x | tail` returns *tail's* exit status, not the verdict, and
+that has already caused a failing round to be reported as passing.
 
-### 6. Report what actually happened
-
-Read `.handoff/runs/<slug>/evidence/evidence.md` and `handoff diff <slug>`. Then tell the user:
-
-- the verdict and which gates failed, if any
-- what actually changed, from the diff
-- any **advisory** findings — they do not reject but often matter
-- anything under **"Not checked"** — absence of a failure there is not evidence of correctness
-
-**Never repeat the model's report as if it were fact.** It is untrusted metadata: reports here have
-claimed success over trees that were never touched. If the gates accept and the report is missing,
-say the patch is good and the report is missing.
-
-The implementer never commits. Leave that to the user.
-
-### 7. When the gates reject
-
-Read the failing command's output in the evidence bundle first. Usual causes, in order: the plan
-was ambiguous, an acceptance command was wrong, or the model got it wrong. Fix the plan and re-run
-rather than patching the code by hand — if the plan was wrong, the next run repeats the mistake.
-
-## Setup, if it is not working
+**Isolation.** The implementer runs arbitrary commands in the live working tree with approval
+disabled. One run wrote a bootstrap script that booted the real application against the real
+database. If the project has live services, a shared SQLite file, or anything else with side
+effects, run it in a scratch worktree instead:
 
 ```bash
-tools/setup-local-implementer     # from the agent-handoff checkout
+git worktree add ../scratch-<slug> -b <slug>
 ```
 
-It probes the stack with a real tool call and refuses rather than half-succeeding. If `handoff` is
-not found, the checkout's `bin/` is not on PATH.
+and work there. Nothing in the harness does this for you.
 
-Full guide: `docs/START-HERE.md` in the agent-handoff checkout.
+### 7. Report what actually happened
+
+Read `.handoff/runs/<slug>/evidence/evidence.md` and `handoff diff <slug>`. Report the verdict,
+which gates failed, what changed from the diff, any **advisory** findings, and anything under
+**"Not checked"** — absence of failure there is not evidence of correctness.
+
+**Never repeat the model's report as fact.** Reports have claimed success over untouched trees. If
+the gates accept and the report is missing, say the patch is good and the report is missing.
+
+The implementer never commits.
+
+### 8. When the gates reject
+
+Read the failing command's output first. Usual causes in order: the plan was ambiguous, an
+acceptance command was wrong, the model got it wrong. Fix the plan and re-run rather than patching
+by hand.
+
+**After two failed rounds, split the task rather than attempting a third.** Two rounds failing the
+same way is evidence about the task's shape, not about the model.
+
+## Setup
+
+`tools/setup-local-implementer` from the agent-handoff checkout. `llama-server` does not survive a
+reboot: `tools/llamacpp-serve start gpt-oss-20b 65536`. Full guide: `docs/START-HERE.md`.

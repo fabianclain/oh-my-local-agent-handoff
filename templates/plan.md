@@ -70,6 +70,16 @@ the finished version once.
 Before finishing, read back each file you changed and confirm it contains exactly one
 implementation and no trace of how you got there.
 
+## Files to read, not modify
+
+Optional. Files the implementer may read and must not change — the harness fails the round if any
+of them comes back modified. Put the tests you wrote yourself here: if the implementer can edit the
+test that judges it, the test is not judging anything.
+
+| Path | Why |
+| --- | --- |
+| `tests/Feature/ExampleTest.php` | written by the reviewer; it judges this change |
+
 ## Acceptance criteria
 
 Each item must be objectively checkable. Codex reports `complete` only when every box is true.
@@ -81,7 +91,7 @@ Include at least one criterion per non-trivial state listed above — especially
 - [ ] `<your test command>` passes
 - [ ] `<your formatter>` leaves no changes
 
-## Verification commands
+## Verification
 
 ```bash
 <your test command>
