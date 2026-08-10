@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+#
+# verifier-selftest — the verifier and the driver, against the failures they exist for.
+#
+#   tools/verifier-selftest
+#
+# tools/harness-selftest covers bench/run. This covers tools/verify-round and bin/handoff, which
+# are what real use touches. Every case below is a bug that reached a user, not a hypothetical.
+#
+#   1. non-ASCII paths      git quotes ⚡ as \342\232\241, so a legitimately created Livewire view
+#                           was reported as invented. Every UI plan in that project failed on its
+#                           own new file.
+#   2. read-only, tracked   a file the plan marks read-only must fail the round if modified —
+#                           this is what stops a model editing the tests that judge it.
+#   3. read-only, untracked a reviewer-written test is usually uncommitted. Asking "does it appear
+#                           in the changed list" is true of every untracked file, so the first
+#                           version failed every such test on sight.
+#   4. read-only, no base   with nothing to compare against, the gate must report `skipped`. A
+#                           pass it cannot support is worse than an absent check.
+#   5. verdict vs advisory  the verdict is the plan's commands plus scope and read-only. Everything
+#                           else reports without a vote, because across 68 bundles the harness's
+#                           own opinions caught one thing the plan had not.
+#   6. exit status          the gates decide in BOTH directions. A provider that fails over a tree
+#                           the gates accept is a success: a third of runs produce a correct patch
+#                           with no report, and rejecting those would teach a script to bin them.
+#   7. init is safe         `handoff init` must never ignore a path the project tracks. It added
+#                           .claude/ to a repo tracking 48 plans under .claude/plans.
+#   8. resume verifies      it did not, and exited 0 regardless, so a resumed round the gates would
+#                           have rejected looked like a pass.
+
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$HERE/.." && pwd)"
+V="$HERE/verify-round"
+SANDBOX="$(mktemp -d)"
+FAILURES=0
+trap 'rm -rf "$SANDBOX"' EXIT
+
+pass() { echo "    PASS: $1"; }
+fail() { echo "    FAIL: $1"; FAILURES=$(( FAILURES + 1 )); }
+
+# A throwaway project with one source file and one reviewer-written test.
+new_project() {
+    local root="$SANDBOX/$1"; shift
+    mkdir -p "$root/src" "$root/tests" "$root/.handoff/plans"
+    ( cd "$root" && git init --quiet . && git config user.email a@b.c && git config user.name t
+      printf '<?php\nclass S\n{\n    public function v(): int\n    {\n        return 1;\n    }\n}\n' > src/S.php
+      git add -A && git commit --quiet -m init ) >/dev/null
+    echo "$root"
+}
+
+snapshot() {  # the tree object bin/handoff records before a run
+    ( cd "$1" && idx="$(mktemp)" && rm -f "$idx" &&
+      GIT_INDEX_FILE="$idx" git add -A >/dev/null &&
+      GIT_INDEX_FILE="$idx" git write-tree && rm -f "$idx" )
+}
+
+verdict_of() { python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['verdict'])" "$1"; }
+gate_status() {
+    python3 -c "
+import json,sys
+d=json.load(open(sys.argv[1]))
+print(next((g['status'] for g in d['gates'] if g['gate']==sys.argv[2]), 'absent'))" "$1" "$2"
+}
+
+echo "==> 1/8 a non-ASCII filename the plan names is not 'invented'"
+R="$(new_project ascii)"
+mkdir -p "$R/resources/views/pages"
+printf '<div>x</div>\n' > "$R/resources/views/pages/⚡rankings.blade.php"
+cat > "$R/.handoff/plans/p.md" <<'PLAN'
+# add the view
+## Files to touch
+| Path | Action |
+| --- | --- |
+| `resources/views/pages/⚡rankings.blade.php` | create |
+## Acceptance criteria
+- [ ] the view exists
+## Verification
+```bash
+test -f 'resources/views/pages/⚡rankings.blade.php'
+```
+## Out of scope
+Anything else.
+PLAN
+"$V" "$R" "$R/.handoff/plans/p.md" HEAD "$R/.handoff/e" >/dev/null 2>&1
+if [[ "$(verdict_of "$R/.handoff/e/evidence.json")" == ACCEPT ]]; then
+    pass "⚡ path matched the plan"
+else
+    fail "a ⚡ path the plan names was rejected — core.quotePath regression"
+fi
+
+echo "==> 2/8 editing a tracked read-only file fails the round"
+R="$(new_project ro_tracked)"
+printf '<?php require "src/S.php"; exit((new S)->v()===7?0:1);\n' > "$R/tests/t.php"
+( cd "$R" && git add -A && git commit --quiet -m tests )
+cat > "$R/.handoff/plans/p.md" <<'PLAN'
+# make v return 7
+## Files to touch
+| Path | Action |
+| --- | --- |
+| `src/S.php` | modify |
+## Files to read, not modify
+| Path | Why |
+| --- | --- |
+| `tests/t.php` | reviewer-written |
+## Acceptance criteria
+- [ ] the test passes
+## Verification
+```bash
+php tests/t.php
+```
+## Out of scope
+Anything else.
+PLAN
+sed -i 's/return 1;/return 7;/' "$R/src/S.php"
+sed -i 's/===7/===1/' "$R/tests/t.php"
+"$V" "$R" "$R/.handoff/plans/p.md" HEAD "$R/.handoff/e" >/dev/null 2>&1
+if [[ "$(gate_status "$R/.handoff/e/evidence.json" read-only)" == fail ]]; then
+    pass "a modified read-only file rejected the round"
+else
+    fail "the model could edit the test that judges it"
+fi
+
+echo "==> 3/8 an UNTRACKED read-only file left alone passes"
+R="$(new_project ro_untracked)"
+printf '<?php require "src/S.php"; exit((new S)->v()===7?0:1);\n' > "$R/tests/t.php"
+cp "$SANDBOX/ro_tracked/.handoff/plans/p.md" "$R/.handoff/plans/p.md"
+SNAP="$(snapshot "$R")"
+sed -i 's/return 1;/return 7;/' "$R/src/S.php"
+"$V" "$R" "$R/.handoff/plans/p.md" HEAD "$R/.handoff/e" "$SNAP" >/dev/null 2>&1
+if [[ "$(gate_status "$R/.handoff/e/evidence.json" read-only)" == pass ]]; then
+    pass "an untouched uncommitted test did not read as tampering"
+else
+    fail "an untracked read-only file was reported modified when it was not"
+fi
+
+echo "==> 4/8 with no baseline the gate says skipped, not pass"
+R="$(new_project ro_nobase)"
+printf '<?php exit(0);\n' > "$R/tests/t.php"
+cp "$SANDBOX/ro_tracked/.handoff/plans/p.md" "$R/.handoff/plans/p.md"
+sed -i 's/return 1;/return 7;/' "$R/src/S.php"
+"$V" "$R" "$R/.handoff/plans/p.md" HEAD "$R/.handoff/e" >/dev/null 2>&1
+if [[ "$(gate_status "$R/.handoff/e/evidence.json" read-only)" == skipped ]]; then
+    pass "no baseline reported as skipped rather than claimed as clean"
+else
+    fail "claimed a read-only verdict it had no baseline for"
+fi
+
+echo "==> 5/8 a regenerated file advises, and does not reject"
+R="$(new_project advisory)"
+cat > "$R/.handoff/plans/p.md" <<'PLAN'
+# make v return 7
+## Files to touch
+| Path | Action |
+| --- | --- |
+| `src/S.php` | modify |
+## Acceptance criteria
+- [ ] v returns 7
+## Verification
+```bash
+php -r 'require "src/S.php"; exit((new S)->v()===7?0:1);'
+```
+## Out of scope
+Anything else.
+PLAN
+printf '<?php\nclass S { public function v(): int { return 7; } }\n' > "$R/src/S.php"
+"$V" "$R" "$R/.handoff/plans/p.md" HEAD "$R/.handoff/e" >/dev/null 2>&1
+V_JSON="$R/.handoff/e/evidence.json"
+if [[ "$(verdict_of "$V_JSON")" == ACCEPT &&
+      "$(python3 -c "import json;print(json.load(open('$V_JSON'))['advisory_failed'])")" -ge 1 ]]; then
+    pass "patch-only reported without a vote"
+else
+    fail "the advisory split regressed — verdict $(verdict_of "$V_JSON")"
+fi
+
+echo "==> 6/8 handoff exit status follows the gates in both directions"
+export PATH="$REPO/bin:$PATH"
+R="$(new_project exitstatus)"
+cp "$SANDBOX/advisory/.handoff/plans/p.md" "$R/.handoff/plans/p.md"
+( cd "$R" && printf '.handoff/runs/\n' >> .gitignore && git add -A && git commit --quiet -m ig )
+( cd "$R" && STUB_PATCH="sed -i 's/return 1;/return 7;/' src/S.php" STUB_REPORT='garbage not json' \
+    HANDOFF_PROVIDER=stub handoff do p >/dev/null 2>&1 ); GOOD=$?
+( cd "$R" && git checkout --quiet -- src/S.php
+  STUB_PATCH="sed -i 's/return 1;/return 4;/' src/S.php" \
+  STUB_REPORT='{"status":"complete","summary":"s","files_changed":[],"tests_run":[],"deviations":[],"blockers":[],"follow_ups":[]}' \
+    HANDOFF_PROVIDER=stub handoff do p >/dev/null 2>&1 ); BAD=$?
+if [[ "$GOOD" -eq 0 && "$BAD" -ne 0 ]]; then
+    pass "good tree + unusable report = 0; bad tree + perfect report = non-zero"
+else
+    fail "exit status wrong: good tree gave $GOOD, bad tree gave $BAD"
+fi
+
+echo "==> 7/8 init never ignores a path the project tracks"
+R="$(new_project inits)"
+mkdir -p "$R/.claude/plans" && echo "# a tracked plan" > "$R/.claude/plans/x.md"
+( cd "$R" && git add -A && git commit --quiet -m plans )
+( cd "$R" && handoff init >/dev/null 2>&1 )
+if grep -qxF '.claude/' "$R/.gitignore" 2>/dev/null; then
+    fail "ignored .claude/ in a project that tracks plans there"
+elif grep -qxF '.handoff/runs/' "$R/.gitignore" 2>/dev/null; then
+    pass "added the safe entry, left the tracked path alone"
+else
+    fail "init added nothing at all"
+fi
+
+echo "==> 8/8 resume verifies instead of exiting 0 blindly"
+if grep -qE '"\$MODE" == "do" \|\| "\$MODE" == "resume"' "$REPO/bin/handoff"; then
+    pass "resume runs the gates"
+else
+    fail "resume no longer verifies — a rejected resume would look like a pass"
+fi
+
+echo
+if [[ "$FAILURES" -eq 0 ]]; then echo "all checks passed"; else echo "$FAILURES check(s) failed"; fi
+exit $(( FAILURES > 0 ? 1 : 0 ))
