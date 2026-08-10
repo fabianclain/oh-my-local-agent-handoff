@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""bench/summary — aggregate preserved runs into cost to an accepted patch.
+
+    bench/summary [plan ...]
+
+bench/report renders every run individually, on purpose: combining repetitions hides the variance
+this protocol exists to expose. This is the other view, and it answers a different question — what
+does one usable patch cost from this configuration, counting the runs that failed.
+
+That last clause is the whole point. "5/5 correct" reads as a uniform result when one of the five
+took 5.7x the others, and a provider that succeeds four times in five while burning three attempts
+each time is not cheaper than one that succeeds three times in five on the first attempt. Dividing
+total spend by accepted patches is the only figure that prices both.
+
+Spread is printed beside every median because at n=5 this model's run-to-run spread is wider than
+most of the differences being measured here, and three separate first-run readings in this project
+were overturned by a later repetition.
+"""
+
+from __future__ import annotations
+
+import json
+import statistics
+import sys
+from pathlib import Path
+
+BENCH_HOME = Path(__file__).resolve().parent
+RESULTS_ROOT = BENCH_HOME / "results"
+
+# A tree a reviewer could take. `accepted` also produced a usable report; `patch-ok-no-report` did
+# the work and failed to say so, which costs a re-ask rather than a human.
+USABLE_TREE = {"accepted", "patch-ok-no-report"}
+
+
+def read_metrics(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for line in path.read_text(errors="replace").splitlines():
+        key, _, value = line.partition("=")
+        if _:
+            values.setdefault(key, value)
+    return values
+
+
+def as_int(value: str | None) -> int | None:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def derive_outcome(metrics: dict[str, str]) -> str:
+    """Recover the outcome for runs recorded before the taxonomy existed.
+
+    Runs from before that commit have every input the classifier uses but no `outcome` line, and
+    dropping them would throw away the only wide-plan measurements taken so far. The derivation
+    below mirrors bench/run exactly; where it cannot decide, it says `unknown` rather than
+    guessing.
+    """
+    recorded = metrics.get("outcome")
+    if recorded and recorded != "unknown":
+        return recorded
+
+    status = metrics.get("status", "")
+    met, total = as_int(metrics.get("criteria_met")), as_int(metrics.get("criteria_total"))
+    empty = as_int(metrics.get("empty_diff"))
+    scope = as_int(metrics.get("scope_violations"))
+    rewrites = as_int(metrics.get("rewrite_violations"))
+    if None in (met, total, empty, scope, rewrites):
+        return "unknown"
+
+    if status in {"timeout", "skipped"}:
+        return "protocol-failed"
+    if status == "false-success":
+        return "fabricated"
+    if empty:
+        return "no-op"
+    tree_ok = met == total and scope == 0 and rewrites == 0
+    if tree_ok and status in {"complete", "partial", "blocked"}:
+        return "accepted"
+    return "patch-ok-no-report" if tree_ok else "patch-damaged"
+
+
+def spread(values: list[int]) -> str:
+    if not values:
+        return "—"
+    if len(values) == 1:
+        return str(values[0])
+    return f"{int(statistics.median(values))} [{min(values)}–{max(values)}]"
+
+
+def second_opinion(plan_dir: Path) -> list[str]:
+    """Cross-check bench/run's tree verdict against verify-round's, run by run.
+
+    Two implementations of "is this acceptable" exist, and they have drifted once already. Two
+    implementations agreeing is evidence; one implementation is an assumption. Runs from before
+    verify-round was wired in carry no bundle and are reported as unchecked rather than as
+    agreement.
+    """
+    agree = disagree = unchecked = 0
+    findings: list[str] = []
+
+    for metrics_file in sorted(plan_dir.glob("*/*/metrics")):
+        run_dir = metrics_file.parent
+        evidence = run_dir / "evidence" / "evidence.json"
+        if not evidence.is_file():
+            unchecked += 1
+            continue
+        try:
+            verdict = json.loads(evidence.read_text())["verdict"]
+        except (ValueError, KeyError, OSError):
+            unchecked += 1
+            continue
+
+        tree_ok = derive_outcome(read_metrics(metrics_file)) in USABLE_TREE
+        if tree_ok == (verdict == "ACCEPT"):
+            agree += 1
+        else:
+            disagree += 1
+            label = "/".join(run_dir.parts[-2:])
+            findings.append(
+                f"  - `{label}`: bench/run says the tree is "
+                f"{'usable' if tree_ok else 'not usable'}, verify-round says {verdict}"
+            )
+
+    if not agree and not disagree:
+        return []
+    out = [
+        "",
+        f"**Second opinion.** `verify-round` agreed with `bench/run` on {agree} of"
+        f" {agree + disagree} runs carrying an evidence bundle.",
+    ]
+    if unchecked:
+        out.append(
+            f"{unchecked} run(s) predate the verificator and were not cross-checked at all."
+        )
+    if findings:
+        out += ["", "Disagreements — resolve before trusting either number:", *findings]
+    return out
+
+
+def summarise(plan_dir: Path) -> list[str]:
+    rows: list[str] = []
+    no_usage: list[str] = []
+    derived: list[str] = []
+    context_hit: list[str] = []
+    context_unmeasured: list[str] = []
+    for provider_dir in sorted(p for p in plan_dir.iterdir() if p.is_dir()):
+        runs = []
+        for metrics_file in sorted(provider_dir.glob("*/metrics")):
+            metrics = read_metrics(metrics_file)
+            metrics["_outcome"] = derive_outcome(metrics)
+            runs.append(metrics)
+        if not runs:
+            continue
+
+        total_runs = len(runs)
+        accepted = [r for r in runs if r["_outcome"] == "accepted"]
+        usable = [r for r in runs if r["_outcome"] in USABLE_TREE]
+        seconds = [s for s in (as_int(r.get("wall_clock_seconds")) for r in runs) if s is not None]
+        attempts = [a for a in (as_int(r.get("attempts")) for r in runs) if a is not None]
+        first_pass = [r for r in runs if as_int(r.get("attempts")) == 1 and r["_outcome"] in USABLE_TREE]
+
+        # A run whose conversation was truncated against the context window is a configuration
+        # result, not a model result, and pooling it with clean runs hides that. Round 6 had one:
+        # it was the arm's only damaged run and its worst outlier on every axis.
+        # Absence of the field is not evidence of a clean run: it means the round predates the
+        # check. Saying "0 truncated" over runs that were never inspected is exactly the kind of
+        # blank-reads-as-zero claim this report exists to avoid.
+        measured = [r for r in runs if "truncated_requests" in r]
+        truncated = [r for r in measured if as_int(r.get("truncated_requests"))
+                     or as_int(r.get("context_overflows"))]
+        if not measured:
+            context_unmeasured.append(provider_dir.name)
+
+        generated = [g for g in (as_int(r.get("generated_tokens")) for r in runs) if g]
+        unattributable = any(as_int(r.get("usage_unattributable")) for r in runs) or not generated
+
+        total_seconds = sum(seconds)
+        # Cost is charged against usable trees, not against `accepted` alone: a run that produced a
+        # correct patch and no report still delivered the patch. Reports are counted separately.
+        per_patch_seconds = f"{total_seconds // len(usable)}" if usable else "never"
+        if unattributable:
+            per_patch_tokens = "not measured"
+        else:
+            per_patch_tokens = f"{sum(generated) // len(usable)}" if usable else "never"
+
+        # Counted in its own column because it is a distinct, repeatable failure with a distinct
+        # remedy: the tree is right and the client returned no final message, so the cost is one
+        # re-ask rather than a human reading a diff. On multi it ran at 1/5, 3/5 and 2/5 across the
+        # three reasoning levels, which is the only signal so far that reasoning changes anything.
+        silent = [r for r in runs if r["_outcome"] == "patch-ok-no-report"]
+
+        rows.append(
+            f"| {provider_dir.name} | {total_runs} | {len(usable)}/{total_runs} | "
+            f"{len(accepted)}/{total_runs} | {len(silent)}/{total_runs} | "
+            f"{len(first_pass)}/{total_runs} | "
+            f"{spread(attempts)} | {spread(seconds)} | "
+            f"{'—' if unattributable else spread(generated)} | "
+            f"{per_patch_seconds} | {per_patch_tokens} |"
+        )
+        if truncated:
+            context_hit.append(f"{provider_dir.name} ({len(truncated)}/{total_runs})")
+        if unattributable:
+            no_usage.append(provider_dir.name)
+        stale = [r for r in runs if not r.get("outcome")]
+        if stale:
+            derived.append(f"{provider_dir.name} ({len(stale)})")
+
+    if not rows:
+        return []
+
+    out = [
+        f"## {plan_dir.name}",
+        "",
+        "| Provider | Runs | Usable tree | Accepted | No report | First attempt | Attempts |"
+        " Seconds | Generated tokens | Seconds per patch | Tokens per patch |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        *rows,
+        "",
+        "Medians, with `[min–max]` beside them. *Usable tree* is a patch a reviewer could take —"
+        " `accepted` plus `patch-ok-no-report`. *Seconds per patch* and *tokens per patch* divide"
+        " total spend across every run, including the failures, by the number of usable trees.",
+    ]
+    # Both caveats are stated rather than hidden. A blank token column that turns out to mean "not
+    # instrumented" would otherwise read as "cost nothing", and a derived outcome is weaker
+    # evidence than a recorded one even when the derivation is exact.
+    notes = []
+    if no_usage:
+        notes.append(
+            "- Token counts unavailable for " + ", ".join(f"`{n}`" for n in no_usage)
+            + " — the adapter reports no usage, or a server restart made the log unattributable."
+        )
+    if context_hit:
+        notes.append(
+            "- **Context truncated** in " + ", ".join(f"`{n}`" for n in context_hit)
+            + ". Those runs lost conversation history against the window and are configuration"
+            " results, not model results — they are included in the figures above, so subtract"
+            " them before comparing arms."
+        )
+    if context_unmeasured:
+        notes.append(
+            "- Context truncation **not checked** for "
+            + ", ".join(f"`{n}`" for n in context_unmeasured)
+            + " — those runs predate the check, so a clean-looking column here means unexamined,"
+            " not clean."
+        )
+    if derived:
+        notes.append(
+            "- Outcomes derived, not recorded, for " + ", ".join(f"`{n}`" for n in derived)
+            + ": these runs predate the taxonomy, so their labels come from the gate results in"
+            " their metrics file rather than from an `outcome` line."
+        )
+    if notes:
+        out += ["", *notes]
+    out += second_opinion(plan_dir)
+    return out
+
+
+def main() -> int:
+    if not RESULTS_ROOT.is_dir():
+        print("No run artifacts are available.")
+        return 0
+
+    wanted = set(sys.argv[1:])
+    plans = sorted(p for p in RESULTS_ROOT.iterdir() if p.is_dir())
+    if wanted:
+        plans = [p for p in plans if p.name in wanted]
+        missing = wanted - {p.name for p in plans}
+        for name in sorted(missing):
+            print(f"no results for plan: {name}", file=sys.stderr)
+
+    blocks = [block for plan in plans if (block := summarise(plan))]
+    if not blocks:
+        print("No run artifacts are available.")
+        return 0
+
+    print("# Cost to an accepted patch")
+    print()
+    print("Aggregated from bench/results. bench/report remains the per-run record; this view exists")
+    print("to price a configuration, and it deliberately charges failed runs to the successful ones.")
+    for block in blocks:
+        print()
+        print("\n".join(block))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

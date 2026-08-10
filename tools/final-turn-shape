@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""final-turn-shape — why a run produced no final report, read from the client's event stream.
+
+    tools/final-turn-shape <results-dir> [...]
+    tools/final-turn-shape bench/results/wide
+
+"The model sometimes returns no final message" was open in this project for a long time, under two
+different models, and was assumed to be the model going quiet. It is not. Cline emits one
+`content_end` event per block of the assistant's turn, tagged `reasoning`, `tool` or `text`, and
+the runs split perfectly on whether a `text` block ever arrives:
+
+    accepted            ... tool, text, reasoning      finishReason=completed
+    no final report     ... reasoning, tool, reasoning  finishReason=error
+
+So the model ends its last turn having produced reasoning and a tool call and **no text block at
+all**. Cline has nothing to parse as a reply and reports "The model produced output that does not
+match the expected peg-native format", which reads like a formatting bug and is really an absence.
+
+This matters for the reasoning sweep. If the volume of reasoning is what crowds out the final
+message, `off` should show a lower rate than `low` — a mechanism, and a prediction that the
+repetitions can settle.
+
+Reads preserved artifacts only. It never talks to a model and is safe to run during a round.
+"""
+
+from __future__ import annotations
+
+import json
+import pathlib
+import sys
+
+
+def attempt_shapes(log: pathlib.Path) -> list[tuple[str, bool, list[str]]]:
+    """One entry per attempt: (finishReason, whether a text block arrived, the last few blocks)."""
+    events = []
+    with log.open(errors="replace") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                events.append(json.loads(line))
+            except ValueError:
+                continue
+
+    out: list[tuple[str, bool, list[str]]] = []
+    blocks: list[str] = []
+    for event in events:
+        if event.get("type") == "agent_event":
+            inner = event.get("event", {})
+            if inner.get("type") == "content_end":
+                blocks.append(inner.get("contentType") or "?")
+        elif event.get("type") == "run_result":
+            out.append((event.get("finishReason") or "?", "text" in blocks[-3:], blocks[-3:]))
+            blocks = []
+    return out
+
+
+def main() -> int:
+    roots = [pathlib.Path(a) for a in sys.argv[1:]] or [pathlib.Path("bench/results")]
+    logs = sorted(p for root in roots for p in root.glob("**/provider.log"))
+    if not logs:
+        print("no provider logs found", file=sys.stderr)
+        return 1
+
+    print(f"{'run':28} {'outcome':20} {'att':>3} {'finish':10} {'text?':6} last blocks")
+    totals = {"with_text": 0, "without_text": 0}
+    # provider -> [first attempts seen, first attempts with no text block]
+    by_provider: dict[str, list[int]] = {}
+    for log in logs:
+        metrics = log.parent / "metrics"
+        outcome = "?"
+        if metrics.exists():
+            for line in metrics.read_text().splitlines():
+                if line.startswith("outcome="):
+                    outcome = line.split("=", 1)[1]
+        name = "/".join(log.parent.parts[-3:])
+        provider = log.parent.parts[-2]
+        for index, (finish, has_text, blocks) in enumerate(attempt_shapes(log), 1):
+            totals["with_text" if has_text else "without_text"] += 1
+            if index == 1:
+                seen = by_provider.setdefault(provider, [0, 0])
+                seen[0] += 1
+                if not has_text:
+                    seen[1] += 1
+            print(f"{name:28} {outcome:20} {index:>3} {finish:10} "
+                  f"{'yes' if has_text else 'NO':6} {','.join(blocks)}")
+
+    print()
+    print(f"attempts ending with a text block: {totals['with_text']}")
+    print(f"attempts ending without one:       {totals['without_text']}")
+
+    # First attempts only, grouped by provider. This is the comparable number: later attempts are
+    # conditioned on the first having failed, so pooling them measures the repair loop rather than
+    # the model's turn-ending behaviour.
+    if by_provider:
+        print()
+        print("First attempts only — the turn-ending rate, per provider:")
+        print(f"  {'provider':22} {'runs':>5} {'no text block':>14} {'rate':>7}")
+        for provider in sorted(by_provider):
+            runs, missing = by_provider[provider]
+            print(f"  {provider:22} {runs:>5} {missing:>14} {100 * missing / runs:>6.0f}%")
+
+    print()
+    print("An attempt with no text block has no final report to parse, whatever the client says")
+    print("about formats. Judge the tree separately — these runs are frequently byte-perfect.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+"""bench/compare — is the difference between two arms real?
+
+    bench/compare <plan> <control> <arm>
+    bench/compare wide lcgptossl lcgptossnt
+
+Twice in one day this comparison, done by hand, dissolved a finding that looked dramatic and would
+otherwise have been written up:
+
+- Round 7 appeared to show that richer repair feedback halves the damage-free rate. Scoring
+  attempt 1 — a phase where the manipulated variable does not yet exist — showed most of the gap
+  was already there before the variable applied.
+- Round 6 appeared to show reasoning `off` costing 26% more per patch. Four measures agreed, and a
+  rank test put it at p = 0.18.
+
+Both checks are mechanical, and neither happens reliably when it has to be remembered. So they live
+here.
+
+## The attempt-1 control
+
+Every arm's first attempt runs before any feedback exists, so for experiments that manipulate the
+repair loop the arms are identical at that point *by construction*. A difference there is the
+plan's noise floor, measured from the experiment's own runs rather than assumed.
+
+If attempt-1 differs significantly, the headline difference is not attributable to the variable and
+this tool says so. If the manipulated variable *can* act on attempt 1 — a reasoning level, a
+sampling change, an adapter retry that fires inside it — the control does not apply, and the tool
+says that too rather than pretending.
+
+Statistics are deliberately simple and exact where possible: Fisher for proportions, Mann-Whitney
+with a normal approximation for the continuous measures. No claim rests on a distributional
+assumption these sample sizes cannot support.
+"""
+
+from __future__ import annotations
+
+import collections
+import math
+import pathlib
+import statistics
+import sys
+from math import comb
+
+BENCH_HOME = pathlib.Path(__file__).resolve().parent
+USABLE = {"accepted", "patch-ok-no-report"}
+
+# Variables that act from the first attempt, so an attempt-1 comparison is not a control for them.
+ACTS_ON_FIRST_ATTEMPT = ("reasoning", "sampling", "model", "engine", "context", "report channel")
+
+
+def read_metrics(path: pathlib.Path) -> dict[str, str]:
+    return dict(
+        line.split("=", 1) for line in path.read_text(errors="replace").splitlines() if "=" in line
+    )
+
+
+def arm(plan: str, name: str) -> list[dict]:
+    root = BENCH_HOME / "results" / plan / name
+    if not root.is_dir():
+        sys.exit(f"no results for {plan}/{name}")
+    out = []
+    for metrics in sorted(root.glob("*/metrics"), key=lambda p: int(p.parent.name)):
+        row = read_metrics(metrics)
+        row["_dir"] = metrics.parent
+        out.append(row)
+    if not out:
+        sys.exit(f"no runs recorded for {plan}/{name}")
+    return out
+
+
+def attempt1_scores(rows: list[dict]) -> list[int]:
+    """How many acceptance commands passed on the first attempt, per run."""
+    scores = []
+    for row in rows:
+        log = row["_dir"] / "verification-attempt-1.log"
+        if log.exists():
+            scores.append(sum(1 for l in log.read_text(errors="replace").splitlines()
+                              if l == "exit_code: 0"))
+    return scores
+
+
+def fisher(a: int, b: int, c: int, d: int) -> float:
+    """Two-sided Fisher exact on a 2x2 table. Exact, so it is honest at these sample sizes."""
+    n = a + b + c + d
+    if n == 0:
+        return 1.0
+
+    def p(x: int) -> float:
+        y, z, w = a + b - x, a + c - x, d - (a - x)
+        if min(y, z, w) < 0:
+            return 0.0
+        return comb(a + b, x) * comb(c + d, z) / comb(n, a + c)
+
+    observed = p(a)
+    return min(1.0, sum(p(x) for x in range(0, min(a + b, a + c) + 1) if p(x) <= observed + 1e-12))
+
+
+def mannwhitney(x: list[int], y: list[int]) -> tuple[float, float]:
+    """Rank-sum with tie correction. Returns (z, two-sided p)."""
+    if not x or not y:
+        return 0.0, 1.0
+    merged = sorted([(v, 0) for v in x] + [(v, 1) for v in y])
+    ranks: dict[int, float] = {}
+    i = 0
+    while i < len(merged):
+        j = i
+        while j + 1 < len(merged) and merged[j + 1][0] == merged[i][0]:
+            j += 1
+        for k in range(i, j + 1):
+            ranks[k] = (i + j) / 2 + 1
+        i = j + 1
+    r1 = sum(ranks[k] for k, (_, g) in enumerate(merged) if g == 0)
+    n1, n2 = len(x), len(y)
+    u1 = r1 - n1 * (n1 + 1) / 2
+    counts = collections.Counter(v for v, _ in merged)
+    n = n1 + n2
+    ties = sum(t ** 3 - t for t in counts.values())
+    var = (n1 * n2 / 12) * ((n + 1) - ties / (n * (n - 1))) if n > 1 else 0
+    if var <= 0:
+        return 0.0, 1.0
+    z = (u1 - n1 * n2 / 2) / math.sqrt(var)
+    return z, math.erfc(abs(z) / math.sqrt(2))
+
+
+def verdict(p: float) -> str:
+    if p < 0.01:
+        return "**difference**"
+    if p < 0.05:
+        return "difference"
+    if p < 0.15:
+        return "suggestive"
+    return "chance"
+
+
+def counts(rows: list[dict]) -> collections.Counter:
+    return collections.Counter(r.get("outcome", "unknown") for r in rows)
+
+
+def main() -> int:
+    # Where the manipulated variable can act. The tool cannot infer this and must not guess: the
+    # attempt-1 control is only a control for variables that act *after* the first attempt. For a
+    # reasoning level, a sampling change or an adapter retry that fires inside attempt 1, a
+    # difference there is the result rather than a warning about noise.
+    acts_on = "repair"
+    args: list[str] = []
+    rest = list(sys.argv[1:])
+    while rest:
+        token = rest.pop(0)
+        if token == "--acts-on":
+            if not rest:
+                sys.exit("--acts-on needs a value: repair or first-attempt")
+            acts_on = rest.pop(0)
+        elif token.startswith("--acts-on="):
+            acts_on = token.split("=", 1)[1]
+        elif token.startswith("--"):
+            sys.exit(f"unknown flag: {token}")
+        else:
+            args.append(token)
+    if len(args) != 3:
+        sys.exit("usage: bench/compare <plan> <control> <arm> [--acts-on repair|first-attempt]")
+    if acts_on not in ("repair", "first-attempt"):
+        sys.exit("--acts-on must be 'repair' or 'first-attempt'")
+    plan, control_name, arm_name = args
+    control, treatment = arm(plan, control_name), arm(plan, arm_name)
+
+    print(f"# {plan}: {arm_name} against {control_name}")
+    print()
+    print(f"n = {len(control)} control, {len(treatment)} treatment.")
+
+    # Configuration differences worth knowing before reading anything below.
+    for field, label in (("harness_commit", "harness"), ("feedback_detail", "feedback"),
+                         ("harness_dirty", "uncommitted harness changes")):
+        a = {r.get(field) for r in control}
+        b = {r.get(field) for r in treatment}
+        if a != b and a and b:
+            print(f"  {label}: control {'/'.join(sorted(map(str, a)))}, "
+                  f"treatment {'/'.join(sorted(map(str, b)))}")
+
+    truncated = [r for arm_rows in (control, treatment) for r in arm_rows
+                 if r.get("truncated_requests", "0") not in ("0", "")]
+    if truncated:
+        print(f"  **{len(truncated)} run(s) hit the context window** and lost history. Those are"
+              " configuration results; subtract them before trusting anything below.")
+
+    print()
+    print("| Outcome | control | treatment | Fisher p | reading |")
+    print("| --- | ---: | ---: | ---: | --- |")
+    ca, ta = counts(control), counts(treatment)
+    nc, nt = len(control), len(treatment)
+    for label, predicate in (
+        ("usable tree", lambda r: r.get("outcome") in USABLE),
+        ("accepted", lambda r: r.get("outcome") == "accepted"),
+        ("no final report", lambda r: r.get("outcome") == "patch-ok-no-report"),
+        ("damaged", lambda r: r.get("outcome") == "patch-damaged"),
+        ("green on first attempt", lambda r: r.get("attempts") == "1" and r.get("outcome") in USABLE),
+    ):
+        k1 = sum(1 for r in control if predicate(r))
+        k2 = sum(1 for r in treatment if predicate(r))
+        p = fisher(k1, nc - k1, k2, nt - k2)
+        print(f"| {label} | {k1}/{nc} | {k2}/{nt} | {p:.2f} | {verdict(p)} |")
+
+    print()
+    print("| Measure | control median | treatment median | ratio | Mann-Whitney p | reading |")
+    print("| --- | ---: | ---: | ---: | ---: | --- |")
+    for field, label in (("wall_clock_seconds", "seconds"), ("generated_tokens", "generated tokens")):
+        a = [int(r[field]) for r in control if r.get(field, "").isdigit() and int(r[field]) > 0]
+        b = [int(r[field]) for r in treatment if r.get(field, "").isdigit() and int(r[field]) > 0]
+        if not a or not b:
+            print(f"| {label} | — | — | — | — | not recorded |")
+            continue
+        ma, mb = statistics.median(a), statistics.median(b)
+        z, p = mannwhitney(a, b)
+        print(f"| {label} | {int(ma)} | {int(mb)} | {mb / ma:.2f}x | {p:.3f} | {verdict(p)} |")
+
+    # The control check.
+    print()
+    print("## Attempt-1 control")
+    print()
+    a1, b1 = attempt1_scores(control), attempt1_scores(treatment)
+    if not a1 or not b1:
+        print("No per-attempt logs preserved, so the noise floor cannot be measured here.")
+    else:
+        need = max(int(r.get("criteria_total", 0)) for r in control + treatment)
+        ka = sum(1 for s in a1 if s == need)
+        kb = sum(1 for s in b1 if s == need)
+        p = fisher(ka, len(a1) - ka, kb, len(b1) - kb)
+        a1_gap = 100 * (kb / len(b1) - ka / len(a1))
+
+        # Significance is the wrong test here, and using it gave false reassurance on the first
+        # case this tool was written for. Round 7's arms sat at 87% and 67% on attempt 1 —
+        # p = 0.36, comfortably "not significant" — and that 20-point gap was three quarters of
+        # the 26-point headline gap it was supposed to explain. What matters is not whether the
+        # noise floor is significant but whether it is *large enough to account for the result*.
+        u_c = 100 * sum(1 for r in control if r.get("outcome") in USABLE) / nc
+        u_t = 100 * sum(1 for r in treatment if r.get("outcome") in USABLE) / nt
+        head_gap = u_t - u_c
+
+        print(f"Green on attempt 1: control {ka}/{len(a1)} ({100*ka/len(a1):.0f}%), "
+              f"treatment {kb}/{len(b1)} ({100*kb/len(b1):.0f}%) — "
+              f"a {a1_gap:+.0f} point gap (Fisher p = {p:.2f}).")
+        print(f"Usable tree overall: {u_c:.0f}% against {u_t:.0f}% — a {head_gap:+.0f} point gap.")
+        print()
+
+        if acts_on == "first-attempt":
+            print("`--acts-on first-attempt`: the variable under test acts from the first attempt,"
+                  " so the numbers above are a result and not a noise check. There is no control"
+                  " here — the only way to separate this variable from run-to-run spread is"
+                  " repetitions.")
+            print()
+            print("Sample sizes here are small. `chance` means this data cannot distinguish the"
+                  " arms; it does not mean they are the same.")
+            return 0
+
+        if abs(head_gap) < 5 and abs(a1_gap) < 5:
+            print("The arms start together and finish together. Nothing to attribute.")
+        elif abs(head_gap) < 5:
+            print(f"The outcome gap is negligible ({head_gap:+.0f} points) while attempt 1 differs"
+                  f" by {a1_gap:+.0f}. Nothing to attribute to the variable, and that attempt-1"
+                  " spread is a reading of this plan's noise floor worth remembering.")
+        elif abs(a1_gap) <= 5:
+            print("The arms start from the same place, so the outcome difference above is the"
+                  " variable's to explain.")
+        elif (share := abs(a1_gap) / abs(head_gap)) >= 0.5:
+            print(f"**Do not attribute the outcome difference to the variable.** {abs(a1_gap):.0f}"
+                  f" of the {abs(head_gap):.0f} point gap is already present at attempt 1"
+                  f" ({share*100:.0f}% of it), where a repair-loop variable cannot act. That"
+                  " residue is this plan's run-to-run noise, and it is the size of the finding.")
+        else:
+            print(f"{abs(a1_gap):.0f} points of the {abs(head_gap):.0f} point gap are present at"
+                  f" attempt 1 ({share*100:.0f}%). Subtract that before reading the result; the"
+                  " remainder is what the variable might have done.")
+        print()
+        print("This control does not apply when the variable acts from the first attempt — "
+              + ", ".join(ACTS_ON_FIRST_ATTEMPT)
+              + ". For those, a difference here is the result, not a warning.")
+
+    print()
+    print("Sample sizes here are small. `chance` means this data cannot distinguish the arms; it"
+          " does not mean they are the same.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
