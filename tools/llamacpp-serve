@@ -24,6 +24,17 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LLAMA_SERVER="${LLAMA_SERVER:-$HOME/.local/opt/llamacpp/llama-b10331/llama-server}"
 PORT="${LLAMACPP_PORT:-8071}"
+# Extra server flags, unquoted on purpose so a caller can pass several.
+#
+# Sampling lives here rather than in the client: Cline exposes no temperature, top-p or seed, so
+# the serving default is the only place it can be set. That default is llama.cpp's — temperature
+# 0.8, top_p 0.95, top_k 40, random seed — which is a creative-writing profile being used for a
+# task whose signatures are dictated and whose acceptance is mechanical. Whatever it is worth, it
+# had never been varied, and it is a plausible source of the run-to-run spread that has made every
+# comparison here hard to resolve.
+#
+#   LLAMACPP_EXTRA_ARGS="--temp 0 --top-p 1 --top-k 0 --seed 42" tools/llamacpp-serve start ...
+LLAMACPP_EXTRA_ARGS="${LLAMACPP_EXTRA_ARGS:-}"
 STATE_DIR="${LLAMACPP_STATE:-$HOME/.cache/agent-handoff}"
 LOG="$STATE_DIR/llamacpp.log"
 SERVING="$STATE_DIR/llamacpp.model"
@@ -85,7 +96,8 @@ cmd_start() {
     done < <(ollama ps 2>/dev/null | awk 'NR>1 {print $1}')
 
     nohup "$LLAMA_SERVER" -m "$gguf" --jinja -c "$context" -ngl 999 \
-        --host 127.0.0.1 --port "$PORT" -ctk q8_0 -ctv q8_0 >"$LOG" 2>&1 &
+        --host 127.0.0.1 --port "$PORT" -ctk q8_0 -ctv q8_0 \
+        ${LLAMACPP_EXTRA_ARGS:-} >"$LOG" 2>&1 &
 
     local i
     for i in $(seq 1 100); do

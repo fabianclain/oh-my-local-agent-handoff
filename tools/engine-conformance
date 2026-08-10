@@ -1,0 +1,417 @@
+#!/usr/bin/env python3
+"""engine-conformance — does this serving stack emit usable tool calls?
+
+    tools/engine-conformance [--engine llamacpp|ollama] [--model NAME] [--repeat N]
+
+`tools/repro-ollama-toolcall-500.py` demonstrates one engine's defect. This asks the general
+question of whichever engine is serving right now, and answers it before a benchmark spends hours
+attributing the answer to the model.
+
+That confusion is the most expensive mistake this project has made. Every gpt-oss result taken
+through ollama was void, and the reason was invisible from inside the harness: the engine failed to
+parse a tool call its own model had generated, the error surfaced through the client, and it read
+as a client bug for a long time. A benchmark cannot distinguish an engine regression from a model
+regression. This can, so run it whenever the engine build, GGUF, chat template, client version,
+context size or tool schema changes.
+
+The cases are the ones that separated working from broken in that investigation:
+
+  first-turn        a tool call as the very first thing the model does
+  after-result      a tool call following a substantial tool result — the condition that broke
+                    ollama, and the one a single-shot smoke test never reaches
+  tiny/medium/large argument sizes, up to roughly a kilobyte of patch text, because argument size
+                    was blamed for the failure and was ruled out; the case stays to keep it ruled
+                    out
+  streamed          the transport the clients actually use
+  reused-connection two calls over one keep-alive connection, which is how a pooling client behaves
+                    and how a single-threaded shim was once wedged forever
+
+A pass means the engine returned a tool call whose arguments parse as JSON and carry the expected
+field. It does not mean the model chose well; the prompts are written so that a competent model has
+one obvious move, and a refusal to call the tool is reported separately from a malformed call.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import http.client
+import json
+import sys
+import urllib.error
+import urllib.request
+
+APPLY_PATCH = {
+    "type": "function",
+    "function": {
+        "name": "apply_patch",
+        "description": (
+            "Edit files with the canonical freeform patch grammar. Pass the patch text directly "
+            "as the `input` string:\n\n*** Begin Patch\n*** Update File: path\n@@\n-[old]\n+[new]\n"
+            "*** End Patch"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"input": {"type": "string", "description": "The patch text."}},
+            "required": ["input"],
+        },
+    },
+}
+
+READ_FILE = {
+    "type": "function",
+    "function": {
+        "name": "read_file",
+        "description": "Read a file from the repository.",
+        "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+    },
+}
+
+TOOLS = [APPLY_PATCH, READ_FILE]
+
+SYSTEM = (
+    "You are a coding agent. Use the provided tools to make edits. "
+    "Never describe an edit in prose when apply_patch can make it."
+)
+
+
+def patch_text(lines: int) -> str:
+    body = "\n".join(f"-    $old{i} = {i};\n+    $new{i} = {i};" for i in range(lines))
+    return f"*** Begin Patch\n*** Update File: src/Money.php\n@@\n{body}\n*** End Patch"
+
+
+def tool_result(size: int) -> str:
+    """A file listing of roughly `size` bytes, as a tool result the model must read past."""
+    chunk = "".join(
+        f"{n:4d}    public function method{n}(int $value): int {{ return $value + {n}; }}\n"
+        for n in range(size // 70 + 1)
+    )
+    return chunk[:size]
+
+
+class Endpoint:
+    """Chat completion over one of the two APIs, optionally on a connection kept open."""
+
+    def __init__(self, engine: str, host: str, port: int, model: str) -> None:
+        self.engine = engine
+        self.host = host
+        self.port = port
+        self.model = model
+        self.path = "/v1/chat/completions" if engine == "llamacpp" else "/api/chat"
+        self.connection: http.client.HTTPConnection | None = None
+
+    def close(self) -> None:
+        if self.connection is not None:
+            self.connection.close()
+            self.connection = None
+
+    def body(self, messages: list[dict], stream: bool, force: str | None = None) -> bytes:
+        # Naming a tool in tool_choice is not enough: llama.cpp accepted
+        # {"type":"function","function":{"name":"apply_patch"}} and the model called read_file
+        # anyway, fourteen times out of fourteen. Offering only the tool under test is what
+        # actually forces the payload shape, and it was verified by hand against the raw endpoint
+        # before being relied on here.
+        tools = [t for t in TOOLS if t["function"]["name"] == force] if force else TOOLS
+        payload = {"model": self.model, "messages": messages, "tools": tools, "stream": stream}
+        if self.engine == "ollama":
+            payload["options"] = {"temperature": 0}
+        else:
+            payload["temperature"] = 0
+            # Force a call rather than hoping for one. The first version of this probe asked
+            # politely and got twelve prose replies out of twelve, then printed CONFORMANCE OK —
+            # a probe that never exercised the path it certifies. tool_choice is the difference
+            # between testing the tool-call machinery and testing the model's mood.
+            payload["tool_choice"] = (
+                {"type": "function", "function": {"name": force}} if force else "required"
+            )
+        return json.dumps(payload).encode()
+
+    def call(self, messages: list[dict], stream: bool, reuse: bool,
+             force: str | None = None) -> tuple[int, str]:
+        data = self.body(messages, stream, force)
+        headers = {"Content-Type": "application/json"}
+        if reuse:
+            if self.connection is None:
+                self.connection = http.client.HTTPConnection(self.host, self.port, timeout=180)
+            self.connection.request("POST", self.path, body=data, headers=headers)
+            response = self.connection.getresponse()
+            text = response.read().decode("utf-8", "replace")
+            return response.status, text
+
+        request = urllib.request.Request(
+            f"http://{self.host}:{self.port}{self.path}", data=data, headers=headers
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=180) as response:
+                return response.status, response.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as error:
+            # The 500 body is the finding, not an incident — read it rather than raising.
+            return error.code, error.read().decode("utf-8", "replace")
+
+
+def extract_tool_calls(engine: str, stream: bool, text: str) -> tuple[list[dict], str | None]:
+    """Return (tool calls, parse error). A malformed payload is a finding, not an exception."""
+    try:
+        if stream:
+            calls: list[dict] = []
+            for line in text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith("data:"):
+                    line = line[5:].strip()
+                if line == "[DONE]":
+                    continue
+                chunk = json.loads(line)
+                if engine == "ollama":
+                    calls += chunk.get("message", {}).get("tool_calls", []) or []
+                else:
+                    for choice in chunk.get("choices", []):
+                        calls += choice.get("delta", {}).get("tool_calls", []) or []
+            return calls, None
+
+        payload = json.loads(text)
+        if engine == "ollama":
+            return payload.get("message", {}).get("tool_calls", []) or [], None
+        choices = payload.get("choices") or []
+        if not choices:
+            return [], None
+        return choices[0].get("message", {}).get("tool_calls", []) or [], None
+    except (json.JSONDecodeError, AttributeError, TypeError) as error:
+        return [], f"{type(error).__name__}: {error}"
+
+
+def arguments_of(call: dict) -> tuple[dict | None, str | None]:
+    """Tool-call arguments as an object, whichever convention the engine used."""
+    function = call.get("function") or {}
+    raw = function.get("arguments")
+    if isinstance(raw, dict):
+        return raw, None
+    if isinstance(raw, str):
+        # Streamed deltas arrive in fragments; an incomplete fragment is not a defect by itself.
+        if not raw.strip():
+            return None, "empty arguments"
+        try:
+            return json.loads(raw), None
+        except json.JSONDecodeError as error:
+            return None, f"arguments are not valid JSON: {error}"
+    return None, f"arguments have type {type(raw).__name__}"
+
+
+def assemble_streamed(calls: list[dict]) -> list[dict]:
+    """Join streamed argument fragments into whole calls, keyed by index."""
+    merged: dict[int, dict] = {}
+    for call in calls:
+        index = call.get("index", 0)
+        slot = merged.setdefault(index, {"function": {"name": None, "arguments": ""}})
+        function = call.get("function") or {}
+        if function.get("name"):
+            slot["function"]["name"] = function["name"]
+        argument = function.get("arguments")
+        if isinstance(argument, str):
+            slot["function"]["arguments"] += argument
+        elif isinstance(argument, dict):
+            slot["function"]["arguments"] = argument
+    return list(merged.values())
+
+
+CASES = [
+    ("first-turn", 0, 1, False, False, "apply_patch"),
+    ("after-small-result", 400, 1, False, False, "apply_patch"),
+    ("after-large-result", 20000, 1, False, False, "apply_patch"),
+    ("large-argument", 20000, 40, False, False, "apply_patch"),
+    ("streamed", 20000, 1, True, False, "apply_patch"),
+    ("reused-connection", 400, 1, False, True, "apply_patch"),
+    ("free-choice", 400, 1, False, False, None),
+]
+
+
+def build_messages(result_bytes: int, patch_lines: int) -> list[dict]:
+    messages: list[dict] = [
+        {"role": "system", "content": SYSTEM},
+        {
+            "role": "user",
+            "content": (
+                "In src/Money.php, rename every variable named $oldN to $newN, keeping the same "
+                "numbering. Make the edit with apply_patch in a single call."
+            ),
+        },
+    ]
+    if result_bytes:
+        messages += [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": json.dumps({"path": "src/Money.php"}),
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "name": "read_file",
+                "content": tool_result(result_bytes),
+            },
+        ]
+    if patch_lines > 1:
+        messages[1]["content"] += (
+            f"\n\nThe file has {patch_lines} such variables; include all of them in one patch."
+        )
+    return messages
+
+
+def run_case(endpoint: Endpoint, case: tuple, repeat: int) -> dict:
+    name, result_bytes, patch_lines, stream, reuse, force = case
+    outcomes = {"ok": 0, "malformed": 0, "no-call": 0, "http-error": 0, "apply_patch": 0}
+    detail: list[str] = []
+
+    for _ in range(repeat):
+        messages = build_messages(result_bytes, patch_lines)
+        try:
+            status, text = endpoint.call(messages, stream, reuse, force)
+        except Exception as error:  # noqa: BLE001 — a transport failure is a result here
+            outcomes["http-error"] += 1
+            detail.append(f"{type(error).__name__}: {error}")
+            endpoint.close()
+            continue
+
+        if status >= 400:
+            outcomes["http-error"] += 1
+            detail.append(f"HTTP {status}: {text[:200]}")
+            continue
+
+        calls, parse_error = extract_tool_calls(endpoint.engine, stream, text)
+        if parse_error:
+            outcomes["malformed"] += 1
+            detail.append(parse_error)
+            continue
+        if stream:
+            calls = assemble_streamed(calls)
+        if not calls:
+            outcomes["no-call"] += 1
+            continue
+
+        # Every call returned is validated, not just apply_patch.
+        #
+        # The first version only looked for apply_patch and counted everything else as "no call".
+        # The model reads the file before patching it, which is correct behaviour, so a perfectly
+        # well-formed read_file call was recorded as a refusal — twelve times, and the probe then
+        # reported that the tool-call path was never exercised. The engine was never the problem.
+        #
+        # apply_patch coverage is still tracked separately: it is the shape that broke ollama, a
+        # single freeform string carrying a whole patch, and a stack that handles small structured
+        # arguments is not thereby known to handle that one.
+        bad = None
+        for call in calls:
+            arguments, argument_error = arguments_of(call)
+            if argument_error or not isinstance(arguments, dict):
+                bad = argument_error or "arguments were not an object"
+                break
+            called = (call.get("function") or {}).get("name")
+            if not called:
+                bad = "tool call carried no function name"
+                break
+            if called == "apply_patch":
+                outcomes["apply_patch"] += 1
+                if not isinstance(arguments.get("input"), str) or not arguments["input"].strip():
+                    bad = "apply_patch call carried no `input` string"
+                    break
+        if bad:
+            outcomes["malformed"] += 1
+            detail.append(bad)
+            continue
+        outcomes["ok"] += 1
+
+    if reuse:
+        endpoint.close()
+    return {"case": name, **outcomes, "detail": detail[:3]}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--engine", choices=("llamacpp", "ollama"), default="llamacpp")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int)
+    parser.add_argument("--model", default="gpt-oss-20b")
+    parser.add_argument("--repeat", type=int, default=3)
+    args = parser.parse_args()
+
+    port = args.port or (8071 if args.engine == "llamacpp" else 11434)
+    endpoint = Endpoint(args.engine, args.host, port, args.model)
+
+    schema_hash = hashlib.sha256(json.dumps(TOOLS, sort_keys=True).encode()).hexdigest()[:12]
+    print(f"engine={args.engine} host={args.host}:{port} model={args.model} "
+          f"repeat={args.repeat} tool_schema={schema_hash}")
+    print()
+    print(f"{'case':<22}{'ok':>4}{'malformed':>11}{'no-call':>9}{'http-error':>12}{'apply_patch':>13}")
+    print("-" * 71)
+
+    failures = 0
+    rows = []
+    for case in CASES:
+        row = run_case(endpoint, case, args.repeat)
+        rows.append(row)
+        print(f"{row['case']:<22}{row['ok']:>4}{row['malformed']:>11}"
+              f"{row['no-call']:>9}{row['http-error']:>12}{row['apply_patch']:>13}")
+        # A refusal to call the tool is the model's choice and is reported without failing the
+        # probe. A malformed call or an HTTP error is the stack, and is what this exists to catch.
+        if row["malformed"] or row["http-error"]:
+            failures += 1
+
+    detailed = [r for r in rows if r["detail"]]
+    if detailed:
+        print()
+        print("first failures per case:")
+        for row in detailed:
+            for line in row["detail"]:
+                print(f"  {row['case']}: {line}")
+
+    no_call_only = [r["case"] for r in rows if r["no-call"] and not r["malformed"] and not r["http-error"]]
+    if no_call_only:
+        print()
+        print("declined to call the tool (model behaviour, not a stack defect): "
+              + ", ".join(no_call_only))
+
+    print()
+    if failures:
+        print(f"CONFORMANCE FAILED: {failures} case(s) produced a malformed call or an HTTP error.")
+        print("Do not attribute benchmark results to the model until this is clean.")
+        return 1
+
+    # "Every call was well formed" is not a pass when there were no calls. The first version of
+    # this probe printed OK over twelve prose replies and zero tool calls, which is the precise
+    # failure mode it exists to catch, one level up.
+    total_ok = sum(row["ok"] for row in rows)
+    if total_ok == 0:
+        print("CONFORMANCE INCONCLUSIVE: the engine never returned a tool call at all, so the")
+        print("tool-call path was never exercised. This certifies nothing.")
+        return 2
+
+    unexercised = [row["case"] for row in rows if not row["ok"]]
+    if unexercised:
+        print("CONFORMANCE PARTIAL: well formed wherever a call was made, but these cases never")
+        print("produced one and remain unchecked: " + ", ".join(unexercised))
+        return 2
+
+    patch_calls = sum(row["apply_patch"] for row in rows)
+    print(f"CONFORMANCE OK: {total_ok} turns returned tool calls, every one well formed"
+          f" ({patch_calls} of them apply_patch).")
+    if patch_calls == 0:
+        print("Note: no apply_patch call was produced, so the freeform-string argument shape —")
+        print("the one that breaks ollama — was not exercised.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -124,10 +124,40 @@ _cline_assert_repo_root() {
 #
 # --system REPLACES Cline's own system prompt, which is where its tool definitions and tool-call
 # protocol live. Overriding it would remove the agent loop this adapter exists to use.
+# How the completion report is asked for.
+#
+#   message  (default)  the model's final assistant message must be the JSON object
+#   file                the model writes the JSON to a path with its file tool
+#
+# The case for `file` is mechanical rather than aesthetic. This model emits tool calls reliably —
+# 14 of 14 well formed at the engine level, including a ~1 KB freeform payload after a 20 KB tool
+# result — and final text unreliably: 33% to 40% of first attempts end with a reasoning block and a
+# tool call and no text block at all, which is the single largest non-success outcome measured
+# here. Asking for the report through the channel that works should remove that class entirely.
+#
+# It is opt-in and unmeasured. An earlier change tonight was applied on equally good reasoning and
+# made things measurably worse, so nothing becomes the default here until a round says it should.
+_cline_report_channel() {
+    if declare -F provider_report_channel >/dev/null; then
+        provider_report_channel
+    else
+        echo "${HANDOFF_REPORT_CHANNEL:-message}"
+    fi
+}
+
 _cline_build_prompt() {
-    local dev="$1" prompt="$2" schema="$3"
+    local dev="$1" prompt="$2" schema="$3" report_rel="${4:-}"
     local compact
     compact="$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])),separators=(",",":")))' "$schema")"
+
+    if [[ -n "$report_rel" ]]; then
+        # The path is under .handoff/runs, which every scope and litter gate already excludes, so
+        # writing it cannot be scored as a file the plan never named.
+        printf '%s\n\n%s\n\nWhen the work is finished, write your completion report to the file `%s`, creating it if necessary. Its entire contents must be a single JSON object conforming to the schema below — no prose, no markdown code fences, no explanation. Write the file with your normal file-writing tool; do not put the report in your reply.\n\nSchema:\n%s\n' \
+            "$dev" "$prompt" "$report_rel" "$compact"
+        return
+    fi
+
     printf '%s\n\n%s\n\nWhen the work is finished, your FINAL message must be a single JSON object conforming to this JSON schema, and nothing else — no prose, no markdown code fences, no explanation.\n\nSchema:\n%s\n' \
         "$dev" "$prompt" "$compact"
 }
@@ -210,9 +240,32 @@ _cline_prompt_validate() {
     local raw reply err_file
     raw="$(mktemp)"; reply="$(mktemp)"; err_file="$(mktemp)"
 
-    local base_prompt; base_prompt="$(_cline_build_prompt "$dev" "$prompt" "$schema")"
+    # Where the model is asked to put the report, when the channel is `file`. Under .handoff/runs,
+    # which every scope and litter gate excludes. Removed first: a stale file from a previous
+    # attempt would otherwise be read as this attempt's report — the model would get credit for a
+    # report it never wrote, which is precisely the fabrication the gates exist to catch.
+    local report_abs="" report_rel=""
+    if [[ "$(_cline_report_channel)" == file ]]; then
+        report_abs="$(dirname "$result")/agent-report.json"
+        report_rel="${report_abs#"$root"/}"
+        rm -f "$report_abs"
+    fi
+
+    local base_prompt; base_prompt="$(_cline_build_prompt "$dev" "$prompt" "$schema" "$report_rel")"
     CLINE_LIVE_LOG="$log" _cline_invoke "$root" "$raw" "$base_prompt" "$session"
     local status=$?
+
+    # Prefer the file when that channel was requested, and fall through to the final message when
+    # it is absent. The fallback is deliberate: it turns "the model ignored the instruction" into
+    # the old behaviour rather than into a lost run.
+    if [[ -n "$report_abs" && -s "$report_abs" ]]; then
+        cp "$report_abs" "$reply"
+        if python3 "$checker" "$reply" "$schema" "$result" >"$err_file"; then
+            rm -f "$raw" "$reply" "$err_file"
+            return "$status"
+        fi
+        echo "==> report file present but did not validate; falling back to the final message" >&2
+    fi
 
     _cline_final_text "$raw" "$reply"
     if python3 "$checker" "$reply" "$schema" "$result" >"$err_file"; then
