@@ -26,7 +26,29 @@ control for published results before re-running its label, or the baseline is go
 | Round | Arm | n | What it settles | Est. |
 | --- | --- | ---: | --- | ---: |
 | 11 | `lcgptossl` — message channel | 20 | A clean control under the current harness, and whether the litter rule changed anything (round 6: 1/15) | ~2h |
-| 13 | `semantic` plan, `lcgptossl` | 12 | **A different axis**: does a plausible-wrong answer survive the gates? Never run against a model | ~1h |
+
+### Round 13 — the gates held, because the wrong answer was never produced
+
+Six runs of `semantic` against `lcgptossl`: 5/6 usable, 3/6 accepted. The question the plan exists
+to ask is not answered by those numbers, though — it asks whether an implementation that satisfies
+six hand-picked examples agrees with the specification *everywhere else*.
+
+All five surviving implementations were extracted and fuzzed against a reference built from the
+plan's own words: 4000 random trials each, varying period length, line count, fees and active days.
+**Zero disagreements, in all five.** Every one implements largest-remainder correctly, including
+the tie-break by insertion order, and every one gets the odd-`D` half-up case right — `intdiv($sum
++ intdiv($D,2), $D)` differs from `floor(sum/D + 1/2)` only when `sum/D` has fractional part
+exactly one half, which requires `D` even, where the two coincide.
+
+The fuzzer was mutation-tested against the wrong answer the plan warns about — rounding each line
+and adding the results — which it flags on 920 of 4000 trials. And that wrong answer would not have
+reached the gates anyway: acceptance criterion 2 requires a subtotal of 1000 on three lines of
+1000 cents over ten of thirty days, and rounding per line gives 999.
+
+So on this axis the harness is not the thing being tested and passed; it was never put under
+strain. A plan whose criteria are computed by hand from worked examples appears to be enough. The
+open question is the one this cannot answer: whether a criteria set written *without* that care
+would have caught it.
 
 ### 12 and 14 are closed without being run
 
@@ -74,6 +96,48 @@ apart.
 | --- | --- | ---: | --- | ---: |
 | 15 | `lcgptosslwhole` — whole-file writes under ~400 lines | 15 | Does rewriting the file wholesale eliminate mis-anchored partial edits? Targets the #1 observed failure | ~1.5h |
 | 16 | `lcgptosslsyntax` — linter as a post-write hook | 15 | Does feeding a parse error back immediately let the model repair a truncation, instead of building on a broken file for the rest of its budget? | ~1.5h |
+### The window is not the variable. Conversation depth is.
+
+`llamacpp-serve start` truncates the server log, so each session's parse-failure rate is measured
+in isolation rather than cumulatively:
+
+| Session | n_ctx | Completions | Discarded | Rate |
+| --- | ---: | ---: | ---: | ---: |
+| earlier era | 32k / 64k | 1011 | 7 | 0.69% |
+| overnight | 131072 | 1743 | 23 | 1.32% |
+| morning wave | 98304 | 359 | 4 | 1.11% |
+
+Pulling the window back from 128k to 96k did not move the rate — 4 observed against 4.7 expected if
+nothing had changed. The queue file said in advance that eight repetitions could not settle this,
+and it could not.
+
+But the depth table did not change either, and that is the finding. At 96k: **0 failures in 99
+completions below 16k, and 2 in 33 above 48k (6.06%).** The fault tracks how deep the conversation
+has gone, not how large the window is — which is exactly why shrinking the window achieved nothing.
+A conversation that reaches 50k fails at the same rate whether the ceiling is 96k or 128k.
+
+**So the lever is step size, not `n_ctx`.** Keep the window large enough that nothing overflows, and
+keep steps small enough that conversations stay shallow. Those are not in tension.
+
+### The missing reports are a serving-stack defect, and the retries are wasted
+
+`tools/final-turn-shape` gives every `patch-ok-no-report` round the same signature:
+
+    att 1   finish=error       text? NO    last blocks: reasoning,tool,reasoning
+    att 2   finish=completed   text? yes
+
+The model emits the report, the harmony parser rejects it, Cline reports an error with no text
+block, and the harness records "no report". Across 48 runs: 24 attempts finished in error with no
+text, **22 of 48 runs spent a second attempt**, and 15 of those still ended `patch-ok-no-report`.
+
+Roughly 40% of all runs paid double for a defect in the serving stack, and the retry did not fix it
+in 15 of 19 cases. Two things follow, and neither is a benchmark:
+
+1. **`llama-server` is pinned at `b10331`.** Harmony parsing has moved upstream since. Upgrading is
+   the cheapest possible fix and is testable in minutes with `tools/engine-conformance`.
+2. **Do not retry a round whose only defect is a missing report**, when the tree is already usable.
+   The retry is chasing an artifact the parser will discard again.
+
 ### Round 17 — answered from the server's own log, in seconds
 
 It did not need an hour of GPU time. `llama-server` has been writing the evidence the whole time,
