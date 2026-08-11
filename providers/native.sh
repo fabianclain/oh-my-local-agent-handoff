@@ -70,5 +70,6 @@ provider_run() {
         --temp "$NATIVE_TEMP" \
         --max-turns "$NATIVE_MAX_TURNS" \
         --writable "${HANDOFF_PLAN_WRITABLE:-}" \
-        --readonly "${HANDOFF_PLAN_READONLY:-}"
+        --readonly "${HANDOFF_PLAN_READONLY:-}" \
+        ${NATIVE_EXTRA_ARGS:-}
 }

@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+#
+# fuzz-all-semantic — check every accepted semantic implementation against the specification.
+#
+#   bench/checks/fuzz-all-semantic <results/semantic dir>
+#
+# Acceptance is the weaker claim. Today a run scored 4/4 accepted and 8/8 criteria while one of the
+# four disagreed with the spec on 2,283 of 4,000 fuzzed trials — correct amounts, wrong order,
+# passing the plan's own ordering criterion because that example used three identical lines and
+# every order was therefore the same order.
+#
+# So this runs after every semantic wave: extract each implementation from its diff, and fuzz it.
+# A run that the gates accepted and the fuzzer rejects is the finding worth waking up to.
+
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$HERE/../.." && pwd)"
+RESULTS="${1:?usage: fuzz-all-semantic <results/semantic dir>}"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+BAD=0 CHECKED=0
+for arm in "$RESULTS"/*/; do
+    [[ -d "$arm" ]] || continue
+    for run in "$arm"*/; do
+        [[ -f "$run/tree.diff" ]] || continue
+        label="$(basename "$arm")/$(basename "$run")"
+        outcome="$(grep '^outcome=' "$run/metrics" 2>/dev/null | cut -d= -f2)"
+        dir="$WORK/$(basename "$arm")-$(basename "$run")"
+        mkdir -p "$dir"
+        cp "$REPO"/bench/fixtures/billing/*.php "$dir/" 2>/dev/null
+
+        python3 - "$run" "$dir" <<'PY' || continue
+import re, sys, pathlib
+run, dest = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+diff = (run / "tree.diff").read_text(errors="replace")
+m = re.search(r"diff --git a/bench/fixtures/billing/Proration\.php.*?(?=^diff --git |\Z)", diff, re.S | re.M)
+if not m:
+    sys.exit(1)
+body = "".join(l[1:] + "\n" for l in m.group(0).splitlines()
+               if l.startswith("+") and not l.startswith("+++"))
+(dest / "Proration.php").write_text(body)
+inv = dest / "Invoice.php"
+t = inv.read_text()
+inv.write_text(t.rstrip()[:-1].rstrip() + "\n"
+               "\n    public function proration(): Proration\n"
+               "    {\n        return new Proration($this);\n    }\n}\n")
+PY
+
+        out="$(php "$HERE/semantic-proration-fuzz.php" "$dir" 2>&1 | tail -1)"
+        CHECKED=$(( CHECKED + 1 ))
+        n="$(grep -oE '^[0-9]+' <<<"${out##*: }" || echo 0)"
+        if [[ "$out" == *"0/4000"* ]]; then
+            printf '  %-22s %-20s correct\n' "$label" "$outcome"
+        else
+            printf '  %-22s %-20s WRONG — %s\n' "$label" "$outcome" "$out"
+            [[ "$outcome" == accepted || "$outcome" == patch-ok-no-report ]] && BAD=$(( BAD + 1 ))
+        fi
+    done
+done
+
+echo
+echo "$CHECKED implementation(s) fuzzed."
+if (( BAD > 0 )); then
+    echo "$BAD were ACCEPTED BY THE GATES AND ARE WRONG. That is a criteria gap, not a model failure:"
+    echo "the plan's examples do not discriminate the case they disagree on. Find a discriminating"
+    echo "case from an observed failure — an invented one nearly always fails to discriminate."
+fi
+exit $(( BAD > 0 ? 1 : 0 ))

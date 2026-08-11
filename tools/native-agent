@@ -83,6 +83,9 @@ def emit(log, kind: str, event: dict) -> None:
 # tools
 
 
+DISABLED: set[str] = set()
+
+
 def tool_schemas(include_report: bool, schema: dict) -> list[dict]:
     tools = [
         {"type": "function", "function": {
@@ -116,7 +119,8 @@ def tool_schemas(include_report: bool, schema: dict) -> list[dict]:
             "parameters": {"type": "object", "required": ["commands"], "properties": {
                 "commands": {"type": "array", "items": {"type": "string"}}}}}},
     ]
-    if include_report:
+    tools = [t for t in tools if t["function"]["name"] not in DISABLED]
+    if include_report and "submit_report" not in DISABLED:
         tools.append({"type": "function", "function": {
             "name": "submit_report",
             "description": "Submit the completion report. Call this when the work is finished.",
@@ -386,11 +390,22 @@ def main() -> int:
     # Colon-separated, exported by bin/handoff from tools/plan-files. Empty means "unknown", and
     # unknown must not become "forbidden" — a provider run outside the driver would refuse every
     # write and look like a total failure.
+    # Design variants, so the loop's own choices can be measured instead of assumed. Each is one
+    # flag here and a three-line provider overlay, which is the practical benefit of owning the
+    # loop: round 15's whole-file question waited months for a benchmark arm and is now a flag.
+    parser.add_argument("--no-replace", action="store_true",
+                        help="drop replace_in_file, forcing whole-file writes (round 15)")
+    parser.add_argument("--no-report-tool", action="store_true",
+                        help="no submit_report tool; the report comes from the no-tools final turn")
     parser.add_argument("--writable", default="")
     parser.add_argument("--readonly", default="")
     parser.add_argument("--timeout", type=int, default=600)
     args = parser.parse_args()
 
+    if args.no_replace:
+        DISABLED.add("replace_in_file")
+    if args.no_report_tool:
+        DISABLED.add("submit_report")
     WRITABLE.update(p for p in args.writable.split(":") if p)
     READONLY.update(p for p in args.readonly.split(":") if p)
     (args.repo / SCRATCH).mkdir(parents=True, exist_ok=True)
