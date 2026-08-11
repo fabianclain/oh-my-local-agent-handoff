@@ -261,6 +261,46 @@ now advisory rather than verdict-bearing, so it will not reject the arm, but the
 truncation is the shared failure mode of both approaches, and what actually distinguishes them is
 whether a syntax check runs before the round is spent. Round 16 may matter more than round 15.
 
+### Round 15, first look: the failure is not truncation. It is diff syntax
+
+`nativewhole` finally made round 15 runnable — one flag rather than a client that offers a
+different tool set. The feared trade-off did not appear. Whole-file writes truncated **nothing**:
+every file came back complete, with the right additions. What broke a round instead:
+
+    -}
+    ++
+    ++    /**
+    ++     * Render the total in the requested currency.
+    ++     */
+    ++    public function summaryIn(...): string
+    + }
+
+Read past the diff's own `+` column. The file on disk contains a literal `+` on every added line
+and a literal leading space on the unchanged closing brace. Told to write the file whole, the model
+wrote a **patch** into the `.php`. Its parse error at line 67 failed all nine functional criteria —
+each of them loads the file first — for 2 of 11, through two attempts, 394 seconds, 71 requests.
+
+Rare across the archive: 2 runs of 73 show diff-prefixed lines, and only 2 of 73 end with a PHP
+parse error at all. So round 16's premise is weakly supported *on this fixture*; the greenfield
+Laravel rounds that motivated it broke far more often, and `wide` is not where its value shows up.
+
+`write_file` and `replace_in_file` now run the language's parse check as a postcondition and hand
+the error back on the turn the file is written. That is round 16's idea as a **mechanism** rather
+than the instruction that was measured at no effect (n=20 per arm, damage identical at 5/20).
+
+**The first run of this arm is void and so is any reading of it**: it ran against a 32768 server
+while every document said 98304, and stopped on the context budget in 3 of 3 provider calls at
+~28.8k. Whole-file writes do consume context faster — each write puts a whole file in the history —
+but "they exhaust the window" cannot be concluded from a window a third of the stated size.
+
+### Queued from tonight, not yet run
+
+| Question | Why it is worth an arm |
+| --- | --- |
+| Does `--max-turns 40` bind? | One `wide` round ended at the limit with 11 of 11 criteria met and no report — the tree was finished and there was no turn left to say so. At 98304 there is room for more turns, but more turns means deeper context, and depth is what correlates with discarded output. Measure the turn-limit rate before changing it |
+| Is the 17% re-read rate worth attacking? | `tools/turn-economy` puts 1 in 6 reads and 1 in 5 searches at redundant — a file read again with no edit to it in between. A tool result could say "you read this at turn N and it has not changed", which is information rather than instruction. Unproven, and the register is full of prompt-layer changes that moved nothing |
+| Does the report re-ask actually recover rounds? | Landed tonight and measured only on fixtures. The population that would size it — the 20-run Cline control — was deleted by `--force` before it could be used |
+
 ## Considered and not queued, with the reason
 
 | Not running | Why not |
