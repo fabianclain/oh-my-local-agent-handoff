@@ -54,6 +54,18 @@ import time
 import urllib.error
 import urllib.request
 
+# The model's own directory, and the only place outside the plan's file list it may create
+# anything. templates/agent-rules.md has said so for a long time; nothing enforced it, and two of
+# four `wide` rounds were rejected for writing tmp/test_*.php and verify.sh instead. The tool now
+# creates it, names it in its own description, and steers writes there.
+SCRATCH = ".handoff/scratch"
+
+# Commands the agent rules forbid, enforced rather than requested. "Do not create git commits, do
+# not amend, do not stash, do not run git checkout or git reset" has been in the instructions
+# throughout; an instruction is not a mechanism, which round 16 measured at n=20 per arm.
+FORBIDDEN = re.compile(
+    r"\bgit\s+(commit|push|amend|stash|checkout|reset|rebase|cherry-pick|clean)\b")
+
 TOOL_TIMEOUT = 120
 OUTPUT_CAP = 20000
 # Held back from the loop so a round that runs long still ends with a report rather than an
@@ -86,7 +98,9 @@ def tool_schemas(include_report: bool, schema: dict) -> list[dict]:
                 "query": {"type": "string"}, "path": {"type": "string"}}}}},
         {"type": "function", "function": {
             "name": "write_file",
-            "description": "Write a file in full. Creates it if absent, replaces it if present.",
+            "description": ("Write a file in full. Creates it if absent, replaces it if "
+                            f"present. Anything not named by the plan belongs in {SCRATCH}/, "
+                            "which is yours and is ignored by the verifier."),
             "parameters": {"type": "object", "required": ["path", "content"], "properties": {
                 "path": {"type": "string"}, "content": {"type": "string"}}}}},
         {"type": "function", "function": {
@@ -97,7 +111,8 @@ def tool_schemas(include_report: bool, schema: dict) -> list[dict]:
                 "path": {"type": "string"}, "old": {"type": "string"}, "new": {"type": "string"}}}}},
         {"type": "function", "function": {
             "name": "run_commands",
-            "description": "Run shell commands in the repository root and return their output.",
+            "description": ("Run shell commands in the repository root and return their "
+                            "output. git commands that change history are refused."),
             "parameters": {"type": "object", "required": ["commands"], "properties": {
                 "commands": {"type": "array", "items": {"type": "string"}}}}}},
     ]
@@ -122,6 +137,25 @@ class ToolFault(Exception):
         super().__init__(detail)
         self.kind = kind
         self.detail = detail
+
+
+def resolve(repo: pathlib.Path, raw: str) -> pathlib.Path:
+    """Resolve a model-supplied path, and refuse anything that leaves the repository.
+
+    `repo / path.lstrip("/")` was the previous behaviour and it silently rewrites `/etc/hosts` to
+    `<repo>/etc/hosts`, which is not an error and not what was asked — the worst combination. `..`
+    escapes were unhandled entirely.
+    """
+    text = str(raw)
+    root = repo.resolve()
+    # An absolute path is treated as absolute and then checked, NOT stripped to a relative one.
+    # Stripping is what the docstring above warns against and what the first version of this
+    # function did anyway: /etc/evil.txt became <repo>/etc/evil.txt and reported success, so the
+    # model was told its write landed somewhere it did not.
+    candidate = (pathlib.Path(text) if text.startswith("/") else repo / text).resolve()
+    if candidate != root and root not in candidate.parents:
+        raise ToolFault("scope", f"{text} resolves outside the repository; refusing")
+    return candidate
 
 
 def read_text_strict(path: pathlib.Path) -> str:
@@ -176,7 +210,7 @@ def run_tool(repo: pathlib.Path, name: str, args: dict) -> str:
         if name == "read_files":
             out = []
             for item in args.get("files") or []:
-                path = repo / str(item.get("path", "")).lstrip("/")
+                path = resolve(repo, item.get("path", ""))
                 if not path.exists():
                     out.append(f"--- {item.get('path')} ---\n(no such file)")
                     continue
@@ -194,13 +228,14 @@ def run_tool(repo: pathlib.Path, name: str, args: dict) -> str:
             return clamp(proc.stdout or f"no matches for {query!r}")
 
         if name == "write_file":
-            path = repo / str(args["path"]).lstrip("/")
+            path = resolve(repo, args["path"])
             content = args.get("content") or ""
             atomic_write(path, content)
-            return f"wrote {args['path']} ({len(content)} bytes, {content.count(chr(10)) + 1} lines)"
+            where = path.relative_to(repo.resolve())
+            return f"wrote {where} ({len(content)} bytes, {content.count(chr(10)) + 1} lines)"
 
         if name == "replace_in_file":
-            path = repo / str(args["path"]).lstrip("/")
+            path = resolve(repo, args["path"])
             if not path.exists():
                 return f"error: {args['path']} does not exist"
             body = read_text_strict(path)
@@ -218,6 +253,10 @@ def run_tool(repo: pathlib.Path, name: str, args: dict) -> str:
         if name == "run_commands":
             out = []
             for command in args.get("commands") or []:
+                if FORBIDDEN.search(command):
+                    out.append(f"$ {command}\nrefused: the plan forbids git history changes; "
+                               "leave every change uncommitted in the working tree\n(exit 1)")
+                    continue
                 proc = subprocess.run(["bash", "-o", "pipefail", "-c", command], cwd=repo,
                                       capture_output=True, text=True, timeout=TOOL_TIMEOUT)
                 body = (proc.stdout or "") + (proc.stderr or "")

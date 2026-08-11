@@ -1104,6 +1104,41 @@ else
     fail "report-probe conflates diverting to a tool with the parser discarding a message"
 fi
 
+# --- native must not be talked out of the repository, or into rewriting history ------------------
+# The rules have always said "do not commit, do not stash, do not checkout" and "scratch goes in
+# .handoff/scratch". Instructions are not a mechanism — round 16 measured a prompt-layer arm at
+# n=20 per side and it moved nothing — so the tool enforces them.
+if python3 - <<'GUARDS'
+import importlib.machinery, importlib.util, io, json, pathlib, sys, tempfile
+l = importlib.machinery.SourceFileLoader("na", "tools/native-agent")
+na = importlib.util.module_from_spec(importlib.util.spec_from_loader("na", l)); l.exec_module(na)
+d = pathlib.Path(tempfile.mkdtemp())
+call = lambda n, a: na.dispatch(d, n, a, "c", io.StringIO())
+
+# An absolute path must be refused, not quietly reinterpreted as repo-relative. The first version
+# stripped the leading slash, so /etc/evil.txt became <repo>/etc/evil.txt and reported success.
+assert "refusing" in call("write_file", {"path": "/etc/evil.txt", "content": "x"}), "absolute path accepted"
+assert not pathlib.Path("/etc/evil.txt").exists(), "a write escaped the repository"
+assert "refusing" in call("write_file", {"path": "../../evil.txt", "content": "x"}), ".. escape accepted"
+assert "refusing" in call("read_files", {"files": [{"path": "../../etc/hostname"}]}), ".. read accepted"
+
+# An absolute path INSIDE the repository is legitimate and must still work.
+assert "wrote" in call("write_file", {"path": str(d / "ok.php"), "content": "<?php\n"}), "inside-repo absolute refused"
+
+for bad in ("git commit -m x", "git push", "git checkout -- .", "git reset --hard"):
+    assert "refused" in call("run_commands", {"commands": [bad]}), f"{bad} was not refused"
+assert "(exit 0)" in call("run_commands", {"commands": ["echo fine"]}), "an ordinary command was refused"
+
+# The scratch directory has to be named where the model will see it.
+assert na.SCRATCH in json.dumps(na.tool_schemas(False, {})), "scratch not named in the tool schemas"
+sys.exit(0)
+GUARDS
+then
+    pass "native refuses paths outside the repo and git history changes"
+else
+    fail "native's scope and history guards are gone — the rules are back to being requests"
+fi
+
 echo
 if [[ "$FAILURES" -eq 0 ]]; then echo "all checks passed"; else echo "$FAILURES check(s) failed"; fi
 exit $(( FAILURES > 0 ? 1 : 0 ))

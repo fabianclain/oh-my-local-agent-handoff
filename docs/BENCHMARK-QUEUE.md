@@ -27,7 +27,7 @@ control for published results before re-running its label, or the baseline is go
 | --- | --- | ---: | --- | ---: |
 | 11 | `lcgptossl` — message channel | 20 | A clean control under the current harness, and whether the litter rule changed anything (round 6: 1/15) | ~2h |
 
-### Round 13 — the gates held, because the wrong answer was never produced
+### Round 13 — REVISED. The wrong answer does get produced, and the gates passed it
 
 Six runs of `semantic` against `lcgptossl`: 5/6 usable, 3/6 accepted. The question the plan exists
 to ask is not answered by those numbers, though — it asks whether an implementation that satisfies
@@ -45,10 +45,32 @@ and adding the results — which it flags on 920 of 4000 trials. And that wrong 
 reached the gates anyway: acceptance criterion 2 requires a subtotal of 1000 on three lines of
 1000 cents over ten of thirty days, and rounding per line gives 999.
 
-So on this axis the harness is not the thing being tested and passed; it was never put under
-strain. A plan whose criteria are computed by hand from worked examples appears to be enough. The
-open question is the one this cannot answer: whether a criteria set written *without* that care
-would have caught it.
+**That conclusion was wrong, and four more runs overturned it the same day.** The same plan through
+the native provider produced 4/4 accepted, 8/8 criteria — and one of the four disagrees with the
+specification on **2,283 of 4,000 fuzzed trials**.
+
+The amounts are right every time; the *order* is not. The plan requires the allocation "keyed by
+line name, in the order the lines were added". That implementation sorts entries by remainder to
+distribute the leftover cents — correct — and then builds the returned array in the sorted order
+instead of restoring insertion order.
+
+**It passes the plan's own ordering criterion**, because the worked example uses three identical
+lines: every remainder ties, the tie-break by index preserves the original order, and the check
+goes green. Give the lines unequal remainders and it is wrong more than half the time.
+
+The lesson is narrower and more useful than "hand-computed examples suffice":
+
+> A worked example that is symmetric in the thing it tests cannot test it. Three identical lines
+> cannot detect an ordering bug, because every order is the same order.
+
+The criteria now carry a case with unequal remainders — D=11, fees 2663/2909/693 over 3/8/8 days —
+taken from an observed failure rather than invented. The first replacement WAS invented, used three
+full-period lines, and discriminated nothing: with every line active the whole period the division
+is exact, no cents are distributed, and the sort never runs. The one now in the plan is verified to
+fail the bad implementation and pass the other three.
+
+Corrected tallies: **native is 3/4 correct on semantic, not 4/4**, and across both providers the
+plausible-wrong answer appears in 1 of 9 implementations rather than 0 of 5.
 
 ### 12 and 14 are closed without being run
 
