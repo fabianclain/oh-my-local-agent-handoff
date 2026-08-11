@@ -101,7 +101,38 @@ If richer feedback does not reduce attempts, it is costing tokens for nothing.
 
 ---
 
-## 0. Ask for the report through the channel that works — built, not yet measured
+## 0. Ask for the report through the channel that works — the premise held, the diagnosis did not
+
+**Update, 2026-08-12.** The observation below is right and the reasoning from it was incomplete in
+a way that mattered. "33–40% of first attempts end with a reasoning block, a tool call, and no text
+block" is a *symptom of the transport*, not of the model preferring one channel:
+
+- llama.cpp's harmony parser rejects the completion, the server returns 500, and **the provider
+  call ends**. Neither the native loop nor Cline retried. 22 of 29 archived runs that hit that
+  fault lost their report, against 1 of 42 that did not (Fisher p = 2.5e-11).
+- Retrying the completion — the conversation is unchanged and still valid — recovers it. First
+  measured live the same night: a round hit the fault, retried once, and reported. Under the old
+  loop it would have been another `patch-ok-no-report`.
+
+So the channel question is narrower than it looked. Two things are now measured rather than argued:
+
+| Depth | How the report actually arrives |
+| --- | --- |
+| below ~9k | the `submit_report` **tool**, in 6 of 7 rounds. The fallback is never reached |
+| `wide`'s 14–33k | the tool goes unused entirely; the no-tools fallback carries every round |
+
+And the fallback's headline "100%" was measured on a few-hundred-token fixture. At depth it failed
+three of four, three different ways — an empty response, reasoning truncated mid-sentence, and a
+tool call emitted as plain text with the report nested inside its `content` argument, which the
+extractor mistook for the report itself.
+
+`tools/report-audit` reports this per round now, so the question stops being answered from
+impressions. What remains genuinely open is whether *offering* `submit_report` at depth helps at
+all, given the model does not reach for it there — which is what tonight's `nativemsg` arm asks.
+
+---
+
+### Original entry, kept because the observation is still the reason this was queued
 
 **The observation.** This model emits tool calls reliably and final text unreliably. At the engine
 level, 14 of 14 tool calls were well formed, including a ~1 KB freeform payload after a 20 KB tool
