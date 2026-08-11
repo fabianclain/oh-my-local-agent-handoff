@@ -462,20 +462,11 @@ def call_model(host: str, port: int, model: str, messages: list[dict], tools: li
         return json.loads(response.read().decode("utf-8", "replace"))
 
 
-def extract_json_object(text: str):
-    """Find the report inside whatever the model actually said, or return None.
+def _balanced_objects(text: str):
+    """Every balanced {...} in `text` that parses to an object, in order of appearance.
 
-    `re.search(r"\\{.*\\}", text, re.S)` was here, and it is wrong in both directions. It is greedy,
-    so on a turn that reasons before answering it spans from the first brace in the prose to the
-    last one anywhere — and it matches braces that are not JSON at all. An observed report turn
-    reasoned about a shell loop containing `>/dev/null` and `${f}`, and the regex handed
-    `json.loads` a slice starting mid-sentence: JSONDecodeError, report lost, round recorded as
-    `patch-ok-no-report` although the model had done the work.
-
-    Instead: walk the string tracking brace depth (ignoring braces inside JSON strings), collect
-    every balanced candidate, and return the LAST one that parses to an object. Last, because a
-    model that reasons and then answers puts the answer at the end, and because a truncated final
-    object leaves the earlier complete ones intact.
+    Also descends into string VALUES that themselves contain JSON. That is not defensive
+    generality — it is the observed case. See extract_json_object.
     """
     candidates = []
     depth = 0
@@ -502,14 +493,52 @@ def extract_json_object(text: str):
                 depth -= 1
                 if depth == 0 and start >= 0:
                     candidates.append(text[start:index + 1])
-    for candidate in reversed(candidates):
+
+    for candidate in candidates:
         try:
             parsed = json.loads(candidate)
         except ValueError:
             continue
-        if isinstance(parsed, dict):
-            return parsed
-    return None
+        if not isinstance(parsed, dict):
+            continue
+        yield parsed
+        for value in parsed.values():
+            if isinstance(value, str) and "{" in value:
+                yield from _balanced_objects(value)
+
+
+def extract_json_object(text: str, wanted: "frozenset[str] | set[str] | tuple" = ()):
+    """Find the REPORT inside whatever the model actually said.
+
+    `wanted` is the set of keys the report schema declares. Without it this returns the last
+    balanced object, which is what it used to do and what is right for a plain answer. With it,
+    the candidate carrying the most schema keys wins — and that is the difference between a
+    recorded report and `patch-ok-no-report`.
+
+    The case that forced it, from a live round at 16.3k depth. Asked for the report with NO tools
+    registered, the model tried to call one anyway and, with no schema for llama.cpp to parse the
+    call against, the harmony header arrived as plain text:
+
+        <|channel|>commentary to=functions.write_file<|channel|>json<|message|>
+        {"path":"final_report.json","content":"{\\n \\"status\\": \\"complete\\", ...}"}
+
+    The report was complete, correct, and one level down inside `content`. Taking the last
+    balanced object took the tool call's ARGUMENTS instead, so the harness stored
+    {"path": ..., "content": ...}, found no `status`, and recorded the round as having no report
+    although 11 of 11 criteria had passed.
+
+    So: descend into string values, and score candidates by schema keys rather than by position.
+    """
+    wanted = set(wanted)
+    best = None
+    best_score = -1
+    for candidate in _balanced_objects(text):
+        score = len(wanted & set(candidate))
+        # >= rather than > so that, on a tie, the LAST match wins: a model that reasons and then
+        # answers puts the answer at the end.
+        if score >= best_score:
+            best, best_score = candidate, score
+    return best
 
 
 def call_model_retrying(host: str, port: int, model: str, messages: list[dict], tools: list[dict],
@@ -594,6 +623,9 @@ def main() -> int:
     (args.repo / SCRATCH).mkdir(parents=True, exist_ok=True)
 
     schema = json.loads(args.schema.read_text())
+    # The keys that identify a report, used to tell it apart from any other JSON object in the
+    # model's final message — a tool call's arguments, most importantly. See extract_json_object.
+    report_keys = set(schema.get("properties") or {}) | set(schema.get("required") or [])
     messages = [{"role": "system", "content": args.system},
                 {"role": "user", "content": args.prompt}]
     totals = {"in": 0, "out": 0}
@@ -744,7 +776,7 @@ def main() -> int:
                     "outputTokens": usage.get("completion_tokens")})
                 totals["in"] += usage.get("prompt_tokens") or 0
                 totals["out"] += usage.get("completion_tokens") or 0
-                report = extract_json_object(final)
+                report = extract_json_object(final, report_keys)
                 if report is None:
                     emit(log, "agent_event", {"type": "error", "error": {"message": (
                         f"report turn {attempt}: no JSON object in "

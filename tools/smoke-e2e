@@ -977,6 +977,17 @@ else
 fi
 rm -rf "$REPO/bench/results/surgical/archiveprobe" "$REPO/bench/archive/surgical-archiveprobe-"*
 
+# --- and the sync then deleted the archive ------------------------------------------------------
+# The two tools have to agree about what is precious. bench/run was changed to archive instead of
+# delete on --force; sync-bench-clone's rsync --delete did not exclude bench/archive/, so the
+# archive survived eleven minutes. Structural rather than behavioural: running the real sync would
+# rewrite whichever clone this machine benchmarks from.
+if grep -q "exclude 'bench/archive/'" "$REPO/tools/sync-bench-clone"; then
+    pass "sync-bench-clone preserves bench/archive/, which --force now writes into"
+else
+    fail "sync-bench-clone would delete the archives bench/run --force creates"
+fi
+
 # --- the prompt was never recorded ---------------------------------------------------------------
 # An arm whose whole variable is a prompt layer can be a silent no-op, and every artifact looks
 # identical to a working arm. This was found by being unable to answer that question at all.

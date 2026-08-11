@@ -26,10 +26,19 @@ if ! flock -n "${TMPDIR:-/tmp}/agent-handoff-bench.lock" true 2>/dev/null; then
     exit 1
 fi
 
-# Results and worktrees belong to the clone and must survive. Everything else comes from source.
+# Results, archives and worktrees belong to the clone and must survive. Everything else comes from
+# source.
+#
+# bench/archive/ was missing from this list, and `--delete` means missing is fatal rather than
+# merely incomplete. On 2026-08-11 a wave of results was moved to bench/archive/ to preserve it,
+# the queue's own sync-clone job ran eleven minutes later, and the archive was deleted — after
+# bench/run had just been changed to archive rather than delete on --force, specifically so that
+# baselines would stop being destroyed. One tool was made careful and the other still swept up
+# behind it.
 rsync -a --delete \
     --exclude '.git/' \
     --exclude 'bench/results/' \
+    --exclude 'bench/archive/' \
     --exclude 'bench/.work/' \
     --exclude '.handoff/runs/' \
     "$SOURCE"/ "$CLONE"/

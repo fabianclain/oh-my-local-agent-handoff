@@ -177,6 +177,7 @@ def check_extractor() -> tuple[int, int]:
         ("empty response", "", None),
         ("an array is not a report", '[1, 2, 3]', None),
     ]
+
     failures = 0
     for name, text, expected in cases:
         # Catching here is not defensive padding: the implementation this replaced RAISED
@@ -192,7 +193,45 @@ def check_extractor() -> tuple[int, int]:
             failures += 1
         else:
             print(f"pass  extractor: {name}")
-    return len(cases), failures
+    # The schema-aware cases. Verbatim in shape from a live round at 16.3k depth: asked for the
+    # report with NO tools registered, the model tried to call one anyway, and with no schema for
+    # llama.cpp to parse the call against the harmony header arrived as plain text with the real
+    # report nested inside the `content` argument. Taking the last balanced object took the tool
+    # call's arguments, so a round with 11 of 11 criteria was recorded as having no report.
+    report = {"status": "complete", "summary": "did the work", "files_changed": ["a.php"]}
+    keys = {"status", "summary", "files_changed", "tests_run"}
+    tool_call_text = (
+        "<|channel|>commentary to=functions.write_file<|channel|>json<|message|>"
+        + json.dumps({"path": "final_report.json", "content": json.dumps(report)}))
+    keyed_cases = [
+        ("the report nested inside a tool call's arguments", tool_call_text, keys, report),
+        # The case that justifies scoring by schema keys rather than by position. Descending into
+        # strings is enough for the nested case above, because the inner object is yielded last
+        # anyway -- so without this line the scoring is dead code that no mutation can reveal.
+        # Here the model reports and THEN reaches for a tool, which is the same instinct that
+        # produced the nested case, and position alone picks the tool call's arguments.
+        ("a report followed by a tool call is still the report",
+         json.dumps(report) + "\n<|channel|>commentary to=functions.write_file<|message|>"
+         + json.dumps({"path": "notes.json", "content": "some other text"}),
+         keys, report),
+        ("a bare report still wins when nothing is nested",
+         json.dumps(report), keys, report),
+        # Without schema keys the behaviour is unchanged: last balanced object.
+        ("no schema keys means last-object, as before",
+         'first {"a": 1} then {"b": 2}', set(), {"b": 2}),
+    ]
+    for name, text, wanted, expected in keyed_cases:
+        try:
+            got = extract(text, wanted)
+        except Exception as error:  # noqa: BLE001
+            got = f"raised {type(error).__name__}"
+        if got != expected:
+            print(f"FAIL  extractor: {name}")
+            print(f"        got {got!r}, expected {expected!r}")
+            failures += 1
+        else:
+            print(f"pass  extractor: {name}")
+    return len(cases) + len(keyed_cases), failures
 
 
 def check_syntax_note() -> tuple[int, int]:
