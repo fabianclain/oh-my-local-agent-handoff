@@ -2,7 +2,7 @@
 #
 # bench/run — execute one plan across providers without sharing their work.
 #
-#   bench/run --plan <slug> --providers <name,...> [--repeat <n>] [--force]
+#   bench/run --plan <slug> --providers <name,...> [--repeat <n>] [--force|--append]
 #
 # Every attempt starts from the same commit in a detached worktree. Reusing a tree would let a
 # later provider inherit an earlier provider's edits, turning isolation into a cosmetic claim.
@@ -28,13 +28,14 @@ if [[ -z "${BENCH_LOCK_HELD:-}" ]]; then
 fi
 
 usage() {
-    echo "usage: bench/run --plan <slug> --providers <name,...> [--repeat <n>] [--force]" >&2
+    echo "usage: bench/run --plan <slug> --providers <name,...> [--repeat <n>] [--force|--append]" >&2
 }
 
 PLAN=""
 PROVIDERS=""
 REPEAT=3
 FORCE=0
+APPEND=0
 
 while (( $# > 0 )); do
     case "$1" in
@@ -67,6 +68,10 @@ while (( $# > 0 )); do
         ;;
     --force)
         FORCE=1
+        shift
+        ;;
+    --append)
+        APPEND=1
         shift
         ;;
     *)
@@ -201,11 +206,22 @@ fi
 IFS=',' read -r -a PROVIDER_LIST <<<"$PROVIDERS"
 (( ${#PROVIDER_LIST[@]} > 0 )) || { echo "--providers list is empty" >&2; exit 64; }
 
+(( FORCE && APPEND )) && {
+    echo "--force and --append contradict each other: one deletes the prior results, the other" >&2
+    echo "continues them. Pick the one you meant." >&2
+    exit 64
+}
+
 for _provider in "${PROVIDER_LIST[@]}"; do
     _dir="$RESULTS_DIR/$_provider"
     [[ -e "$_dir" ]] || continue
+    # --append is the deliberate "yes, mix these" answer to the refusal below. It is safe in a way
+    # a rerun is not, because it never reuses a repetition number and so cannot overwrite an
+    # artifact: the numbering continues past whatever is there.
+    (( APPEND )) && continue
     [[ "$FORCE" -eq 1 ]] || {
-        echo "results already exist for '$PLAN/$_provider'; use --force to replace them" >&2
+        echo "results already exist for '$PLAN/$_provider'; use --force to replace them," >&2
+        echo "or --append to add repetitions to them" >&2
         exit 1
     }
     rm -rf -- "$_dir"
@@ -420,6 +436,19 @@ capture_tree_artifacts() {
     local before="$run_dir/tree-before" after="$run_dir/tree-after"
     local excludes=(
         ':(exclude).handoff/runs/**'
+        # The scratch directory is granted to the model by templates/agent-rules.md — "that
+        # directory is yours, it is ignored by the verifier and by git, and it is the only place
+        # outside the plan's file list where you may create anything" — and the journal is the
+        # harness writing its own records mid-round. Counting either as the model's work scores a
+        # model down for following its instructions.
+        #
+        # This cost a whole night. Of 40 runs, 8 were classified `patch-damaged` on nothing but
+        # sanctioned scratch files, dropping the measured usable-tree rate from 90%/100% to
+        # 75%/75%. tools/verify-round already excluded these; bench/run did not, and nothing
+        # compared the two. That is the same defect shape as tools/check-plan and bench/run once
+        # parsing plans with separate copies of the same expressions.
+        ':(exclude).handoff/scratch/**'
+        ':(exclude).handoff/journal/**'
         ':(exclude).omc/**'
         ':(exclude)storage/logs/**'
         ':(exclude)storage/framework/**'
@@ -443,14 +472,18 @@ capture_tree_artifacts() {
     # staged plan is known, so this fallback preserves inspectable evidence instead of losing it.
     git -C "$tree" diff --binary "$BASE_COMMIT" -- . \
         ':(exclude).handoff/runs/**' \
+        ':(exclude).handoff/scratch/**' \
+        ':(exclude).handoff/journal/**' \
         ":(exclude).handoff/plans/$PLAN.md" >"$result_dir/tree.diff"
     {
         git -C "$tree" -c core.quotePath=false diff --name-only "$BASE_COMMIT" -- . \
             ':(exclude).handoff/runs/**' \
+            ':(exclude).handoff/scratch/**' \
+            ':(exclude).handoff/journal/**' \
             ":(exclude).handoff/plans/$PLAN.md"
         git -C "$tree" -c core.quotePath=false ls-files --others --exclude-standard |
             awk -v plan=".handoff/plans/$PLAN.md" '
-                $0 != plan && $0 !~ /^\.handoff\/runs\// { print }
+                $0 != plan && $0 !~ /^\.handoff\/(runs|scratch|journal)\// { print }
             '
     } | sort -u >"$result_dir/tree-files.txt"
 
@@ -486,12 +519,42 @@ for provider in "${PROVIDER_LIST[@]}"; do
         exit 64
     }
 
-    for (( repetition=1; repetition<=REPEAT; repetition++ )); do
+    # Where this provider's numbering starts.
+    #
+    # Normally 1, because the existence check above guaranteed an empty directory. Under --append
+    # it continues from whatever is already there, which is what makes a wave possible: five
+    # repetitions of each arm, then five more, so the arms stay balanced at every point in the
+    # night rather than only at the end.
+    #
+    # That matters more than it sounds. Running one arm to n=20 and then the next means a run that
+    # stops early — a crash, a deadline, a dead server — leaves one complete arm and nothing to
+    # compare it against. Interleaved, the same interruption leaves a usable comparison at
+    # whatever n it reached. The statistics are identical; only the failure mode differs.
+    REP_START=1
+    if (( APPEND )); then
+        _highest=0
+        for _existing in "$RESULTS_DIR/$provider"/*; do
+            _n="${_existing##*/}"
+            [[ "$_n" =~ ^[0-9]+$ ]] || continue
+            (( _n > _highest )) && _highest="$_n"
+        done
+        REP_START=$(( _highest + 1 ))
+        (( _highest == 0 )) || echo "appending to $PLAN/$provider: $_highest existing, adding $REPEAT"
+    fi
+
+    for (( repetition=REP_START; repetition<REP_START+REPEAT; repetition++ )); do
         RESULT_DIR="$RESULTS_DIR/$provider/$repetition"
         mkdir -p "$RESULT_DIR"
 
         # Initialised here rather than beside the attempt loop, because the preflight and
         # missing-adapter paths below write metrics without ever entering it.
+        #
+        # ATTEMPTS belongs in this list for exactly the reason the comment gives, and was missing
+        # from it. Under `set -u` that turned every early failure into an unbound-variable abort
+        # inside write_metrics — so a provider whose preflight failed produced one cryptic line
+        # about line 408 and no record of what actually went wrong, which is the worst possible
+        # behaviour for a run nobody is watching.
+        ATTEMPTS=0
         PROMPT_TOKENS=0
         GENERATED_TOKENS=0
         MODEL_REQUESTS=0
@@ -690,6 +753,11 @@ for provider in "${PROVIDER_LIST[@]}"; do
         [[ ! -f "$RUN_DIR/result.json" ]] || cp "$RUN_DIR/result.json" "$RESULT_DIR/handoff-report.json"
         [[ ! -f "$RUN_DIR/stdout.log" ]] || cp "$RUN_DIR/stdout.log" "$RESULT_DIR/provider.log"
         [[ ! -f "$RUN_DIR/session-id" ]] || cp "$RUN_DIR/session-id" "$RESULT_DIR/session-id"
+        # Per attempt, not once: a repair attempt is sent a different prompt from the first, and
+        # the feedback it carries is the variable in half the arms measured here. Overwriting it
+        # would leave only the last one, which is the one nobody is asking about.
+        [[ ! -f "$RUN_DIR/prompt.md" ]] ||
+            cp "$RUN_DIR/prompt.md" "$RESULT_DIR/prompt-attempt-$ATTEMPTS.md"
 
         # Capture against the tree as it stood before the FIRST attempt, not this one.
         #

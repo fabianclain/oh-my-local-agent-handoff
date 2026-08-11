@@ -205,5 +205,6 @@ planner, and why escalations are bounded and have to be asked for.
 | --- | --- |
 | [START-HERE.md](START-HERE.md) | Setup, your first plan, reading the verdict |
 | [usage.md](usage.md) | Full command surface, the journal, the ladder |
+| [OVERNIGHT.md](OVERNIGHT.md) | Running a queue unattended, waves, and driving the model over Tailscale |
 | [how-it-works.md](how-it-works.md) | The gates and the four prompt layers |
 | [local-models.md](local-models.md) | Every measured finding, and the conclusions that turned out wrong |

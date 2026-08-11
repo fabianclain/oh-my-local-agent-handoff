@@ -23,6 +23,10 @@ REPO="$(cd "$HERE/.." && pwd)"
 CONTEXT=""
 MODEL="gpt-oss-20b"
 PORT="${LLAMACPP_PORT:-8071}"
+# See tools/llamacpp-serve for LLAMACPP_HOST against LLAMACPP_BIND. Cline is configured against
+# the address a *client* uses: loopback on the GPU machine, a Tailscale address from an SSH server
+# or a laptop driving a model that lives elsewhere.
+HOST="${LLAMACPP_HOST:-127.0.0.1}"
 CACHE="${LLAMACPP_STATE:-$HOME/.cache/agent-handoff}"
 GGUF="${GPTOSS_GGUF:-$CACHE/models/gpt-oss-20b-MXFP4.gguf}"
 CLINE_CONFIG="${HANDOFF_CLINE_CONFIG:-$HOME/.cline-llamacpp}"
@@ -94,9 +98,9 @@ if "$HERE/llamacpp-serve" status 2>/dev/null | grep -q "$MODEL"; then
 else
     "$HERE/llamacpp-serve" start "$MODEL" "$CONTEXT" || die "llama-server would not start"
 fi
-curl -fsS --max-time 10 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 ||
+curl -fsS --max-time 10 "http://$HOST:$PORT/health" >/dev/null 2>&1 ||
     die "nothing answering on :$PORT"
-RESIDENT="$(curl -fsS --max-time 5 "http://127.0.0.1:$PORT/props" 2>/dev/null |
+RESIDENT="$(curl -fsS --max-time 5 "http://$HOST:$PORT/props" 2>/dev/null |
     python3 -c 'import json,sys; print(json.load(sys.stdin).get("default_generation_settings",{}).get("n_ctx","?"))' 2>/dev/null)"
 ok "serving with n_ctx=$RESIDENT"
 
@@ -105,10 +109,10 @@ if [[ -f "$CLINE_CONFIG/data/settings/providers.json" ]]; then
     ok "already configured at $CLINE_CONFIG"
 else
     cline auth -p openai-compatible -m "$MODEL" \
-        -b "http://127.0.0.1:$PORT/v1" -k dummy --config "$CLINE_CONFIG" >/dev/null 2>&1 ||
+        -b "http://$HOST:$PORT/v1" -k dummy --config "$CLINE_CONFIG" >/dev/null 2>&1 ||
         die "could not configure cline. Try it by hand:
       cline auth -p openai-compatible -m $MODEL \\
-        -b http://127.0.0.1:$PORT/v1 -k dummy --config $CLINE_CONFIG"
+        -b http://$HOST:$PORT/v1 -k dummy --config $CLINE_CONFIG"
     ok "configured at $CLINE_CONFIG"
 fi
 

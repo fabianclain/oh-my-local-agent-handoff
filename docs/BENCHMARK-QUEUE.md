@@ -26,14 +26,34 @@ control for published results before re-running its label, or the baseline is go
 | Round | Arm | n | What it settles | Est. |
 | --- | --- | ---: | --- | ---: |
 | 11 | `lcgptossl` — message channel | 20 | A clean control under the current harness, and whether the litter rule changed anything (round 6: 1/15) | ~2h |
-| 12 | `lcgptossltool` — report as a tool call | 20 | 8% against 27% missing reports, at enough power to separate them | ~2.3h |
 | 13 | `semantic` plan, `lcgptossl` | 12 | **A different axis**: does a plausible-wrong answer survive the gates? Never run against a model | ~1h |
-| 14 | `lcgptossl96` — 96k context | 15 | 64k is measurably at its edge; two runs have filled it and silently lost history | ~1.5h |
 
-Round 14 is last because it restarts the serving stack. Everything above it shares one server, so
-a restart cannot affect results already recorded, and conformance is re-probed afterwards — context
-size is part of the stack, and a stack that stops emitting usable tool calls must never be
-attributed to the model.
+### 12 and 14 are closed without being run
+
+**Round 14 (96k context) was the wrong shape of question.** Whether a context size fits is a
+property of this card and these weights, and `tools/llamacpp-serve calibrate` answers it in four
+minutes by ascending through candidate sizes and keeping the largest that stays fully GPU-resident.
+Measured on the RTX 5060 Ti, 16 GB: **131072 tokens, all layers resident, 948 MiB free.** KV costs
+roughly 200 MiB per 16k at `q8_0`, so 64k was never near the edge — the earlier OOM was a spill
+caused by something else holding the card.
+
+The margin at 131072 is thin for a GPU that also drives a display. `CALIBRATE_MARGIN_MIB=1500`
+selects 98304 instead, which is the setting to prefer when the machine is in use.
+
+This is not entirely good news, and the next queue should watch for it: the two
+`header-transposition` faults found by `tools/peg-audit` both occurred at 47–49k tokens. Raising
+the window to 128k means conversations can now *reach* depths where that fault has been observed.
+More context may buy more of the failure class that costs a whole round.
+
+**Round 12 (report as a tool call) is measuring the wrong thing.** It was queued to separate an 8%
+missing-report rate from a 27% one. `tools/peg-audit` shows the reports are not missing: they are
+generated in full, addressed to the `final` channel with a `<|constrain|>JSON` tag rather than
+emitted as a tool call, and discarded by llama.cpp's harmony parser with a warning. Changing the
+channel the harness *asks* for does not address a parser that cannot map what the model produced.
+
+Two consecutive smoke runs on `surgical` came back `report-unparseable`, so the per-round rate is
+high even though the per-completion rate is 0.4% — a report is emitted once per round, and the
+denominator in the audit is completions.
 
 ## Queued from real use — the editing-failure batch
 
@@ -54,12 +74,32 @@ apart.
 | --- | --- | ---: | --- | ---: |
 | 15 | `lcgptosslwhole` — whole-file writes under ~400 lines | 15 | Does rewriting the file wholesale eliminate mis-anchored partial edits? Targets the #1 observed failure | ~1.5h |
 | 16 | `lcgptosslsyntax` — linter as a post-write hook | 15 | Does feeding a parse error back immediately let the model repair a truncation, instead of building on a broken file for the rest of its budget? | ~1.5h |
-| 17 | `peg-native` repro, not a benchmark | — | Is the tool-call corruption reproducible outside Cline? Extend `tools/engine-conformance` with the call shapes round 6 died on, alongside `tools/repro-ollama-toolcall-500.py` | ~1h |
+### Round 17 — answered from the server's own log, in seconds
 
-Round 17 is diagnostic rather than comparative, and it should run **before** 15 and 16: a round
-that emits no writes at all is scored as a failure, so an intermittent adapter fault silently
-depresses every arm it touches. Two of seven real rounds hit it. If that rate holds inside the
-benchmark, it is larger than most of the effects being measured.
+It did not need an hour of GPU time. `llama-server` has been writing the evidence the whole time,
+under a warning nobody was reading:
+
+    W common_chat_peg_parse: unparsed peg-native output: <|channel|>...
+
+`tools/peg-audit` classifies every occurrence and reports the rate against completions in the same
+log. Over 1011 completions, 7 parse failures — 0.69% — and they are **two different faults with two
+different fixes**, cleanly separated by context depth:
+
+| Class | n | Where | What it is |
+| --- | ---: | --- | --- |
+| `report-in-final-channel` | 4 | 0–8k, 3.42% of that bucket | The completion report, complete and well formed, addressed to `final` with `<\|constrain\|>JSON` instead of emitted as a tool call. Discarded. |
+| `header-transposition` | 2 | 47.6k–49k | The harmony header itself scrambled — `<\|channel\|>functions.run_commands<\|channel\|>commentary to=assistant`. Observed only on `run_commands`. This is the fault that spends a whole round reading files and never writing one. |
+| `empty-final` | 1 | 3.8k | `{"final":""}` |
+
+The 8k–32k middle is completely clean: 485 completions, zero failures.
+
+**Do not read the 0.69% as the impact.** The denominator is completions, and a report is emitted
+once per *round* — so per-completion understates report loss by roughly the number of completions
+in a round. Four losses across ~117 completions in the shallow bucket is on the order of a dozen
+rounds, which lands close to the observed ~27% missing-report rate.
+
+What this removes: the theory that an intermittent adapter fault was depressing every arm uniformly.
+It is not uniform, it is depth-dependent, and in the range most rounds actually occupy it is zero.
 
 Both are measurable against `wide` with round 11's arm as control, and both should be run before
 anyone trusts a read of five rounds — including the read that produced them.

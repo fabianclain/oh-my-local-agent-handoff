@@ -760,5 +760,133 @@ else
 fi
 
 echo
+echo "10. unattended running — the queue runner and the log audit"
+
+# These run without a model, a GPU or a network. That is the point: the whole value of a queue
+# runner is what it does when something goes wrong at three in the morning, and none of those
+# paths involve a model.
+
+QDIR="$SANDBOX/queues"
+mkdir -p "$QDIR"
+MARKER="$SANDBOX/ran-marker"
+
+cat >"$QDIR/simple.sh" <<QUEUE
+job first  --no-gpu --est 10 --timeout 30 -- touch "$MARKER.first"
+job second --no-gpu --est 10 --timeout 30 -- touch "$MARKER.second"
+QUEUE
+
+if OVERNIGHT_DIR="$SANDBOX/on" "$REPO/tools/overnight" "$QDIR/simple.sh" --list 2>&1 |
+        grep -q '2 job(s)'; then
+    pass "overnight --list reports the queue without running it"
+else
+    fail "overnight --list did not describe a two-job queue"
+fi
+[[ -e "$MARKER.first" ]] && fail "--list ran a job; it must only describe them"
+
+if OVERNIGHT_DIR="$SANDBOX/on" "$REPO/tools/overnight" "$QDIR/simple.sh" >/dev/null 2>&1 &&
+        [[ -e "$MARKER.first" && -e "$MARKER.second" ]]; then
+    pass "overnight runs every job in the queue"
+else
+    fail "overnight did not run both jobs"
+fi
+
+# The deadline must prevent a job from STARTING, not kill it half way. A job killed at the deadline
+# has cost its whole runtime and produced nothing usable, which is worse than never starting it.
+cat >"$QDIR/deadline.sh" <<QUEUE
+job toolong --no-gpu --est 7200 --timeout 60 -- touch "$MARKER.toolong"
+QUEUE
+OVERNIGHT_DIR="$SANDBOX/on2" "$REPO/tools/overnight" "$QDIR/deadline.sh" \
+    --until "$(date -d '+2 minutes' +%H:%M)" >/dev/null 2>&1
+if [[ -e "$MARKER.toolong" ]]; then
+    fail "a job needing two hours was started with two minutes left before the deadline"
+else
+    pass "overnight refuses to start a job that cannot finish before the deadline"
+fi
+
+# Resume must skip what already succeeded. Without this a crash at 02:00 re-runs the whole night.
+RESUMED="$(ls -d "$SANDBOX/on"/* 2>/dev/null | head -1)"
+rm -f "$MARKER.first" "$MARKER.second"
+if [[ -n "$RESUMED" ]] &&
+        OVERNIGHT_DIR="$SANDBOX/on" "$REPO/tools/overnight" "$QDIR/simple.sh" \
+            --resume "$RESUMED" >/dev/null 2>&1 &&
+        [[ ! -e "$MARKER.first" && ! -e "$MARKER.second" ]]; then
+    pass "overnight --resume skips jobs that already succeeded"
+else
+    fail "overnight --resume re-ran jobs that had already succeeded"
+fi
+
+printf 'echo nothing\n' >"$QDIR/empty.sh"
+expect_refusal 65 "defines no jobs" "a queue file with no jobs" \
+    "$REPO/tools/overnight" "$QDIR/empty.sh"
+expect_refusal 66 "no queue file"   "a queue file that is not there" \
+    "$REPO/tools/overnight" "$QDIR/nope.sh"
+
+# peg-audit against a log built to contain one of each class. Without this the classifier could
+# return "other" for everything and the tool would still print a confident-looking table.
+SYNTH="$SANDBOX/synth-llamacpp.log"
+{
+    echo 'I slot      release: id 0 | task 1 | stop processing: n_tokens = 6000, truncated = 0'
+    echo 'W common_chat_peg_parse: unparsed peg-native output: <|channel|>final <|constrain|>JSON<|message|>{"status":"complete","files_changed":[]}'
+    echo 'I slot      release: id 0 | task 2 | stop processing: n_tokens = 48000, truncated = 0'
+    echo 'W common_chat_peg_parse: unparsed peg-native output: <|channel|>functions.run_commands<|channel|>commentary to=assistant<|constrain|>json<|message|>{"commands":["ls"]}'
+    echo 'I slot      release: id 0 | task 3 | stop processing: n_tokens = 3000, truncated = 0'
+    echo 'W common_chat_peg_parse: unparsed peg-native output: <|channel|>final <|constrain|>json<|message|>{"final":""}'
+    echo 'I slot      release: id 0 | task 4 | stop processing: n_tokens = 5000, truncated = 0'
+} >"$SYNTH"
+
+AUDIT="$("$REPO/tools/peg-audit" "$SYNTH" --show 0 2>&1)"
+for want in report-in-final-channel header-transposition empty-final; do
+    grep -q "$want" <<<"$AUDIT" || fail "peg-audit did not classify $want"
+done
+grep -q '4 completion' <<<"$AUDIT" ||
+    fail "peg-audit miscounted completions — the denominator is what makes the rate meaningful"
+# The depth split is the finding, not decoration: the classes separate by context depth, and a
+# classifier that lumps them together would hide that.
+grep -qE '32k–48k|48k\+' <<<"$AUDIT" ||
+    fail "peg-audit did not bucket the deep-context failure by depth"
+pass "peg-audit classifies each parse-failure class and buckets it by context depth"
+
+# The two things that judge a tree must exclude the same paths.
+#
+# They did not, and it cost a night: `.handoff/scratch/**` is granted to the model by the agent
+# rules, tools/verify-round excluded it, bench/run did not, and 8 of 40 runs were recorded as
+# `patch-damaged` for creating files they were explicitly told they could create. Nothing compared
+# the two, so both tools looked right in isolation.
+# Only scratch and journal are asserted, not every exclusion the two share. They legitimately
+# differ elsewhere: bench/run excludes the one plan under test rather than all of them, so a run
+# that edits a *different* plan is still caught. A guard that demanded whole-list equality would
+# fail on that difference and get deleted, which is worse than no guard.
+GRANTED_OK=1
+for tool in bench/run tools/verify-round; do
+    for path in scratch journal; do
+        grep -qF -- ":(exclude).handoff/$path/**" "$REPO/$tool" || {
+            GRANTED_OK=0
+            fail "$tool does not exclude .handoff/$path/** — the model is granted that directory,
+          so counting it charges the model for following its instructions"
+        }
+    done
+done
+(( GRANTED_OK )) &&
+    pass "bench/run and verify-round both exclude the directories the model is granted"
+
+# --force and --append contradict each other, and a queue that passed both would silently delete
+# the arm it meant to extend.
+#
+# BENCH_LOCK_HELD=1 skips the flock re-exec at the top of bench/run. Without it this check blocks
+# for the full 600s lock wait whenever a benchmark is running — and then "failed" for the wrong
+# reason, which would make the check pass while testing nothing. A suite that cannot be run during
+# an overnight queue is a suite that does not get run.
+#
+# The status is asserted exactly, not merely as non-zero, for the same reason: a lock timeout, a
+# missing plan and the contradiction being tested all exit non-zero.
+( cd "$REPO" && BENCH_LOCK_HELD=1 ./bench/run --plan surgical --providers stub --force --append ) \
+    >/dev/null 2>&1
+if [[ $? -eq 64 ]]; then
+    pass "bench/run refuses --force and --append together"
+else
+    fail "bench/run did not refuse --force and --append together with a usage error"
+fi
+
+echo
 if [[ "$FAILURES" -eq 0 ]]; then echo "all checks passed"; else echo "$FAILURES check(s) failed"; fi
 exit $(( FAILURES > 0 ? 1 : 0 ))

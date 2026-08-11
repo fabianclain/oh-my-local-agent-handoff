@@ -17,3 +17,6 @@
 # Python bytecode from the proxy/shim tools
 __pycache__/
 *.pyc
+
+# Overnight queue output: logs and per-job state, regenerated every run.
+.overnight/

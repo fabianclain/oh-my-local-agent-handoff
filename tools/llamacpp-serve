@@ -24,6 +24,20 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LLAMA_SERVER="${LLAMA_SERVER:-$HOME/.local/opt/llamacpp/llama-b10331/llama-server}"
 PORT="${LLAMACPP_PORT:-8071}"
+
+# Where the server listens, and where clients look for it. Separate variables because they answer
+# different questions and conflating them is how a model server ends up on the open internet.
+#
+#   LLAMACPP_BIND   the interface the server binds. Defaults to loopback. To reach the model from
+#                   another machine over Tailscale, bind the Tailscale address specifically:
+#                       LLAMACPP_BIND="$(tailscale ip -4)" tools/llamacpp-serve start gpt-oss-20b
+#                   Never 0.0.0.0. llama-server has no authentication, so binding every interface
+#                   publishes an unauthenticated model to whatever network the machine is on.
+#
+#   LLAMACPP_HOST   the address a client uses. On the GPU machine that is loopback; from a laptop
+#                   or an SSH server it is the GPU machine's Tailscale name or address.
+BIND="${LLAMACPP_BIND:-127.0.0.1}"
+HOST="${LLAMACPP_HOST:-127.0.0.1}"
 # Extra server flags, unquoted on purpose so a caller can pass several.
 #
 # Sampling lives here rather than in the client: Cline exposes no temperature, top-p or seed, so
@@ -49,7 +63,91 @@ model_path() {
     esac
 }
 
-usage() { echo "usage: llamacpp-serve {start <model> [context]|stop|status|residency <log> [rss-kb]}" >&2; }
+usage() { echo "usage: llamacpp-serve {start <model> [context]|stop|status|calibrate <model>|residency <log> [rss-kb]}" >&2; }
+
+# How much context actually fits, measured rather than chosen.
+#
+# The queue in docs/BENCHMARK-QUEUE.md proposed 96k as a benchmark arm. That is the wrong shape of
+# question: whether 96k fits is a property of this card and these weights, and it is answered in
+# four minutes by trying it, not in ninety by benchmarking it.
+#
+# It matters because both errors are expensive and they look nothing alike. Too little context and
+# real rounds die with "exceeds the available context size" — three of three surviving real runs
+# hit that at 32k. Too much and the KV cache spills to host RAM, which does not fail: the server
+# answers, slowly, until it fills swap and is OOM-killed along with whatever terminal started it.
+#
+# Ascending from a known-good size and stopping at the first failure, rather than descending from
+# an optimistic one, because every failed attempt costs a load and an unload, and descending pays
+# that cost for the sizes that were never going to work.
+#
+# The margin is the point. A context that fits with nothing to spare fits until the desktop opens
+# a browser tab, so a candidate is only accepted if it leaves MARGIN_MIB of the card free.
+CALIBRATE_MARGIN_MIB="${CALIBRATE_MARGIN_MIB:-900}"
+CALIBRATE_STEPS="${CALIBRATE_STEPS:-32768 49152 65536 98304 131072}"
+
+cmd_calibrate() {
+    local model="$1"
+    local best="" candidate free
+    mkdir -p "$STATE_DIR"
+
+    echo "calibrating $model — the largest context that stays fully GPU-resident"
+    echo "margin: ${CALIBRATE_MARGIN_MIB} MiB must remain free"
+    echo
+
+    for candidate in $CALIBRATE_STEPS; do
+        printf '%7s  ' "$candidate"
+        if ! cmd_start "$model" "$candidate" >/dev/null 2>&1; then
+            echo "server did not come up — stopping here"
+            break
+        fi
+
+        local pid rss=""
+        pid="$(pgrep -f "$LLAMA_SERVER" 2>/dev/null | head -1)"
+        [[ -z "$pid" ]] || rss="$(awk '/^VmRSS:/{print $2}' "/proc/$pid/status" 2>/dev/null)"
+        if ! cmd_residency "$LOG" "$rss" >/dev/null 2>&1; then
+            echo "spilled out of VRAM — stopping here"
+            break
+        fi
+
+        free="$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -dc '0-9')"
+        if [[ -n "$free" ]] && (( free < CALIBRATE_MARGIN_MIB )); then
+            echo "resident, but only ${free} MiB free — too tight, stopping here"
+            break
+        fi
+
+        # Resident is necessary and not sufficient: a server can hold the weights and still fail
+        # to generate. One real completion, or the size does not count as working.
+        if ! curl -fsS --max-time 60 "http://$HOST:$PORT/v1/chat/completions" \
+            -H 'Content-Type: application/json' \
+            -d '{"messages":[{"role":"user","content":"Reply with the single word: ok"}],"max_tokens":8}' \
+            >/dev/null 2>&1; then
+            echo "resident but would not generate — stopping here"
+            break
+        fi
+
+        echo "ok (${free:-?} MiB free)"
+        best="$candidate"
+    done
+
+    echo
+    if [[ -z "$best" ]]; then
+        echo "nothing in the candidate list fits. Lower CALIBRATE_STEPS, or use a smaller KV type:"
+        echo "  the server runs -ctk q8_0 -ctv q8_0; q4_0 roughly halves the KV cache."
+        return 1
+    fi
+
+    printf '%s\n' "$best" >"$STATE_DIR/llamacpp.context"
+    cmd_start "$model" "$best" || return 1
+    echo
+    echo "calibrated: $best tokens. Recorded in $STATE_DIR/llamacpp.context and now serving."
+    if (( best <= 32768 )); then
+        echo
+        echo "That is the floor, not a comfortable size. Real rounds here have exceeded 32k and"
+        echo "failed as 'exceeds the available context size', which reads as a model failure and is"
+        echo "not one. Keep steps to one or two files."
+    fi
+    return 0
+}
 
 # Did the model actually land on the GPU?
 #
@@ -108,7 +206,7 @@ cmd_residency() {
 }
 
 cmd_status() {
-    if curl -fsS --max-time 3 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+    if curl -fsS --max-time 3 "http://$HOST:$PORT/health" >/dev/null 2>&1; then
         echo "llama-server: up on :$PORT serving $(cat "$SERVING" 2>/dev/null || echo unknown)"
         return 0
     fi
@@ -152,12 +250,12 @@ cmd_start() {
     done < <(ollama ps 2>/dev/null | awk 'NR>1 {print $1}')
 
     nohup "$LLAMA_SERVER" -m "$gguf" --jinja -c "$context" -ngl 999 \
-        --host 127.0.0.1 --port "$PORT" -ctk q8_0 -ctv q8_0 \
+        --host "$BIND" --port "$PORT" -ctk q8_0 -ctv q8_0 \
         ${LLAMACPP_EXTRA_ARGS:-} >"$LOG" 2>&1 &
 
     local i
     for i in $(seq 1 100); do
-        if curl -fsS --max-time 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+        if curl -fsS --max-time 2 "http://$HOST:$PORT/health" >/dev/null 2>&1; then
             printf '%s\n' "$model" >"$SERVING"
             echo "llama-server: up on :$PORT serving $model at ${context} context"
             nvidia-smi --query-gpu=memory.used,memory.free --format=csv,noheader 2>/dev/null |
@@ -182,6 +280,7 @@ stop)   cmd_stop ;;
 status) cmd_status ;;
 # Exposed as a subcommand so the check can be run against a log after the fact — and so it can be
 # tested without a GPU, which is the only way it would ever have been tested at all.
+calibrate) shift; [[ $# -ge 1 ]] || { usage; exit 64; }; cmd_calibrate "$@" ;;
 residency) shift; [[ $# -ge 1 ]] || { usage; exit 64; }; cmd_residency "$@" ;;
 *)      usage; exit 64 ;;
 esac

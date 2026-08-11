@@ -89,6 +89,15 @@ if [[ "$MODE" == "auto" ]]; then
     exec "$HANDOFF_HOME/tools/escalate" "$@"
 fi
 
+# A queue of jobs, run unattended. Outside the mode switch for the same reason as `auto`: it
+# invokes the driver (and the bench) many times rather than being one invocation of it.
+if [[ "$MODE" == "overnight" ]]; then
+    HANDOFF_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    export HANDOFF_HOME
+    shift
+    exec "$HANDOFF_HOME/tools/overnight" "$@"
+fi
+
 # `log` and `stats` read the journal and need no slug — they are about the history, not one run.
 if [[ "$MODE" == "log" || "$MODE" == "stats" ]]; then
     HANDOFF_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -371,7 +380,7 @@ retro)
     ;;
 
 *)
-    echo "unknown mode: $MODE (expected do|check|resume|diff|verify|retro|auto|log|stats|init|doctor)" >&2
+    echo "unknown mode: $MODE (expected do|check|resume|diff|verify|retro|auto|overnight|log|stats|init|doctor)" >&2
     exit 64
     ;;
 esac
@@ -383,6 +392,20 @@ while IFS='=' read -r cap level; do
 done < <(provider_capabilities)
 
 echo "==> handoff $MODE '$SLUG'  provider=$PROVIDER model=${HANDOFF_MODEL:-default} sandbox=${HANDOFF_SANDBOX:-workspace-write}"
+
+# What was actually sent. Nothing recorded this before, and the gap is not cosmetic: a benchmark
+# arm whose whole variable is a prompt layer could be a silent no-op — the rules file missing, an
+# export landing after the read, a provider overlay not sourced — and every artifact in the results
+# directory would look identical to a working arm. There is no way to tell those apart afterwards
+# without the prompt, and by then the GPU time is spent.
+#
+# Written before the provider runs rather than after, so it survives a crash, a timeout, and a
+# kill -9 partway through the round.
+{
+    printf '%s\n' "$DEV_INSTRUCTIONS"
+    printf '\n----- 8< ----- task prompt -----\n\n'
+    printf '%s\n' "$PROMPT"
+} >"$RUN_DIR/prompt.md" 2>/dev/null || true
 
 STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 

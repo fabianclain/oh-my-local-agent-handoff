@@ -1,0 +1,282 @@
+#!/usr/bin/env bash
+#
+# overnight — run a queue of jobs unattended, and still have evidence in the morning.
+#
+#   tools/overnight <queue.sh> [--until HH:MM] [--resume DIR] [--dry-run] [--list]
+#   handoff overnight <queue.sh> --until 07:00
+#
+# Nothing here runs a model. It sequences things that do, and adds the discipline that an
+# unattended run needs and an interactive one gets from the person watching:
+#
+#   one at a time      concurrent jobs share one GPU and measure contention, not the model
+#   preflight          `doctor` before every job, so a dead server is caught in seconds rather
+#                      than recorded as eight hours of model failure
+#   a deadline         --until stops starting jobs that cannot finish before you wake up
+#   resume             a crash at 02:00 skips forward instead of ending the night
+#   a log per job      plus one summary, written incrementally, so a kill -9 still leaves a record
+#
+# The queue file is bash, sourced twice — once to collect the jobs, once to run them. That is
+# deliberate: it needs no parser, a job line is a command line, and `--list` can show you exactly
+# what will run before anything does.
+#
+#     job r11-control --cwd "$CLONE" --est 7200 --timeout 9000 -- \
+#         ./bench/run --plan wide --providers lcgptossl --repeat 20 --force
+#
+# --est is what the deadline plans against; --timeout is when the job is killed. They are separate
+# because an estimate that doubles as a kill switch has to be pessimistic, and a pessimistic
+# estimate empties the queue by refusing to start anything.
+
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HANDOFF_HOME="$(cd "$HERE/.." && pwd)"
+
+# Put the harness on PATH before anything checks for it.
+#
+# Found by running this against its own preflight: `doctor` reports "handoff is not on PATH" as a
+# blocking problem, which is correct and would have aborted the entire queue on the first job. An
+# unattended run started from cron, a systemd timer or an agent's shell gets a minimal PATH, and
+# the one thing every job here needs is the harness it is driving.
+export PATH="$HANDOFF_HOME/bin:$PATH"
+
+QUEUE=""
+UNTIL=""
+RESUME=""
+DRY_RUN=0
+LIST=0
+MIN_FREE_GB="${OVERNIGHT_MIN_FREE_GB:-10}"
+
+usage() {
+    echo "usage: overnight <queue.sh> [--until HH:MM] [--resume DIR] [--dry-run] [--list]" >&2
+}
+
+while (( $# > 0 )); do
+    case "$1" in
+    --until)   UNTIL="${2:?--until needs HH:MM}"; shift 2 ;;
+    --resume)  RESUME="${2:?--resume needs a directory}"; shift 2 ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --list)    LIST=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    -*)        echo "unknown argument: $1" >&2; usage; exit 64 ;;
+    *)         QUEUE="$1"; shift ;;
+    esac
+done
+
+[[ -n "$QUEUE" ]] || { usage; exit 64; }
+[[ -f "$QUEUE" ]] || { echo "no queue file at $QUEUE" >&2; exit 66; }
+QUEUE="$(cd "$(dirname "$QUEUE")" && pwd)/$(basename "$QUEUE")"
+
+# ------------------------------------------------------------------------------------------------
+# collecting the jobs
+#
+# Parallel arrays rather than one array of records, because bash has no records and the
+# alternative — encoding fields into a delimited string — is how a command containing the
+# delimiter becomes a silent mis-parse at three in the morning.
+
+JOB_NAMES=(); JOB_CWDS=(); JOB_ESTS=(); JOB_TIMEOUTS=(); JOB_GPU=(); JOB_CMDS=()
+
+job() {
+    local name="$1"; shift
+    local cwd="" est="" timeout="3600" gpu=1
+    while (( $# > 0 )); do
+        case "$1" in
+        --cwd)     cwd="${2:?--cwd needs a path}"; shift 2 ;;
+        --est)     est="${2:?--est needs seconds}"; shift 2 ;;
+        --timeout) timeout="${2:?--timeout needs seconds}"; shift 2 ;;
+        --no-gpu)  gpu=0; shift ;;
+        --)        shift; break ;;
+        *)         echo "job $name: unknown option $1" >&2; exit 64 ;;
+        esac
+    done
+    (( $# > 0 )) || { echo "job $name: no command" >&2; exit 64; }
+
+    JOB_NAMES+=("$name")
+    JOB_CWDS+=("${cwd:-$PWD}")
+    JOB_ESTS+=("${est:-$timeout}")
+    JOB_TIMEOUTS+=("$timeout")
+    JOB_GPU+=("$gpu")
+    # The command is stored quoted so it survives the round trip through a string and back.
+    JOB_CMDS+=("$(printf '%q ' "$@")")
+}
+
+# shellcheck disable=SC1090
+source "$QUEUE"
+
+(( ${#JOB_NAMES[@]} > 0 )) || { echo "queue $QUEUE defines no jobs" >&2; exit 65; }
+
+if (( LIST )); then
+    printf '%-24s %8s %8s %s\n' "job" "est" "timeout" "command"
+    for i in "${!JOB_NAMES[@]}"; do
+        printf '%-24s %7sm %7sm %s\n' "${JOB_NAMES[$i]}" \
+            "$(( JOB_ESTS[i] / 60 ))" "$(( JOB_TIMEOUTS[i] / 60 ))" "${JOB_CMDS[$i]}"
+    done
+    total=0; for e in "${JOB_ESTS[@]}"; do total=$(( total + e )); done
+    printf '\n%s job(s), estimated %sh%02dm\n' "${#JOB_NAMES[@]}" "$(( total / 3600 ))" "$(( total % 3600 / 60 ))"
+    exit 0
+fi
+
+# ------------------------------------------------------------------------------------------------
+# where the night is recorded
+
+if [[ -n "$RESUME" ]]; then
+    RUN_DIR="$RESUME"
+    [[ -d "$RUN_DIR" ]] || { echo "no run directory at $RUN_DIR" >&2; exit 66; }
+else
+    RUN_DIR="${OVERNIGHT_DIR:-$HANDOFF_HOME/.overnight}/$(date +%Y-%m-%d-%H%M)"
+    mkdir -p "$RUN_DIR"
+fi
+STATE="$RUN_DIR/state.tsv"
+SUMMARY="$RUN_DIR/summary.md"
+touch "$STATE"
+
+# The deadline. --until 07:00 means the next 07:00, whether that is today or tomorrow.
+DEADLINE=0
+if [[ -n "$UNTIL" ]]; then
+    DEADLINE="$(date -d "$UNTIL" +%s 2>/dev/null)" || { echo "cannot parse --until $UNTIL" >&2; exit 64; }
+    (( DEADLINE > $(date +%s) )) || DEADLINE="$(date -d "tomorrow $UNTIL" +%s)"
+fi
+
+say() { printf '%s  %s\n' "$(date +%H:%M:%S)" "$1" | tee -a "$RUN_DIR/overnight.log"; }
+
+STOPPING=0
+trap 'STOPPING=1; say "interrupted — finishing the current job, then stopping"' INT TERM
+
+# ------------------------------------------------------------------------------------------------
+# preflight
+#
+# Separated from the jobs because the whole point is to tell an environment fault from a model
+# failure, and a check that only runs inside the job cannot do that. `doctor` is read-only, so the
+# one thing it will not do is quietly fix the problem and leave you thinking there wasn't one.
+
+preflight() {
+    local needs_gpu="$1" problems=""
+    local free_gb
+    free_gb="$(df -BG --output=avail "$RUN_DIR" 2>/dev/null | tail -1 | tr -dc '0-9')"
+    if [[ -n "$free_gb" ]] && (( free_gb < MIN_FREE_GB )); then
+        problems+="only ${free_gb}G free on the volume holding the results; "
+    fi
+    if (( needs_gpu )); then
+        if ! "$HERE/doctor" --quiet >/dev/null 2>&1; then
+            # One restart, then give up. A server that will not come back is not something to
+            # keep re-trying against for six hours.
+            say "doctor reports a problem — restarting the model server once"
+            "$HERE/llamacpp-serve" start "${OVERNIGHT_MODEL:-gpt-oss-20b}" \
+                "${OVERNIGHT_CONTEXT:-32768}" >>"$RUN_DIR/overnight.log" 2>&1
+            "$HERE/doctor" --quiet >>"$RUN_DIR/overnight.log" 2>&1 ||
+                problems+="doctor still reports blocking problems after a restart; "
+        fi
+    fi
+    [[ -z "$problems" ]] && return 0
+    say "PREFLIGHT: $problems"
+    return 1
+}
+
+# ------------------------------------------------------------------------------------------------
+# the run
+
+already_done() { grep -qP "^$1\tok\t" "$STATE" 2>/dev/null; }
+
+record() {  # name status seconds detail
+    printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >>"$STATE"
+}
+
+say "overnight: ${#JOB_NAMES[@]} job(s), recording to $RUN_DIR"
+[[ "$DEADLINE" -gt 0 ]] && say "deadline $(date -d "@$DEADLINE" '+%a %H:%M') ($(( (DEADLINE - $(date +%s)) / 60 )) minutes from now)"
+
+RAN=0; FAILED=0; SKIPPED=0
+for i in "${!JOB_NAMES[@]}"; do
+    name="${JOB_NAMES[$i]}"
+
+    if (( STOPPING )); then
+        record "$name" "skipped" 0 "run was interrupted"
+        SKIPPED=$(( SKIPPED + 1 ))
+        continue
+    fi
+
+    if already_done "$name"; then
+        say "skip  $name (already ok in this run directory)"
+        continue
+    fi
+
+    # Do not start what cannot finish. A job killed by the deadline mid-way costs its whole
+    # runtime and produces a result nobody can use — worse than not starting it.
+    if (( DEADLINE > 0 )); then
+        remaining=$(( DEADLINE - $(date +%s) ))
+        if (( remaining < JOB_ESTS[i] )); then
+            say "skip  $name — needs $(( JOB_ESTS[i] / 60 ))m, only $(( remaining / 60 ))m left before the deadline"
+            record "$name" "skipped" 0 "would not finish before the deadline"
+            SKIPPED=$(( SKIPPED + 1 ))
+            continue
+        fi
+    fi
+
+    if (( DRY_RUN )); then
+        say "would run  $name: ${JOB_CMDS[$i]}"
+        continue
+    fi
+
+    if ! preflight "${JOB_GPU[$i]}"; then
+        record "$name" "blocked" 0 "preflight failed"
+        FAILED=$(( FAILED + 1 ))
+        say "STOPPING: the environment is not fit to run $name, and the rest of the queue would"
+        say "          record hours of failures that say nothing about the model."
+        STOPPING=1
+        continue
+    fi
+
+    log="$RUN_DIR/$name.log"
+    say "start $name  (timeout $(( JOB_TIMEOUTS[i] / 60 ))m, log ${log##*/})"
+    started="$(date +%s)"
+
+    ( cd "${JOB_CWDS[$i]}" && eval "timeout --signal=TERM --kill-after=60 ${JOB_TIMEOUTS[$i]} ${JOB_CMDS[$i]}" ) \
+        >>"$log" 2>&1
+    status=$?
+
+    elapsed=$(( $(date +%s) - started ))
+    RAN=$(( RAN + 1 ))
+
+    case "$status" in
+    0)   record "$name" "ok" "$elapsed" ""
+         say "ok    $name in $(( elapsed / 60 ))m" ;;
+    124) record "$name" "timeout" "$elapsed" "killed at the timeout"
+         FAILED=$(( FAILED + 1 ))
+         say "TIMEOUT $name after $(( elapsed / 60 ))m — killed" ;;
+    *)   record "$name" "failed" "$elapsed" "exit $status"
+         FAILED=$(( FAILED + 1 ))
+         say "FAIL  $name exit $status after $(( elapsed / 60 ))m — see ${log##*/}"
+         # A failed job is not a reason to abandon the queue. Each is independent, and the most
+         # common cause is the job itself rather than the machine; preflight catches the machine.
+         ;;
+    esac
+done
+
+# ------------------------------------------------------------------------------------------------
+# the morning
+
+{
+    echo "# Overnight run — $(basename "$RUN_DIR")"
+    echo
+    echo "Queue: \`$QUEUE\`"
+    echo "Finished: $(date '+%a %d %b %H:%M %Z')"
+    echo
+    echo "| job | status | time |"
+    echo "| --- | --- | ---: |"
+    while IFS=$'\t' read -r n s secs detail; do
+        printf '| %s | %s%s | %sm |\n' "$n" "$s" \
+            "${detail:+ — $detail}" "$(( secs / 60 ))"
+    done <"$STATE"
+    echo
+    echo "$RAN ran, $FAILED failed, $SKIPPED skipped."
+    echo
+    echo "Logs are beside this file, one per job. To pick up where this stopped:"
+    echo
+    echo '```'
+    echo "tools/overnight $QUEUE --resume $RUN_DIR"
+    echo '```'
+} >"$SUMMARY"
+
+say "done — $RAN ran, $FAILED failed, $SKIPPED skipped"
+say "summary: $SUMMARY"
+cat "$SUMMARY"
+
+exit $(( FAILED > 0 ? 1 : 0 ))

@@ -19,6 +19,10 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HANDOFF_HOME="$(cd "$HERE/.." && pwd)"
 PORT="${LLAMACPP_PORT:-8071}"
+# Loopback unless told otherwise. Set LLAMACPP_HOST to the GPU machine's Tailscale address to
+# drive a model that lives on another box — the harness runs where the repository is, and only
+# the model has to be local to the card.
+HOST="${LLAMACPP_HOST:-127.0.0.1}"
 QUIET=0
 [[ "${1:-}" == "--quiet" ]] && QUIET=1
 
@@ -77,8 +81,8 @@ else
 fi
 
 # --- the model -------------------------------------------------------------------------------
-if curl -fsS --max-time 3 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
-    SERVED="$(curl -fsS --max-time 3 "http://127.0.0.1:$PORT/props" 2>/dev/null |
+if curl -fsS --max-time 3 "http://$HOST:$PORT/health" >/dev/null 2>&1; then
+    SERVED="$(curl -fsS --max-time 3 "http://$HOST:$PORT/props" 2>/dev/null |
         python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("model_path","?").split("/")[-1], d.get("default_generation_settings",{}).get("n_ctx","?"))' 2>/dev/null)"
     ok "llama-server answering on :$PORT — ${SERVED:-unknown}"
     CTX="${SERVED##* }"
@@ -88,7 +92,7 @@ if curl -fsS --max-time 3 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
         hint "context size'. That reads as a model failure and is not one."
     fi
 else
-    bad "nothing answering on http://127.0.0.1:$PORT/health"
+    bad "nothing answering on http://$HOST:$PORT/health"
     hint "Start it:  $HANDOFF_HOME/tools/llamacpp-serve start gpt-oss-20b 32768"
     hint "If you are an agent inside a sandbox, localhost may be unreachable even though the"
     hint "server is running. Codex needs -c sandbox_workspace_write.network_access=true."

@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""peg-audit — what llama.cpp failed to parse, and what it cost.
+
+    tools/peg-audit [LOG ...] [--json] [--show N]
+
+Round 17 in `docs/BENCHMARK-QUEUE.md` was queued as an hour of GPU time to find out whether
+intermittent tool-call corruption was reproducible. It did not need an hour: llama-server has been
+writing the evidence to its own log the whole time, under a warning nobody was reading.
+
+    W common_chat_peg_parse: unparsed peg-native output: <|channel|>...
+
+When that fires, the model's output did not match the harmony grammar, so llama.cpp emits nothing
+usable for it. The text is right there in the log. Reading seven of them was enough to show that
+"intermittent corruption" is two different faults with two different fixes:
+
+  report-in-final-channel   The completion report, complete and well formed, addressed to the
+                            `final` channel with a <|constrain|>JSON tag instead of emitted as a
+                            tool call. The report is NOT missing. It is generated and discarded.
+                            This is the likeliest explanation for the ~27% "no report" rate, which
+                            was previously attributed to the model declining to report.
+
+  header-transposition      The harmony header itself comes out scrambled — `<|channel|>functions.
+                            run_commands<|channel|>commentary to=assistant` where the two halves
+                            belong the other way round. Observed only on `run_commands`, and only
+                            deep into a long context. This is the fault that spends a whole round
+                            reading files and never writing one.
+
+  empty-final               `{"final":""}` — a turn that produced nothing.
+
+Rates are reported against the number of completions in the same log, because a count without a
+denominator cannot be compared between two nights of different length.
+
+Nothing here is inferred from a model's report. Every number comes from the server's own log.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from collections import Counter
+from pathlib import Path
+
+WARNING = re.compile(r"common_chat_peg_parse: unparsed peg-native output: (?P<payload>.*)$")
+RELEASE = re.compile(r"slot\s+release:.*n_tokens = (?P<tokens>\d+)")
+CHANNEL = re.compile(r"<\|channel\|>")
+
+
+def classify(payload: str) -> tuple[str, str]:
+    """Return (class, one-line note). Ordered most-specific first."""
+    channels = len(CHANNEL.findall(payload))
+
+    # Two channel headers in one message is the scrambled case, whatever else is in it. Check it
+    # before the report shape: a transposed header can still carry report-looking JSON, and
+    # attributing it to the report path would send the fix to the wrong place.
+    if channels > 1:
+        head = payload.split("<|message|>")[0][:120]
+        return "header-transposition", head
+
+    if re.search(r'<\|channel\|>final\b', payload):
+        body = payload.split("<|message|>", 1)[-1]
+        if body.strip() in ('{"final":""}', '{"final": ""}'):
+            return "empty-final", "the turn produced nothing"
+        if '"status"' in body or "submit_handoff_report" in payload or "files_changed" in body:
+            return "report-in-final-channel", f"{len(body)} bytes of report, discarded"
+        return "other-final", body[:80]
+
+    return "other", payload[:80]
+
+
+# Depth buckets, in tokens. The whole question is whether these faults are uniform noise or a
+# function of how full the window is, and an overall rate cannot answer it: 7 failures in 1011
+# completions is 0.69% and sounds ignorable, while the same 7 concentrated above 32k is a reason
+# to cap the step size. The denominator has to be bucketed too, which is why every release line is
+# counted by depth rather than just totalled.
+BUCKETS = [(0, 8_000), (8_000, 16_000), (16_000, 32_000), (32_000, 48_000), (48_000, 10**9)]
+
+
+def bucket_of(tokens: int | None) -> str:
+    if tokens is None:
+        return "unknown"
+    for low, high in BUCKETS:
+        if low <= tokens < high:
+            return f"{low // 1000}k–{high // 1000}k" if high < 10**9 else f"{low // 1000}k+"
+    return "unknown"
+
+
+def audit(path: Path) -> dict:
+    completions = 0
+    by_depth: Counter[str] = Counter()
+    failures: list[dict] = []
+    last_tokens = None
+
+    with path.open("r", errors="replace") as handle:
+        for line in handle:
+            release = RELEASE.search(line)
+            if release:
+                completions += 1
+                last_tokens = int(release.group("tokens"))
+                by_depth[bucket_of(last_tokens)] += 1
+                continue
+            warning = WARNING.search(line)
+            if warning:
+                payload = warning.group("payload")
+                kind, note = classify(payload)
+                failures.append({
+                    "class": kind,
+                    "note": note,
+                    # The release line immediately precedes the warning, so this is the context
+                    # depth at which the generation went wrong — the one variable that separated
+                    # the two classes when these were first read by hand.
+                    "n_tokens": last_tokens,
+                    "payload": payload,
+                })
+
+    return {"log": str(path), "completions": completions,
+            "by_depth": dict(by_depth), "failures": failures}
+
+
+def default_logs() -> list[Path]:
+    state = Path(os.environ.get("LLAMACPP_STATE") or (Path.home() / ".cache" / "agent-handoff"))
+    return sorted(state.glob("llamacpp*.log"))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("logs", nargs="*", type=Path)
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--show", type=int, default=1,
+                        help="payloads to print per class (0 for none)")
+    args = parser.parse_args()
+
+    logs = args.logs or default_logs()
+    logs = [p for p in logs if p.exists()]
+    if not logs:
+        print("no llama-server logs found — pass one, or set LLAMACPP_STATE", file=sys.stderr)
+        return 66
+
+    reports = [audit(p) for p in logs]
+    completions = sum(r["completions"] for r in reports)
+    failures = [f for r in reports for f in r["failures"]]
+
+    if args.json:
+        json.dump({"completions": completions, "failures": failures}, sys.stdout, indent=2)
+        print()
+        return 0
+
+    print(f"peg-audit: {len(logs)} log(s), {completions} completion(s), {len(failures)} parse failure(s)")
+    if completions:
+        print(f"           {100 * len(failures) / completions:.2f}% of completions were discarded by the parser")
+    print()
+
+    if not failures:
+        print("Nothing unparsed. Note this is only informative against a log with real traffic in it;")
+        print("a fresh server that has served nothing cannot exonerate the stack.")
+        return 0
+
+    counts = Counter(f["class"] for f in failures)
+    print(f"{'class':<26}{'n':>4}{'rate':>9}   context depth where it happened")
+    print("-" * 78)
+    for kind, n in counts.most_common():
+        depths = [f["n_tokens"] for f in failures if f["class"] == kind and f["n_tokens"]]
+        span = f"{min(depths):,}–{max(depths):,} tokens" if depths else "unknown"
+        rate = f"{100 * n / completions:.2f}%" if completions else "—"
+        print(f"{kind:<26}{n:>4}{rate:>9}   {span}")
+
+    # The conditional rate. This is the table that decides whether the fault is a curiosity or a
+    # constraint on how big a step may be.
+    depth_totals: Counter[str] = Counter()
+    for report in reports:
+        depth_totals.update(report["by_depth"])
+    depth_failures = Counter(bucket_of(f["n_tokens"]) for f in failures)
+
+    print()
+    print(f"{'context depth':<16}{'completions':>12}{'failures':>10}{'rate':>9}")
+    print("-" * 47)
+    order = [f"{low // 1000}k–{high // 1000}k" if high < 10**9 else f"{low // 1000}k+"
+             for low, high in BUCKETS]
+    for label in order + ["unknown"]:
+        total = depth_totals.get(label, 0)
+        if not total:
+            continue
+        bad = depth_failures.get(label, 0)
+        print(f"{label:<16}{total:>12}{bad:>10}{100 * bad / total:>8.2f}%")
+
+    if args.show:
+        print()
+        for kind in counts:
+            print(f"{kind}:")
+            for failure in [f for f in failures if f["class"] == kind][:args.show]:
+                payload = failure["payload"]
+                print(f"  {payload[:300]}{'…' if len(payload) > 300 else ''}")
+            print()
+
+    recoverable = counts.get("report-in-final-channel", 0)
+    if recoverable:
+        print(f"{recoverable} completion report(s) were generated in full and thrown away by the parser.")
+        print("Those rounds are recorded as 'no report'. They are not.")
+        print()
+        print("Do not compare that count against the rate above. A report is emitted once per ROUND,")
+        print("while the denominator here is completions, of which a round contains many — so the")
+        print("per-completion rate understates report loss by roughly that factor. To get the real")
+        print("figure, join these against the runs that recorded no report:")
+        print("  tools/final-turn-shape bench/results/<plan>")
+
+    if counts.get("header-transposition"):
+        print()
+        print("Header transposition is the fault that costs a whole round: the call never reaches the")
+        print("client, so the model reads files for its entire budget and writes nothing. Check the")
+        print("context depths above — if they cluster high, the fix is a smaller step, not a retry.")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

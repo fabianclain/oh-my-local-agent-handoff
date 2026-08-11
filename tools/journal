@@ -373,6 +373,16 @@ def cmd_record(args: argparse.Namespace) -> int:
     record = {
         "schema": SCHEMA_VERSION,
         "run_id": run_id,
+        # Which project this run came from.
+        #
+        # Needed as soon as HANDOFF_JOURNAL_DIR points several projects at one directory, which is
+        # the setup worth having: the interesting questions — does this model do better on mature
+        # code than greenfield, which failure classes recur everywhere — cannot be asked of a
+        # single project's history, and a per-project journal makes them unanswerable by
+        # construction. Recorded always, so a journal that is later centralised does not have a
+        # blind era in the middle of it.
+        "project": repo.name,
+        "project_path": str(repo),
         "slug": args.slug,
         "attempt": attempt,
         "mode": args.mode,
@@ -505,6 +515,22 @@ def cmd_stats(args: argparse.Namespace) -> int:
         print(json.dumps(summary, indent=2))
         return 0
 
+    # A centralised journal holds several projects, and an aggregate across them is misleading
+    # without saying so: this model's measured hit rate differs by an order of magnitude between
+    # mechanical work on mature code and greenfield design, so one blended number describes
+    # neither. Broken out whenever there is more than one project in the file.
+    by_project = collections.Counter(r.get("project") or "?" for r in rows)
+    if len(by_project) > 1:
+        print(f"{total} runs across {len(by_project)} projects\n")
+        print(f"{'project':<28}{'runs':>6}{'usable':>9}")
+        print("-" * 43)
+        for name, n in by_project.most_common():
+            good = sum(1 for r in rows
+                       if (r.get("project") or "?") == name
+                       and r.get("outcome") in ("accepted", "patch-ok-no-report"))
+            print(f"{name:<28}{n:>6}{good / n:>8.0%}")
+        print("\nThe blended figures below mix these. Read them together, not instead.\n")
+
     print(f"{total} runs across {summary['distinct_plans']} plans")
     print(f"usable patch (accepted or patch-ok-no-report): "
           f"{accepted}/{total} = {summary['usable_patch_rate']:.0%}")
@@ -540,7 +566,7 @@ def cmd_export_sqlite(args: argparse.Namespace) -> int:
     db = sqlite3.connect(dest)
     db.executescript("""
         CREATE TABLE runs (
-            run_id TEXT PRIMARY KEY, slug TEXT, attempt INT, mode TEXT, recorded_at TEXT,
+            run_id TEXT PRIMARY KEY, project TEXT, slug TEXT, attempt INT, mode TEXT, recorded_at TEXT,
             seconds INT, provider TEXT, model TEXT, outcome TEXT, verdict TEXT,
             acceptance_passed INT, acceptance_total INT, regressed INT,
             files_changed INT, insertions INT, deletions INT,
@@ -552,8 +578,8 @@ def cmd_export_sqlite(args: argparse.Namespace) -> int:
     """)
     for r in rows:
         g, t, a, p = (r.get(k) or {} for k in ("gates", "tree", "activity", "provider"))
-        db.execute("INSERT OR REPLACE INTO runs VALUES (" + ",".join("?" * 25) + ")", (
-            r.get("run_id"), r.get("slug"), r.get("attempt"), r.get("mode"), r.get("recorded_at"),
+        db.execute("INSERT OR REPLACE INTO runs VALUES (" + ",".join("?" * 26) + ")", (
+            r.get("run_id"), r.get("project"), r.get("slug"), r.get("attempt"), r.get("mode"), r.get("recorded_at"),
             r.get("seconds"), p.get("name"), p.get("model"), r.get("outcome"), g.get("verdict"),
             g.get("acceptance_passed"), g.get("acceptance_total"), int(bool(g.get("regressed"))),
             t.get("files_changed"), t.get("insertions"), t.get("deletions"),
