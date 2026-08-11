@@ -93,7 +93,16 @@ TOOLS = [
 #
 # If that is right, the harness's own report schema is causing the missing reports it complains
 # about, and the fix is a schema or an API flag rather than a stronger instruction.
-def build_messages(schema: dict, already_verified: bool) -> list[dict]:
+def build_messages(schema: dict, already_verified, report_tool: bool = False) -> list[dict]:
+    if report_tool:
+        # Asking for a final message while offering a report tool is a contradictory prompt, and
+        # measuring it would measure the contradiction. When the tool exists, the tool is the ask.
+        base = ("The work is done. Call submit_report with your completion report. "
+                "Do not reply with prose.")
+        if already_verified:
+            base += ("\n\nEvery verification command has already been run for you: "
+                     "`php -l src/Temperature.php` exited 0.")
+        return MESSAGES[:-1] + [{"role": "user", "content": base}]
     ask = ("The work is done. Reply with ONLY a JSON object matching this schema, as your "
            "final message. No prose, no code fence.")
     if already_verified == "forbid":
@@ -121,6 +130,19 @@ def schema_without_tests(schema: dict) -> dict:
     trimmed["properties"].pop("tests_run", None)
     trimmed["required"] = [k for k in trimmed["required"] if k != "tests_run"]
     return trimmed
+
+
+# The report delivered AS a tool call, rather than as a final message.
+#
+# The whole finding above is that the model would rather call a function than conclude. This stops
+# fighting that: the report becomes the function. It is the shape bench/results already hints at —
+# round 10 measured 1/12 missing against 4/15 — and the probe can settle it in two minutes rather
+# than the two hours a wave costs.
+REPORT_TOOL = {"type": "function", "function": {
+    "name": "submit_report",
+    "description": "Submit the completion report. Call this when the work is finished.",
+    "parameters": SCHEMA,
+}}
 
 
 MESSAGES = [
@@ -175,7 +197,7 @@ def deepen(depth_tokens: int) -> list[dict]:
 def sample(host: str, port: int, model: str, timeout: int,
            temperature: float, seed: int, depth: int = 0,
            tool_choice: str | None = None, schema: dict = SCHEMA,
-           already_verified: bool = False) -> tuple[str, str]:
+           already_verified=False, report_tool: bool = False) -> tuple[str, str]:
     """Return (classification, detail) for one turn.
 
     Temperature and seed are per-request rather than inherited from the server, because a probe
@@ -189,10 +211,13 @@ def sample(host: str, port: int, model: str, timeout: int,
     # an implementation detail: `<|constrain|>` belongs to the tool-call dialect, so a model with
     # no functions in scope has no reason to reach for it. The harness always runs with these
     # registered, so a probe without them is not probing the same stack.
-    messages = build_messages(schema, already_verified)
+    messages = build_messages(schema, already_verified, report_tool)
     if depth > 0:
         messages = deepen(depth)[:-1] + messages[-1:]
-    payload = {"model": model, "messages": messages, "tools": TOOLS, "stream": False,
+    tools = list(TOOLS)
+    if report_tool:
+        tools.append(REPORT_TOOL)
+    payload = {"model": model, "messages": messages, "tools": tools, "stream": False,
                "temperature": temperature, "seed": seed}
     if tool_choice:
         payload["tool_choice"] = tool_choice
@@ -223,10 +248,22 @@ def sample(host: str, port: int, model: str, timeout: int,
         # the fault rate enormously — the first version of this probe reported 50% on exactly this
         # mistake, and `tools/peg-audit` disproved it by showing the server had logged no parse
         # failures at all for those turns.
-        if message.get("tool_calls"):
-            names = ",".join((c.get("function") or {}).get("name", "?")
-                             for c in message["tool_calls"])
-            return "tool-call", f"called {names} instead of reporting ({generated} tokens)"
+        calls = message.get("tool_calls") or []
+        names = [(c.get("function") or {}).get("name", "?") for c in calls]
+        if report_tool and "submit_report" in names:
+            # Validate the arguments rather than counting the call. A schema-shaped tool that is
+            # called with junk is not a report, and counting it as one is the same vacuity this
+            # project keeps catching elsewhere.
+            call = calls[names.index("submit_report")]
+            raw = (call.get("function") or {}).get("arguments")
+            try:
+                args = json.loads(raw) if isinstance(raw, str) else (raw or {})
+            except ValueError:
+                return "not-json", f"submit_report arguments are not JSON: {str(raw)[:80]}"
+            gaps = [k for k in schema["required"] if k not in args]
+            return ("incomplete", "submit_report missing " + ", ".join(gaps)) if gaps else ("ok", "")
+        if calls:
+            return "tool-call", f"called {','.join(names)} instead of reporting ({generated} tokens)"
         # The fault. The model generated; the parser discarded; the client sees nothing.
         return "empty", f"no content and no tool call, {generated} tokens generated"
 
@@ -261,6 +298,8 @@ def main() -> int:
                         help="drop tests_run from the schema — does the model stop diverting?")
     parser.add_argument("--already-verified", nargs="?", const=True, default=False,
                         help="both (default) | forbid = prohibition only | results = reason only")
+    parser.add_argument("--report-tool", action="store_true",
+                        help="offer submit_report as a function — stop fighting the preference")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
@@ -270,7 +309,7 @@ def main() -> int:
     for index in range(args.repeat):
         kind, detail = sample(args.host, args.port, args.model, args.timeout,
                               args.temp, 1000 + index, args.depth, args.tool_choice,
-                              schema, args.already_verified)
+                              schema, args.already_verified, args.report_tool)
         counts[kind] = counts.get(kind, 0) + 1
         if detail and len(details) < 5:
             details.append(f"{kind}: {detail}")
@@ -288,6 +327,7 @@ def main() -> int:
     if args.already_verified:
         variant.append({"forbid": "prohibition only", "results": "reason only"}
                        .get(args.already_verified, "prohibition + reason"))
+    if args.report_tool: variant.append("report as a tool call")
     if args.tool_choice: variant.append(f"tool_choice={args.tool_choice}")
     if args.depth: variant.append(f"depth~{args.depth}")
     print(f"report-probe: {args.repeat} turns at temp {args.temp}"
