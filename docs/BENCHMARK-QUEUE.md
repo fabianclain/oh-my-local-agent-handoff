@@ -67,15 +67,46 @@ This is not entirely good news, and the next queue should watch for it: the two
 the window to 128k means conversations can now *reach* depths where that fault has been observed.
 More context may buy more of the failure class that costs a whole round.
 
-**Round 12 (report as a tool call) is measuring the wrong thing.** It was queued to separate an 8%
-missing-report rate from a 27% one. `tools/peg-audit` shows the reports are not missing: they are
-generated in full, addressed to the `final` channel with a `<|constrain|>JSON` tag rather than
-emitted as a tool call, and discarded by llama.cpp's harmony parser with a warning. Changing the
-channel the harness *asks* for does not address a parser that cannot map what the model produced.
+~~**Round 12 (report as a tool call) is measuring the wrong thing.**~~ **Reinstated as the top
+priority, and the dismissal above was wrong.** It was written on the reasoning that a parser which
+cannot map the model's output will not be helped by changing the channel the harness asks for. The
+chat template says otherwise — see below. A tool call is the one place `<|constrain|>json` is
+legal, so routing the report there puts the model's own instinct onto a parseable path, which is a
+*mechanism* the arm previously lacked.
 
-Two consecutive smoke runs on `surgical` came back `report-unparseable`, so the per-round rate is
-high even though the per-completion rate is 0.4% — a report is emitted once per round, and the
-denominator in the audit is completions.
+Round 10 already measured it at low power: **no report 1/12 (8%) against 4/15 (27%)**, turns ending
+with no text block 17% against 33%, p = 0.34. Round 12 exists to give that enough power to
+separate. `~/.cline-llamacpp-mcp` is already configured, so it can run as-is.
+
+### The chat template and the model disagree about harmony, and that explains both faults
+
+Read back from the running server, `GET /props` → `chat_template`, 16,616 characters. Two
+observations, both directly checkable:
+
+| | The GGUF's template renders | The model emits |
+| --- | --- | --- |
+| a tool call | `<\|start\|>assistant to=functions.NAME<\|channel\|>commentary json<\|message\|>` | `<\|channel\|>functions.run_commands<\|channel\|>commentary to=assistant<\|constrain\|>json<\|message\|>` |
+| a structured final | `<\|start\|>assistant<\|channel\|>final<\|message\|>` | `<\|channel\|>final <\|constrain\|>JSON<\|message\|>` |
+
+The template puts `to=` **before** the channel token and marks the content type with a bare word.
+The string `<|constrain|>` does not occur anywhere in its 16,616 characters. The model puts the
+channel first and marks content type with a `<|constrain|>` token — which is the ordering and the
+tag used by OpenAI's published harmony format. *(Stated from the harmony documentation rather than
+re-derived here; worth confirming before it is quoted anywhere load-bearing.)*
+
+So the model was trained on one dialect and is being prompted in another, and both observed faults
+are what that produces: a header assembled from halves of each convention, and a `<|constrain|>`
+tag applied to a `final` message because the model wants to signal "this is JSON" and the harness
+has asked for JSON in the final message.
+
+**This weakens the case that it is a llama.cpp defect.** Putting a tool-call construct on a final
+message is not canonical harmony, so a parser rejecting it is defensible. The narrow upstream
+request that survives is leniency — recover the message body instead of discarding it — and that is
+a much smaller ask than a bug. The larger question, whether this GGUF's template matches what
+gpt-oss was trained on, belongs to whoever published the GGUF.
+
+**The workaround is on this side and already built.** Ask for the report where `<|constrain|>json`
+is legal: as a tool call.
 
 ## Queued from real use — the editing-failure batch
 

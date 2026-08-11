@@ -683,6 +683,16 @@ Both were attributed to the model for weeks. Both are the serving stack, and bot
 The last row is the one to remember. The other five were overturned by measurement; that one was an
 invention that survived a commit message because it sounded like the kind of thing that is true.
 
+And one more, from the same afternoon:
+
+| Believed | Actually |
+| --- | --- |
+| Changing the channel the report is asked for cannot help, because the parser cannot map what the model produced either way | Backwards. The GGUF's chat template contains no `<\|constrain\|>` in 16,616 characters and puts `to=` before the channel token; the model emits `<\|constrain\|>` and puts the channel first. It was trained on one harmony dialect and prompted in another. `<\|constrain\|>json` is legal **only on a tool call** — so asking for the report as a tool call is the one change that puts the model's own instinct onto a parseable path. Round 10 had already measured 1/12 against 4/15 and it was dismissed as coincidence |
+
+The lesson is narrower than "check your assumptions". It is that a mechanism was declared —
+*the parser cannot map the output* — without reading the thing that decides it, which was one HTTP
+request away the whole time: `GET /props` returns the chat template.
+
 ### Wrong about the benchmark, which was scoring the model down for obeying it
 
 `templates/agent-rules.md` grants the model `.handoff/scratch/` in as many words — *"that directory
