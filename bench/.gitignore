@@ -1,2 +1,8 @@
 .work/
 results/
+
+# Archived results, written by --force instead of deleting what it replaces. Ignored for the same
+# reason results/ is, and because leaving them tracked makes every subsequent run record
+# harness_dirty=1 -- a flag that is supposed to mean "the harness code was modified" and would
+# instead mean "an archive exists". Observed within an hour of --force learning to archive.
+archive/
