@@ -139,6 +139,36 @@ class ToolFault(Exception):
         self.detail = detail
 
 
+WRITABLE: set[str] = set()
+READONLY: set[str] = set()
+
+
+def check_writable(repo: pathlib.Path, path: pathlib.Path) -> None:
+    """Refuse a write the gates would reject anyway, on the turn it happens.
+
+    Two rules, both already enforced after the fact and both cheaper enforced now:
+
+      - a file under '## Files to read, not modify' must come back byte-identical. A reviewer
+        writes the tests before the run and lists them here; editing them is the implementer
+        marking its own work, and the round is lost when the gate notices.
+      - a file the plan does not name is a scope violation. Two of four `wide` rounds were
+        rejected for tmp/test_*.php and verify.sh, one of them with 11 of 11 criteria met.
+
+    Silence when the lists are unknown. A tool that refuses everything because nobody told it what
+    was allowed is worse than one that refuses nothing.
+    """
+    try:
+        rel = str(path.relative_to(repo.resolve()))
+    except ValueError:
+        return
+    if rel in READONLY:
+        raise ToolFault("scope", f"{rel} is listed under 'Files to read, not modify'; "
+                                 "it must come back byte-identical and may not be edited")
+    if WRITABLE and rel not in WRITABLE and not rel.startswith(SCRATCH + "/"):
+        raise ToolFault("scope", f"{rel} is not in the plan's 'Files to touch'; "
+                                 f"put anything else under {SCRATCH}/, which is yours")
+
+
 def resolve(repo: pathlib.Path, raw: str) -> pathlib.Path:
     """Resolve a model-supplied path, and refuse anything that leaves the repository.
 
@@ -229,6 +259,7 @@ def run_tool(repo: pathlib.Path, name: str, args: dict) -> str:
 
         if name == "write_file":
             path = resolve(repo, args["path"])
+            check_writable(repo, path)
             content = args.get("content") or ""
             atomic_write(path, content)
             where = path.relative_to(repo.resolve())
@@ -236,6 +267,7 @@ def run_tool(repo: pathlib.Path, name: str, args: dict) -> str:
 
         if name == "replace_in_file":
             path = resolve(repo, args["path"])
+            check_writable(repo, path)
             if not path.exists():
                 return f"error: {args['path']} does not exist"
             body = read_text_strict(path)
@@ -351,8 +383,17 @@ def main() -> int:
     parser.add_argument("--model", default="gpt-oss-20b")
     parser.add_argument("--temp", type=float, default=0.8)
     parser.add_argument("--max-turns", type=int, default=40)
+    # Colon-separated, exported by bin/handoff from tools/plan-files. Empty means "unknown", and
+    # unknown must not become "forbidden" — a provider run outside the driver would refuse every
+    # write and look like a total failure.
+    parser.add_argument("--writable", default="")
+    parser.add_argument("--readonly", default="")
     parser.add_argument("--timeout", type=int, default=600)
     args = parser.parse_args()
+
+    WRITABLE.update(p for p in args.writable.split(":") if p)
+    READONLY.update(p for p in args.readonly.split(":") if p)
+    (args.repo / SCRATCH).mkdir(parents=True, exist_ok=True)
 
     schema = json.loads(args.schema.read_text())
     messages = [{"role": "system", "content": args.system},

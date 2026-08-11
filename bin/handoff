@@ -391,6 +391,15 @@ while IFS='=' read -r cap level; do
     [[ "$level" == "native" ]] || echo "==> NOTE: $PROVIDER $cap is '$level', not native"
 done < <(provider_capabilities)
 
+# The plan's declared paths, for providers that can enforce them during the round rather than
+# leaving them to the gates afterwards. Extracted by tools/plan-files, which shares verify-round's
+# expressions rather than adding a parser.
+if [[ -f "$PLAN_FILE" ]]; then
+    HANDOFF_PLAN_WRITABLE="$("$HANDOFF_HOME/tools/plan-files" "$PLAN_FILE" writable 2>/dev/null | paste -sd: -)"
+    HANDOFF_PLAN_READONLY="$("$HANDOFF_HOME/tools/plan-files" "$PLAN_FILE" readonly 2>/dev/null | paste -sd: -)"
+    export HANDOFF_PLAN_WRITABLE HANDOFF_PLAN_READONLY
+fi
+
 echo "==> handoff $MODE '$SLUG'  provider=$PROVIDER model=${HANDOFF_MODEL:-default} sandbox=${HANDOFF_SANDBOX:-workspace-write}"
 
 # What was actually sent. Nothing recorded this before, and the gap is not cosmetic: a benchmark

@@ -1139,6 +1139,69 @@ else
     fail "native's scope and history guards are gone — the rules are back to being requests"
 fi
 
+# --- plan-files must agree with verify-round, and native must act on what it says ----------------
+# A third parser of the same table is how check-plan and verify-round drifted; the agreement check
+# is what keeps this one honest.
+PF="$SANDBOX/agree.md"
+cat >"$PF" <<'AGREE'
+# x
+## Files to touch
+| Path | Action |
+| --- | --- |
+| `src/A.php` | modify |
+| `src/B.php` | create |
+## Files to read, not modify
+| Path | Why |
+| --- | --- |
+| `tests/AT.php` | the judge |
+## Acceptance criteria
+- [ ] a
+## Verification
+```bash
+true
+```
+AGREE
+VR_OUT="$(awk '/^## Files to touch[[:space:]]*$/{s=1;next} s&&/^## /{exit} s&&/^\|/{split($0,c,"|");p=c[2];gsub(/^[[:space:]]+|[[:space:]]+$/,"",p);gsub(/`/,"",p);if(p!="Path"&&p!~/^-+$/&&p!="")print p}' "$PF")"
+if [[ "$("$REPO/tools/plan-files" "$PF" writable)" == "$VR_OUT" ]]; then
+    pass "plan-files agrees with verify-round's extraction"
+else
+    fail "plan-files and verify-round disagree about what a plan declares"
+fi
+if [[ "$("$REPO/tools/plan-files" "$PF" readonly)" == "tests/AT.php" ]]; then
+    pass "plan-files reads the protected-file table"
+else
+    fail "plan-files does not extract 'Files to read, not modify'"
+fi
+
+if python3 - <<'SCOPED'
+import importlib.machinery, importlib.util, io, pathlib, sys, tempfile
+l = importlib.machinery.SourceFileLoader("na", "tools/native-agent")
+na = importlib.util.module_from_spec(importlib.util.spec_from_loader("na", l)); l.exec_module(na)
+d = pathlib.Path(tempfile.mkdtemp())
+(d / "src").mkdir(); (d / "tests").mkdir()
+(d / "tests/AT.php").write_text("<?php // judge\n")
+call = lambda n, a: na.dispatch(d, n, a, "c", io.StringIO())
+
+# Unknown lists must not mean "refuse everything" — a provider run outside the driver still works.
+assert "wrote" in call("write_file", {"path": "src/A.php", "content": "<?php\n"}), "refused with no lists set"
+
+na.WRITABLE.update({"src/A.php", "src/B.php"})
+na.READONLY.update({"tests/AT.php"})
+assert "wrote" in call("write_file", {"path": "src/A.php", "content": "<?php\n"}), "a declared file was refused"
+out = call("write_file", {"path": "tests/AT.php", "content": "<?php // tampered\n"})
+assert "byte-identical" in out, f"a protected file was writable: {out}"
+assert (d / "tests/AT.php").read_text() == "<?php // judge\n", "the protected file was modified"
+out = call("write_file", {"path": "tmp/test_x.php", "content": "x"})
+assert "not in the plan" in out and na.SCRATCH in out, f"an out-of-scope write was allowed: {out}"
+assert "wrote" in call("write_file", {"path": f"{na.SCRATCH}/probe.php", "content": "x"}), "scratch was refused"
+sys.exit(0)
+SCOPED
+then
+    pass "native enforces the plan's writable and read-only lists during the round"
+else
+    fail "native writes wherever it is told again — the gates are back to catching it afterwards"
+fi
+
 echo
 if [[ "$FAILURES" -eq 0 ]]; then echo "all checks passed"; else echo "$FAILURES check(s) failed"; fi
 exit $(( FAILURES > 0 ? 1 : 0 ))

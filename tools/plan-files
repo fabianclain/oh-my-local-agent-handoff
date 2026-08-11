@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+#
+# plan-files — the paths a plan declares, for anything that needs them before the round runs.
+#
+#   tools/plan-files <plan.md> writable    the '## Files to touch' table
+#   tools/plan-files <plan.md> readonly    the '## Files to read, not modify' table
+#
+# tools/verify-round extracts both lists to judge a finished round. It is the authority, and the
+# expressions here are copied from it deliberately rather than rewritten — tools/selftest-all
+# already runs a "plan-parser agreement" check because check-plan and verify-round drifted once,
+# and a third independent parser is how that happens again.
+#
+# The lists exist here because the native loop can act on them BEFORE the tree is judged. A write
+# to a protected file is currently discovered afterwards, as a byte-identical gate failure and a
+# lost round; the tool can refuse it on the turn instead, and tell the model why. Same facts, an
+# order of magnitude earlier.
+#
+# tools/smoke-e2e asserts this agrees with verify-round on a fixture, so a change to one that is
+# not made to the other is caught rather than measured.
+
+set -uo pipefail
+
+PLAN="${1:-}"
+[[ -n "$PLAN" ]] || { echo "usage: plan-files <plan.md> {writable|readonly}" >&2; exit 64; }
+WHICH="${2:-writable}"
+[[ -f "$PLAN" ]] || { echo "no plan at $PLAN" >&2; exit 66; }
+
+case "$WHICH" in
+writable) HEADING='## Files to touch' ;;
+readonly) HEADING='## Files to read, not modify' ;;
+*) echo "usage: plan-files <plan.md> {writable|readonly}" >&2; exit 64 ;;
+esac
+
+awk -v heading="$HEADING" '
+    $0 == heading { in_section=1; next }
+    in_section && /^## / { exit }
+    in_section && /^\|/ {
+        split($0, cells, "|"); path=cells[2]
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", path); gsub(/`/, "", path)
+        if (path != "Path" && path !~ /^-+$/ && path != "") print path
+    }
+    # The read-only section is documented as a table but a bare list reads naturally and has been
+    # written that way, so both are accepted — matching verify-round.
+    in_section && /^- / {
+        path=$0; sub(/^- +/, "", path); gsub(/`/, "", path)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", path)
+        if (path != "") print path
+    }
+' "$PLAN"

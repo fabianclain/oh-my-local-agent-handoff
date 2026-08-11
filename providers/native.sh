@@ -68,5 +68,7 @@ provider_run() {
         --port "${LLAMACPP_PORT:-8071}" \
         --model "$HANDOFF_MODEL" \
         --temp "$NATIVE_TEMP" \
-        --max-turns "$NATIVE_MAX_TURNS"
+        --max-turns "$NATIVE_MAX_TURNS" \
+        --writable "${HANDOFF_PLAN_WRITABLE:-}" \
+        --readonly "${HANDOFF_PLAN_READONLY:-}"
 }
