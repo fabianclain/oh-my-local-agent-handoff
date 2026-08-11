@@ -38,7 +38,12 @@ if [[ "${1:-}" == --kill ]]; then
     shift
 fi
 
-PATTERN="${1:-cline|opencode|codex}"
+# native-agent belongs here for the same reason the rented clients do, and was missing because it
+# did not exist when this list was written. It orphans identically: killing a bench job left one
+# generating against the server in a worktree that was about to be deleted, holding the model and
+# charging its tokens to whichever run was open next. The default must name every loop that can
+# talk to the server, not just the ones bought from someone else.
+PATTERN="${1:-cline|opencode|codex|native-agent}"
 FOUND=0
 GHOST_PIDS=()
 KILLED=0

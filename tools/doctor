@@ -86,7 +86,22 @@ if curl -fsS --max-time 3 "http://$HOST:$PORT/health" >/dev/null 2>&1; then
         python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("model_path","?").split("/")[-1], d.get("default_generation_settings",{}).get("n_ctx","?"))' 2>/dev/null)"
     ok "llama-server answering on :$PORT — ${SERVED:-unknown}"
     CTX="${SERVED##* }"
-    if [[ "$CTX" =~ ^[0-9]+$ ]] && (( CTX < 32768 )); then
+    # An expectation, when the caller has one. A benchmark queue states the stack it is measuring
+    # -- build, model, context -- and every part of that except the context was already asserted
+    # somewhere. The gap cost an hour of a ten-hour night: a 32768 server left over from an
+    # afternoon of probing was still up, the queue adopted it, doctor printed the number without
+    # objecting because the old check only fires BELOW 32768, and three arms ran against a window
+    # a third of the one every document named. Set HANDOFF_EXPECT_CTX and a mismatch is a failure.
+    if [[ -n "${HANDOFF_EXPECT_CTX:-}" ]]; then
+        if [[ "$CTX" == "${HANDOFF_EXPECT_CTX}" ]]; then
+            ok "context is $CTX, as expected"
+        else
+            bad "context is $CTX, but HANDOFF_EXPECT_CTX asks for ${HANDOFF_EXPECT_CTX}"
+            hint "Restart:  $HANDOFF_HOME/tools/llamacpp-serve start gpt-oss-20b ${HANDOFF_EXPECT_CTX}"
+            hint "A server outliving the session that started it keeps its old settings, and"
+            hint "/health cannot tell you which settings those are."
+        fi
+    elif [[ "$CTX" =~ ^[0-9]+$ ]] && (( CTX < 32768 )); then
         warn "context is only $CTX tokens"
         hint "Real rounds here have exceeded 32k and failed with 'exceeds the available"
         hint "context size'. That reads as a model failure and is not one."

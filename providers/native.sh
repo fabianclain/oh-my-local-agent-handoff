@@ -35,9 +35,30 @@ source "$(dirname "${BASH_SOURCE[0]}")/lcpp.sh"
 
 provider_name() { echo "native"; }
 
+# Keep lcpp.sh's manifest under another name rather than replacing it. It is the only place that
+# records server_props — the context the round actually ran at — and overriding it wholesale is
+# how three native arms ran at 32768 for an hour while the queue file, the handoff prompt and this
+# comment block all said 98304, with nothing in any result file able to contradict them. The
+# Cline arms recorded n_ctx and were checkable the whole time; the native arms were not.
+#
+# `declare -f` prints the definition, `tail -n +2` drops the name line, and eval binds the body to
+# a new name. Copying the body by hand would put a second stack-recording implementation in the
+# repository, which is the defect shape that put check-plan and bench/run out of step.
+eval "_native_stack_manifest() $(declare -f provider_manifest | tail -n +2)"
+
 provider_manifest() {
-    printf '{"provider":"native","model":"%s","max_turns":%s,"temp":%s}\n' \
-        "$HANDOFF_MODEL" "$NATIVE_MAX_TURNS" "$NATIVE_TEMP"
+    _native_stack_manifest | NATIVE_FIELDS="$(printf \
+        '{"provider":"native","client":"native","client_version":null,"max_turns":%s,"temp":%s}' \
+        "$NATIVE_MAX_TURNS" "$NATIVE_TEMP")" python3 -c '
+import json, os, sys
+
+try:
+    manifest = json.load(sys.stdin)
+except ValueError:
+    manifest = {}
+manifest.update(json.loads(os.environ["NATIVE_FIELDS"]))
+print(json.dumps(manifest, indent=2))
+'
 }
 
 # Structured output is native here in the strict sense: the report is a tool call whose input
