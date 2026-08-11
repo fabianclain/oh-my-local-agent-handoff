@@ -33,6 +33,19 @@
 # Waves rather than arms-in-sequence, for the reason last night established: an interruption at any
 # point leaves a balanced comparison rather than one complete arm and nothing to compare it to.
 
+# A CONFOUND TO DECLARE, found while launching this.
+#
+# The queue aborted on its first attempt because `doctor` reported cline missing. The package was
+# present; its bin symlink was not. The file is dated 22:10 tonight and reports 3.0.53, where
+# doctor saw 3.0.52 this morning — cline upgraded mid-session and the upgrade did not recreate the
+# link. So tonight's lcgptossl runs are on 3.0.53 and today's are on 3.0.52.
+#
+# Within tonight the comparison is clean, because every arm runs under one client. Against today's
+# numbers it is not, and the client version now belongs in the same list as the harness commit and
+# the llama.cpp build: things that change underneath a measurement and are recorded nowhere.
+#
+# It is also the reason doctor's cline check earns its keep. Without it the control arm would have
+# failed every round for a missing binary, and the native arms would have looked better for it.
 CLONE="${BENCH_CLONE:-$HOME/dev/agent-handoff-bench}"
 HANDOFF="${HANDOFF_HOME:-$PWD}"
 
