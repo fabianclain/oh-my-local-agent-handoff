@@ -25,7 +25,7 @@ eval "_lcgptossl96_base_preflight() { $(declare -f provider_preflight | tail -n 
 provider_preflight() {
     _lcgptossl96_base_preflight || return 1
     local port="${LLAMACPP_PORT:-8071}" n_ctx
-    n_ctx="$(curl -fsS --max-time 5 "http://127.0.0.1:${port}/props" 2>/dev/null |
+    n_ctx="$(curl -fsS --max-time 5 "http://${LLAMACPP_HOST:-127.0.0.1}:${port}/props" 2>/dev/null |
         python3 -c 'import json,sys; print(json.load(sys.stdin)["default_generation_settings"]["n_ctx"])' 2>/dev/null)"
     [[ -n "$n_ctx" ]] || { echo "could not read n_ctx from llama-server" >&2; return 1; }
     [[ "$n_ctx" -ge 98304 ]] || {
