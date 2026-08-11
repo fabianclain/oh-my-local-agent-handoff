@@ -127,16 +127,34 @@ keep steps small enough that conversations stay shallow. Those are not in tensio
     att 2   finish=completed   text? yes
 
 The model emits the report, the harmony parser rejects it, Cline reports an error with no text
-block, and the harness records "no report". Across 48 runs: 24 attempts finished in error with no
-text, **22 of 48 runs spent a second attempt**, and 15 of those still ended `patch-ok-no-report`.
+block, and the harness records "no report". Across 48 runs, 24 provider calls ended that way.
 
-Roughly 40% of all runs paid double for a defect in the serving stack, and the retry did not fix it
-in 15 of 19 cases. Two things follow, and neither is a benchmark:
+**Read that `att` column carefully — it is provider calls, not benchmark attempts.** The first
+version of this section said 22 of 48 runs "spent a second attempt" and paid double. That was a
+misreading of `tools/final-turn-shape`, whose `att` counts `run_result` events, and the harness's
+own report re-ask is one of them. Checked against the metrics, every one of those runs recorded
+`attempts=1`: the acceptance criteria had already passed, so `bench/run` broke out of its loop
+correctly and **no round was re-implemented.**
 
-1. **`llama-server` is pinned at `b10331`.** Harmony parsing has moved upstream since. Upgrading is
-   the cheapest possible fix and is testable in minutes with `tools/engine-conformance`.
-2. **Do not retry a round whose only defect is a missing report**, when the tree is already usable.
-   The retry is chasing an artifact the parser will discard again.
+Measured cost of the re-ask, over six runs: **7.2% of output tokens and 4.9% of wall clock.** It
+fails the same way the original did — 700–1300 tokens generated, `{"tool_calls":[],"final":""}`
+returned. So it is waste, not damage, and suppressing it would save about 1.2% overall. Not worth
+the change.
+
+What follows instead:
+
+1. **`llama-server` is pinned at `b10331`, and upgrading is not the fix.** The 26 commits between
+   `b10331` and `b10357` touch `common/chat.cpp` only for an unrelated chat template. Reverting is
+   worse: the PEG chat parser landed in #17136 on 2025-12-03, so escaping it means going back eight
+   months. Neither direction helps, which leaves reporting it upstream.
+2. **`tools/engine-conformance` cannot detect a fix for this.** It passed 21/21 on the broken build,
+   twice. It exercises tool calls; this fault is a `final`-channel message. Any test of a candidate
+   build has to measure the no-report rate per round over a wave, not conformance.
+3. **The untested lever is sampling.** The server runs at llama.cpp's default temperature of 0.8 — a
+   creative-writing profile — and malformed control tokens are exactly what high temperature
+   produces. Sampling has been varied before, but only ever against outcome variance, never against
+   the parse-failure rate. `LLAMACPP_EXTRA_ARGS="--temp 0 --top-p 1 --top-k 0"` and one wave would
+   answer it.
 
 ### Round 17 — answered from the server's own log, in seconds
 

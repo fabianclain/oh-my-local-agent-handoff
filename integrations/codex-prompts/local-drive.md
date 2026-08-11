@@ -106,10 +106,13 @@ the model server's own log for faults that never reach the harness at all.
 
 **`patch-ok-no-report` is the one row that needs no action, and it is the most common.** The model
 writes the report in full; llama.cpp's harmony parser cannot map it and discards it, so the turn
-arrives as an error with no text. Measured across 48 runs, the signature was identical every time:
-attempt 1 finishes in error with no text block, attempt 2 completes. **22 of those 48 runs spent a
-second attempt chasing it, and 15 still ended without a report** — roughly 40% of runs paying
-double for a defect no retry can fix.
+arrives as an error with no text. The harness then makes one short call asking for the report
+again, and that call is discarded the same way — it generates 700–1300 tokens and comes back
+`{"tool_calls":[],"final":""}`.
+
+**No round is re-implemented over this.** The acceptance criteria had already passed, so the
+harness stopped after one attempt; the re-ask costs about 7% of a round's output tokens and 5% of
+its wall clock. It is waste, not damage.
 
 So when the tree is usable and the only thing missing is the report: accept the step, commit it,
 and move on. Do not retry, do not re-specify, and do not report it to the planner as a problem with
