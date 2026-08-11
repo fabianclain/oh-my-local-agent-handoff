@@ -327,28 +327,39 @@ than a control, and the tool must not pretend otherwise.
 Expect `chance`. At n≈15 this plan's noise floor is roughly 20 percentage points, measured from two
 arms that were identical by construction and still differed by that much.
 
-### Round 15 at the right window: the budget that binds is turns, not context
+### Round 15 at the right window, and a claim of mine that lasted three runs
 
-Re-run at 98304 after the 32768 episode, n=3 per arm, same harness commit:
+Re-run at 98304 after the 32768 episode, same harness commit.
 
-| | `native` | `nativewhole` |
+**What held.** The context-budget stops were the window. They were 3 of 3 provider calls at 32768
+and are 0 of 8 at 98304. Nothing about whole-file writes exhausted the context.
+
+**What did not hold.** At n=3 per arm `nativewhole` hit the 40-turn limit in 2 of 3 rounds and
+`native` in none, and this file said whole-file writes "cost turns, not correctness". Three more
+runs per arm erased the difference:
+
+| finish reason, per provider call | `native` | `nativewhole` |
 | --- | ---: | ---: |
-| stopped on the context budget | 0/3 | **0/3** — was 3/3 at 32768 |
-| stopped on the turn limit | 0/3 | **2/3** |
-| criteria met | 11/11 in all three | 11/11 in all three |
-| accepted | 3/3 | 2/3 |
+| turn-limit | 3 | 3 |
+| completed | 3 | 3 |
+| error | 1 | 2 |
+| recovered-report | 1 | 0 |
 
-Two things follow, and the second is the useful one.
+The turn limit binds **both** arms, in roughly 3 of 8 provider calls. That is a fact about
+`--max-turns 40`, not about editing style, and the editing-style reading came from a three-run
+split that the queue file's own noise-floor note predicts: at this n the plan's floor is about 20
+percentage points.
 
-The context-budget stops were the **window**, exactly as suspected: they disappear entirely when
-the server serves what every document said it was serving. Nothing about whole-file writes
-exhausted the context.
+Kept as written rather than quietly replaced, because the failure mode is the one this document
+exists to record — a mechanism inferred from a difference that was not there.
 
-What whole-file writes actually cost is **turns**. `nativewhole` hit the 40-turn limit in two of
-three rounds, `native` in none — and the round that lost its report had already met 11 of 11
-criteria. The tree was finished and there was no turn left to say so. So round 15's arm does not
-produce worse code; it produces the same code and runs out of budget describing it.
+**What is still true of the arm at n=6:** 11 of 11 criteria in every single round, both arms.
+`native` 6/6 accepted, `nativewhole` 5/6 with one round losing its report. Whole-file writing does
+not produce worse code on this plan. Whether it produces worse code on a *large* file — the 421-line
+service that motivated the patch-only gate — this plan cannot say, and that is the version of round
+15 still worth running.
 
-That makes `--max-turns` the variable worth an arm, not the editing style. Raising it trades
-against depth, which is what correlates with discarded output — so it has to be measured, not
-assumed. n is 3 per arm at the time of writing and the night runs to 18.
+**The real finding is the turn budget.** Over a third of provider calls end at the limit, and at
+least one of them had already met every criterion and had no turn left to report in. Raising
+`--max-turns` trades against depth, which is what correlates with discarded output, so it needs an
+arm rather than a guess.
