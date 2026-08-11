@@ -107,6 +107,12 @@ spend its whole budget reading files and write nothing. Measured across two sess
 same rate whichever ceiling it runs under. Enlarging the window does not buy you a bigger step. It
 only stops you overflowing.
 
+**Depth is a proxy, not the cause, so do not treat the table as a budget to spend up to.** The same
+fault has been induced deliberately at **666 tokens** by putting the model in conflict — asked to
+attest to test results while forbidden from running anything. What deep conversations have in
+common with that is pressure to conclude while the model still wants to act. Small steps help
+because they reach that moment with less accumulated pressure, not because tokens are toxic.
+
 So size a step by the conversation it will produce, not by the window it has available. A step that
 needs the model to read six files before it can write one is a deep conversation regardless of how
 few files it changes.

@@ -667,6 +667,47 @@ than by argument.
 | Telling the model to run the syntax checker after every write will catch truncation while it is still repairable | n=20 per arm: **damage identical at 5/20**, every outcome measure indistinguishable, 38% slower and 37% more tokens. Second prompt-layer variant to move nothing. Instructions are not a mechanism |
 | Money and aggregates are where this model breaks down | Not when the arithmetic is specified. Five of five implementations of integer proration with largest-remainder allocation were correct under 4000 randomised trials each, including the tie-break and an odd-divisor rounding edge the plan never spelled out. The greenfield 0/7 was about deciding, not computing |
 
+### 8c. Why the model calls a tool instead of reporting — measured directly, 2026-08-11
+
+`tools/report-probe` provokes the final turn in isolation: sixteen samples, about two minutes,
+against `bench/run`'s forty minutes for eight rounds. Every cell below is n=16 at temperature 0.8,
+same conversation, same schema.
+
+| The report turn is asked with | reports cleanly | calls a tool instead | no answer at all | HTTP 500 |
+| --- | ---: | ---: | ---: | ---: |
+| tools registered, free choice *(what the harness does)* | 44% | **56%** | 0 | 0 |
+| the same, with `tests_run` dropped from the schema | 56% | 44% | 0 | 0 |
+| verification results supplied, nothing forbidden | 56% | 44% | 0 | 0 |
+| `tool_choice: "none"` | 38% | 0 | **62%** | 0 |
+| "Do not call any tool" in the prompt | 75% | 0 | 0 | **19%** |
+| **both — results supplied AND tools forbidden** | **88%** | 12% | 0 | 0 |
+| no tools registered at all | **100%** | — | 0 | 0 |
+
+**The model is not ignoring the instruction. It is obeying a different one — ours.** The report
+schema asks it to attest to `tests_run` and `files_changed`; `templates/agent-rules.md` tells it
+never to claim a command passed unless it ran it. So at report time it goes to establish ground
+truth. Its own reasoning, captured from a raw response:
+
+> *"We need to fill status, summary, files_changed, tests_run, deviations, blockers. We should run
+> tests to see if any failures. Let's run tests."*
+
+**Forbidding the tool at the API level is worse than allowing it.** `tool_choice: "none"` produces
+silence, not reports: `finish_reason: stop`, ~105 tokens of reasoning, empty content. The model
+resolves "I must verify" against "I cannot act" by stopping rather than by answering. That is the
+obvious flag to reach for and it makes the problem worse.
+
+**The tension is what produces malformed harmony.** Prohibiting tool calls in the prompt without
+removing the reason to make them yields 19% HTTP 500 *"output does not match the expected
+peg-native format"* — the parse fault, induced deliberately, **at 666 tokens of context.** Supplying
+the verification results as well removes the conflict and the 500s vanish.
+
+That last point corrects §3's reading of the depth table. The production correlation between
+conversation depth and parse failures is real, but depth is a *proxy*: a deep conversation is one
+where the model is being pushed to conclude while it still wants to act. The fault can be produced
+at 666 tokens by creating that conflict directly. Smaller steps still help — they reach the
+conclude-or-act moment with less accumulated pressure — but "keep the conversation shallow" is the
+symptom's lever, not the mechanism's.
+
 ### Wrong for a long time about the two loudest numbers, 2026-08-11
 
 Both were attributed to the model for weeks. Both are the serving stack, and both were sitting in

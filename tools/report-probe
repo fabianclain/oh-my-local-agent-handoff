@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+"""report-probe — reproduce the discarded-report fault directly, in seconds rather than an hour.
+
+    tools/report-probe [--repeat 20] [--port 8071] [--host 127.0.0.1] [--json]
+
+The fault this exists for: the model is asked for a JSON completion report as its final message,
+emits it in full, addresses it to the `final` channel with a `<|constrain|>JSON` tag, and
+llama.cpp's harmony parser discards the whole message. The client receives empty content.
+
+Why a probe and not a benchmark. Measuring this through `bench/run` costs 40 minutes a wave and
+returns 8 rounds — barely enough to see a complete fix and never enough to see a partial one. The
+fault happens on one turn, so it can be provoked on one turn. Twenty samples take about two
+minutes, which turns "test a chat-template change" from an afternoon into a coffee break.
+
+`tools/engine-conformance` cannot substitute for this and it is worth saying why, because it looks
+like it should: it passed 21/21 against the stack that was losing a quarter of all reports, twice.
+It exercises TOOL CALLS. This fault is a final-channel message, which conformance never asks for.
+
+What is measured. `empty` is the fault: HTTP 200, a finish reason, and no content — which is what
+a discarded message looks like from the client. The server's own log is where the discarded text
+survives, so run `tools/peg-audit` afterwards to confirm the mechanism rather than inferring it
+from a blank.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import urllib.error
+import urllib.request
+
+# Deliberately the shape the harness actually asks for: a structured completion report as the
+# final assistant message, after the model has "done" some work. The schema is small but real —
+# the fault has never been observed on a trivial one-field object, and a probe that cannot
+# reproduce the failure certifies nothing.
+SCHEMA = {
+    "type": "object",
+    "required": ["status", "summary", "files_changed", "tests_run"],
+    "properties": {
+        "status": {"type": "string", "enum": ["complete", "partial", "blocked"]},
+        "summary": {"type": "string"},
+        "files_changed": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}, "change": {"type": "string"},
+                               "why": {"type": "string"}},
+            },
+        },
+        "tests_run": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}, "passed": {"type": "boolean"},
+                               "detail": {"type": "string"}},
+            },
+        },
+        "deviations": {"type": "array", "items": {"type": "string"}},
+        "blockers": {"type": "array", "items": {"type": "string"}},
+    },
+}
+
+# The functions the harness registers. Names and shapes match what Cline exposes, because the
+# tool namespace is part of what the chat template renders into the prompt.
+TOOLS = [
+    {"type": "function", "function": {
+        "name": "apply_patch",
+        "description": "Edit files with the canonical freeform patch grammar.",
+        "parameters": {"type": "object", "properties": {"input": {"type": "string"}},
+                       "required": ["input"]}}},
+    {"type": "function", "function": {
+        "name": "run_commands",
+        "description": "Run shell commands in the repository.",
+        "parameters": {"type": "object",
+                       "properties": {"commands": {"type": "array", "items": {"type": "string"}}},
+                       "required": ["commands"]}}},
+    {"type": "function", "function": {
+        "name": "read_files",
+        "description": "Read files from the repository.",
+        "parameters": {"type": "object",
+                       "properties": {"files": {"type": "array", "items": {"type": "object"}}},
+                       "required": ["files"]}}},
+]
+
+# Why the ablations below exist.
+#
+# Asked for a final report with functions still in scope, the model calls one instead of reporting
+# about half the time — and what it reaches for is `run_commands`. The report schema asks for
+# `tests_run: [{command, passed, detail}]`. The most likely reading is that the model is not
+# ignoring the instruction at all: it is going to run the tests so it can fill that field in
+# honestly, which is exactly what the agent rules ask of it everywhere else.
+#
+# If that is right, the harness's own report schema is causing the missing reports it complains
+# about, and the fix is a schema or an API flag rather than a stronger instruction.
+def build_messages(schema: dict, already_verified: bool) -> list[dict]:
+    ask = ("The work is done. Reply with ONLY a JSON object matching this schema, as your "
+           "final message. No prose, no code fence.")
+    if already_verified == "forbid":
+        # The prohibition on its own. Is being told not to enough?
+        ask = ("The work is done. Do not call any tool. Reply with ONLY a JSON object matching "
+               "this schema, as your final message. No prose, no code fence.")
+    elif already_verified == "results":
+        # The reason removed, with no prohibition at all: hand it the ground truth it was going
+        # to go and fetch. If this alone works, the fix is to supply verification results in the
+        # report request rather than to forbid anything.
+        ask = ("The work is done and every verification command has already been run for you; "
+               "their results are below. Reply with ONLY a JSON object matching this schema, as "
+               "your final message. No prose, no code fence.\n\n"
+               "Commands already run: `php -l src/Temperature.php` exited 0.")
+    elif already_verified:
+        ask = ("The work is done AND every verification command has already been run for you; "
+               "their results are below. Do not call any tool. Reply with ONLY a JSON object "
+               "matching this schema, as your final message. No prose, no code fence.\n\n"
+               "Commands already run: `php -l src/Temperature.php` exited 0.")
+    return MESSAGES[:-1] + [{"role": "user", "content": ask + "\n\n" + json.dumps(schema, indent=2)}]
+
+
+def schema_without_tests(schema: dict) -> dict:
+    trimmed = json.loads(json.dumps(schema))
+    trimmed["properties"].pop("tests_run", None)
+    trimmed["required"] = [k for k in trimmed["required"] if k != "tests_run"]
+    return trimmed
+
+
+MESSAGES = [
+    {"role": "system", "content": "You are a coding agent finishing a task."},
+    {"role": "user", "content": "Add a fahrenheit() accessor to src/Temperature.php."},
+    {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{
+            "id": "call_1", "type": "function",
+            "function": {"name": "apply_patch", "arguments": json.dumps({
+                "input": "*** Begin Patch\n*** Update File: src/Temperature.php\n@@\n+    public "
+                         "function fahrenheit(): float { return $this->celsius * 9 / 5 + 32; }\n"
+                         "*** End Patch"})},
+        }],
+    },
+    {"role": "tool", "tool_call_id": "call_1", "name": "apply_patch", "content": "Patch applied."},
+    # Depth padding goes here at index 4; see deepen().
+    {
+        "role": "user",
+        "content": "The work is done. Reply with ONLY a JSON object matching this schema, as your "
+                   "final message. No prose, no code fence.\n\n" + json.dumps(SCHEMA, indent=2),
+    },
+]
+
+
+def deepen(depth_tokens: int) -> list[dict]:
+    """MESSAGES padded with a large tool result, to reach roughly `depth_tokens` of context.
+
+    Depth is not decoration. The parse fault is absent below 16k (0 in 119 completions measured),
+    appears at 0.70% in 16-32k and 2.63% in 32-48k. A probe at 2k reproduces nothing and would
+    certify a template change that fixed nothing.
+    """
+    if depth_tokens <= 0:
+        return MESSAGES
+    # ~3.5 chars per token for this kind of source listing, measured against the server's own
+    # prompt-token count rather than assumed.
+    filler = "".join(
+        f"{n:5d}    public function generated{n}(int $value): int {{ return $value * {n} + 1; }}\n"
+        for n in range(depth_tokens // 12)
+    )
+    padded = list(MESSAGES)
+    padded.insert(4, {"role": "assistant", "content": "", "tool_calls": [{
+        "id": "call_pad", "type": "function",
+        "function": {"name": "read_files",
+                     "arguments": json.dumps({"files": [{"path": "src/Legacy.php"}]})}}]})
+    padded.insert(5, {"role": "tool", "tool_call_id": "call_pad", "name": "read_files",
+                      "content": filler})
+    return padded
+
+
+def sample(host: str, port: int, model: str, timeout: int,
+           temperature: float, seed: int, depth: int = 0,
+           tool_choice: str | None = None, schema: dict = SCHEMA,
+           already_verified: bool = False) -> tuple[str, str]:
+    """Return (classification, detail) for one turn.
+
+    Temperature and seed are per-request rather than inherited from the server, because a probe
+    that estimates a *rate* needs the samples to differ. At temperature 0 every turn here is
+    byte-identical — twenty samples of one outcome, reported as 0% or 100% with equal confidence
+    and no way to tell which it is. The default is 0.8 because that is what the harness serves at.
+    """
+    # Tools are declared even though the turn under test is a final message and not a tool call.
+    #
+    # Without them the fault does not reproduce at all — 20 of 20 clean. That is the finding, not
+    # an implementation detail: `<|constrain|>` belongs to the tool-call dialect, so a model with
+    # no functions in scope has no reason to reach for it. The harness always runs with these
+    # registered, so a probe without them is not probing the same stack.
+    messages = build_messages(schema, already_verified)
+    if depth > 0:
+        messages = deepen(depth)[:-1] + messages[-1:]
+    payload = {"model": model, "messages": messages, "tools": TOOLS, "stream": False,
+               "temperature": temperature, "seed": seed}
+    if tool_choice:
+        payload["tool_choice"] = tool_choice
+    request = urllib.request.Request(
+        f"http://{host}:{port}/v1/chat/completions",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = json.loads(response.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as error:
+        return "http-error", f"HTTP {error.code}: {error.read().decode('utf-8', 'replace')[:160]}"
+    except Exception as error:  # noqa: BLE001 — a transport failure is a result here
+        return "http-error", f"{type(error).__name__}: {error}"
+
+    choices = body.get("choices") or []
+    if not choices:
+        return "empty", "no choices in the response"
+    message = choices[0].get("message") or {}
+    content = (message.get("content") or "").strip()
+
+    if not content:
+        usage = body.get("usage") or {}
+        generated = usage.get("completion_tokens", "?")
+        # Empty content with a tool call is the model choosing to call a function instead of
+        # answering. That is a decision, not a discarded message, and conflating the two inflates
+        # the fault rate enormously — the first version of this probe reported 50% on exactly this
+        # mistake, and `tools/peg-audit` disproved it by showing the server had logged no parse
+        # failures at all for those turns.
+        if message.get("tool_calls"):
+            names = ",".join((c.get("function") or {}).get("name", "?")
+                             for c in message["tool_calls"])
+            return "tool-call", f"called {names} instead of reporting ({generated} tokens)"
+        # The fault. The model generated; the parser discarded; the client sees nothing.
+        return "empty", f"no content and no tool call, {generated} tokens generated"
+
+    try:
+        parsed = json.loads(content)
+    except ValueError:
+        # Content arrived but is not the object asked for. A different problem from the one under
+        # test, and reported separately so the two are never added together.
+        return "not-json", content[:120].replace("\n", " ")
+
+    missing = [k for k in schema["required"] if k not in parsed]
+    if missing:
+        return "incomplete", "missing " + ", ".join(missing)
+    return "ok", ""
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--repeat", type=int, default=20)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8071)
+    parser.add_argument("--model", default="gpt-oss-20b")
+    parser.add_argument("--timeout", type=int, default=180)
+    parser.add_argument("--temp", type=float, default=0.8,
+                        help="per-request temperature; 0 makes every sample identical")
+    parser.add_argument("--depth", type=int, default=0,
+                        help="pad the conversation to roughly this many tokens (the fault needs 16k+)")
+    parser.add_argument("--tool-choice", default=None,
+                        help="pass through to the API, e.g. none — does the model still divert?")
+    parser.add_argument("--no-tests-field", action="store_true",
+                        help="drop tests_run from the schema — does the model stop diverting?")
+    parser.add_argument("--already-verified", nargs="?", const=True, default=False,
+                        help="both (default) | forbid = prohibition only | results = reason only")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+
+    schema = schema_without_tests(SCHEMA) if args.no_tests_field else SCHEMA
+    counts: dict[str, int] = {}
+    details: list[str] = []
+    for index in range(args.repeat):
+        kind, detail = sample(args.host, args.port, args.model, args.timeout,
+                              args.temp, 1000 + index, args.depth, args.tool_choice,
+                              schema, args.already_verified)
+        counts[kind] = counts.get(kind, 0) + 1
+        if detail and len(details) < 5:
+            details.append(f"{kind}: {detail}")
+
+    empty = counts.get("empty", 0)
+    rate = empty / args.repeat
+
+    if args.json:
+        json.dump({"repeat": args.repeat, "counts": counts, "empty_rate": rate}, sys.stdout, indent=2)
+        print()
+        return 0
+
+    variant = []
+    if args.no_tests_field: variant.append("no tests_run field")
+    if args.already_verified:
+        variant.append({"forbid": "prohibition only", "results": "reason only"}
+                       .get(args.already_verified, "prohibition + reason"))
+    if args.tool_choice: variant.append(f"tool_choice={args.tool_choice}")
+    if args.depth: variant.append(f"depth~{args.depth}")
+    print(f"report-probe: {args.repeat} turns at temp {args.temp}"
+          + (" [" + ", ".join(variant) + "]" if variant else " [baseline]"))
+    print()
+    for kind in ("ok", "empty", "tool-call", "not-json", "incomplete", "http-error"):
+        if kind in counts:
+            print(f"  {kind:<12}{counts[kind]:>4}   {100 * counts[kind] / args.repeat:5.1f}%")
+    if details:
+        print()
+        for line in details:
+            print(f"  {line}")
+
+    print()
+    print(f"DISCARDED: {empty}/{args.repeat} ({100 * rate:.0f}%) of reports came back empty.")
+    print("Confirm the mechanism rather than assuming it — the discarded text is in the server log:")
+    print("  tools/peg-audit")
+    # Non-zero when the fault reproduces, so a queue can branch on it.
+    return 1 if empty else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
