@@ -94,7 +94,40 @@ TOOLS = [
 #
 # If that is right, the harness's own report schema is causing the missing reports it complains
 # about, and the fix is a schema or an API flag rather than a stronger instruction.
-def build_messages(schema: dict, already_verified, report_tool: bool = False) -> list[dict]:
+# The conversation a model is in when a REAL round asks it to report.
+#
+# The base fixture stops after applying a patch, then asks the model to attest to `tests_run` and
+# `files_changed`. Diverting to read_files is the correct answer to that: it is being asked to
+# certify work it has not checked. Real rounds reach the report turn having already read the files
+# back and run the verification commands, which is why both models measured here report cleanly at
+# real depth and badly on the fixture — gpt-oss 44% against 8/8, Muse Glimmer 12.5% against 3/3.
+#
+# These turns close that gap without inflating the token count, so the fixture keeps its ~1s
+# sample while representing the state the question is actually asked in.
+WORK_COMPLETED = [
+    {"role": "assistant", "content": "", "tool_calls": [{
+        "id": "call_2", "type": "function",
+        "function": {"name": "read_files",
+                     "arguments": json.dumps({"files": [{"path": "src/Temperature.php"}]})}}]},
+    {"role": "tool", "tool_call_id": "call_2", "name": "read_files",
+     "content": ("  1 | <?php\n  2 | final class Temperature\n  3 | {\n"
+                 "  4 |     public function __construct(private float $celsius) {}\n"
+                 "  5 |     public function fahrenheit(): float\n"
+                 "  6 |     { return $this->celsius * 9 / 5 + 32; }\n  7 | }\n")},
+    {"role": "assistant", "content": "", "tool_calls": [{
+        "id": "call_3", "type": "function",
+        "function": {"name": "run_commands", "arguments": json.dumps({"commands": [
+            "php -l src/Temperature.php",
+            "php -r 'require \"src/Temperature.php\"; exit(abs((new Temperature(100.0))->fahrenheit()-212.0)<0.001?0:1);'"]})}}]},
+    {"role": "tool", "tool_call_id": "call_3", "name": "run_commands",
+     "content": ("No syntax errors detected in src/Temperature.php\n"
+                 "(exit 0)\n\n(exit 0)")},
+]
+
+
+def build_messages(schema: dict, already_verified, report_tool: bool = False,
+                   work_completed: bool = False) -> list[dict]:
+    base_messages = (MESSAGES[:-1] + WORK_COMPLETED) if work_completed else MESSAGES[:-1]
     if report_tool:
         # Asking for a final message while offering a report tool is a contradictory prompt, and
         # measuring it would measure the contradiction. When the tool exists, the tool is the ask.
@@ -103,7 +136,7 @@ def build_messages(schema: dict, already_verified, report_tool: bool = False) ->
         if already_verified:
             base += ("\n\nEvery verification command has already been run for you: "
                      "`php -l src/Temperature.php` exited 0.")
-        return MESSAGES[:-1] + [{"role": "user", "content": base}]
+        return base_messages + [{"role": "user", "content": base}]
     ask = ("The work is done. Reply with ONLY a JSON object matching this schema, as your "
            "final message. No prose, no code fence.")
     if already_verified == "forbid":
@@ -123,7 +156,7 @@ def build_messages(schema: dict, already_verified, report_tool: bool = False) ->
                "their results are below. Do not call any tool. Reply with ONLY a JSON object "
                "matching this schema, as your final message. No prose, no code fence.\n\n"
                "Commands already run: `php -l src/Temperature.php` exited 0.")
-    return MESSAGES[:-1] + [{"role": "user", "content": ask + "\n\n" + json.dumps(schema, indent=2)}]
+    return base_messages + [{"role": "user", "content": ask + "\n\n" + json.dumps(schema, indent=2)}]
 
 
 def schema_without_tests(schema: dict) -> dict:
@@ -198,7 +231,8 @@ def deepen(depth_tokens: int) -> list[dict]:
 def sample(host: str, port: int, model: str, timeout: int,
            temperature: float, seed: int, depth: int = 0,
            tool_choice: str | None = None, schema: dict = SCHEMA,
-           already_verified=False, report_tool: bool = False) -> tuple[str, str]:
+           already_verified=False, report_tool: bool = False,
+           work_completed: bool = False) -> tuple[str, str]:
     """Return (classification, detail) for one turn.
 
     Temperature and seed are per-request rather than inherited from the server, because a probe
@@ -212,10 +246,11 @@ def sample(host: str, port: int, model: str, timeout: int,
     # an implementation detail: `<|constrain|>` belongs to the tool-call dialect, so a model with
     # no functions in scope has no reason to reach for it. The harness always runs with these
     # registered, so a probe without them is not probing the same stack.
-    messages = build_messages(schema, already_verified, report_tool)
+    messages = build_messages(schema, already_verified, report_tool, work_completed)
     if depth > 0:
         messages = deepen(depth)[:-1] + messages[-1:]
     tools = list(TOOLS)
+    base_messages = (MESSAGES[:-1] + WORK_COMPLETED) if work_completed else MESSAGES[:-1]
     if report_tool:
         tools.append(REPORT_TOOL)
     payload = {"model": model, "messages": messages, "tools": tools, "stream": False,
@@ -309,6 +344,9 @@ def main() -> int:
                         help="drop tests_run from the schema — does the model stop diverting?")
     parser.add_argument("--already-verified", nargs="?", const=True, default=False,
                         help="both (default) | forbid = prohibition only | results = reason only")
+    parser.add_argument("--work-completed", action="store_true",
+                        help="reach the report turn having read the file back and run the tests, "
+                             "as a real round does")
     parser.add_argument("--report-tool", action="store_true",
                         help="offer submit_report as a function — stop fighting the preference")
     parser.add_argument("--concurrency", type=int, default=1,
@@ -363,6 +401,7 @@ def main() -> int:
     if args.already_verified:
         variant.append({"forbid": "prohibition only", "results": "reason only"}
                        .get(args.already_verified, "prohibition + reason"))
+    if args.work_completed: variant.append("work completed and verified")
     if args.report_tool: variant.append("report as a tool call")
     if args.tool_choice: variant.append(f"tool_choice={args.tool_choice}")
     if args.depth: variant.append(f"depth~{args.depth}")

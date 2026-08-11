@@ -222,11 +222,37 @@ def main() -> int:
         if inner.get("type") == "usage" and inner.get("inputTokens"):
             original = inner["inputTokens"]
 
+    # Headroom against the SERVER'S window, not just fidelity to the original.
+    #
+    # A replay can be perfectly faithful and still untestable: a 16,145-token conversation sent to
+    # a server started at 16,384 leaves 239 tokens to generate in, and every sample comes back
+    # empty. That happened, and the empties read as a total model failure until the window was
+    # checked. Fidelity to the original says nothing about whether there is room to answer.
+    served_ctx = 0
+    try:
+        with urllib.request.urlopen(f"http://{args.host}:{args.port}/props", timeout=10) as r:
+            served_ctx = json.loads(r.read())["default_generation_settings"]["n_ctx"]
+    except Exception:  # noqa: BLE001 — absence is reported, not fatal
+        pass
+
     print(f"replay {args.result_dir}  variant={args.variant}")
     print(f"  rebuilt {provenance['tool_calls_rebuilt']} tool calls, "
           f"{provenance['patch_bodies_rebuilt']} patch bodies from tree.diff, "
           f"{provenance['reasoning_blocks']} reasoning blocks")
     print(f"  opening prompt: {provenance['opening_prompt']}")
+
+    if served_ctx:
+        # Rough, and deliberately generous: 4 chars per token on the rebuilt messages.
+        estimate = sum(len(json.dumps(m)) for m in messages) // 4
+        headroom = served_ctx - estimate
+        if headroom < 2048:
+            print()
+            print(f"REFUSING: the conversation is ~{estimate:,} tokens and the server's window is "
+                  f"{served_ctx:,}, leaving ~{headroom:,} to generate in.")
+            print("Every sample would come back empty, and it would look like a model failure.")
+            print(f"Restart with a larger context: tools/llamacpp-serve start <model> "
+                  f"{max(32768, (estimate + 8192) // 8192 * 8192)}")
+            return 2
 
     counts: dict[str, int] = {}
     depth_seen = 0
