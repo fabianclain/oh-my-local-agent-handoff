@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import re
 import subprocess
@@ -55,6 +56,9 @@ import urllib.request
 
 TOOL_TIMEOUT = 120
 OUTPUT_CAP = 20000
+# Held back from the loop so a round that runs long still ends with a report rather than an
+# overflow. A usable tree with an account beats a full window every time.
+RESERVE_FOR_REPORT = 4096
 
 
 def emit(log, kind: str, event: dict) -> None:
@@ -105,6 +109,62 @@ def tool_schemas(include_report: bool, schema: dict) -> list[dict]:
     return tools
 
 
+class ToolFault(Exception):
+    """The harness failed, not the model.
+
+    The distinction is the entire point of this layer. Without it every tool-layer defect arrives
+    as a rejected round with a damaged tree, indistinguishable from the model writing nonsense —
+    which is how six separate instrument faults were attributed to the model in a single day
+    before anyone checked. A fault raised here is logged with its own class and says whose it is.
+    """
+
+    def __init__(self, kind: str, detail: str) -> None:
+        super().__init__(detail)
+        self.kind = kind
+        self.detail = detail
+
+
+def read_text_strict(path: pathlib.Path) -> str:
+    """Decode strictly, and refuse what cannot be decoded.
+
+    `errors="replace"` is the tempting default and it is lossy in silence: the file comes back with
+    U+FFFD where the bytes were, the model edits that version, writes it back, and the corruption
+    is now real and attributed to the model. Nothing in the tree, the gates or the log would say
+    otherwise.
+    """
+    raw = path.read_bytes()
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ToolFault("encoding",
+                        f"{path.name} is not valid UTF-8 ({error.reason} at byte {error.start}); "
+                        "refusing to read it rather than silently replacing characters") from error
+
+
+def atomic_write(path: pathlib.Path, content: str) -> None:
+    """Write via a temporary file and rename, then confirm what landed.
+
+    Two classes closed at once. A process killed mid-write leaves a truncated file that looks
+    exactly like a model truncating its own output — the rename makes the write all-or-nothing, so
+    that cannot happen. And re-reading afterwards turns "the disk did something else" from an
+    invisible corruption into a named fault.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".native-tmp")
+    try:
+        tmp.write_text(content, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as error:
+        tmp.unlink(missing_ok=True)
+        raise ToolFault("io", f"could not write {path.name}: {error}") from error
+
+    landed = path.read_text(encoding="utf-8", errors="replace")
+    if landed != content:
+        raise ToolFault("postcondition",
+                        f"{path.name} does not contain what was written "
+                        f"({len(content)} bytes requested, {len(landed)} on disk)")
+
+
 def clamp(text: str) -> str:
     if len(text) <= OUTPUT_CAP:
         return text
@@ -123,7 +183,7 @@ def run_tool(repo: pathlib.Path, name: str, args: dict) -> str:
                 # Deliberately NOT line-numbered. The rented loop returns numbered lines, and a
                 # model wrote the gutter back into a file — `  1 | # Add a discount` — corrupting
                 # it. Content in, content out.
-                out.append(f"--- {item.get('path')} ---\n{path.read_text(errors='replace')}")
+                out.append(f"--- {item.get('path')} ---\n{read_text_strict(path)}")
             return clamp("\n\n".join(out) or "(no files requested)")
 
         if name == "search":
@@ -135,16 +195,15 @@ def run_tool(repo: pathlib.Path, name: str, args: dict) -> str:
 
         if name == "write_file":
             path = repo / str(args["path"]).lstrip("/")
-            path.parent.mkdir(parents=True, exist_ok=True)
             content = args.get("content") or ""
-            path.write_text(content)
+            atomic_write(path, content)
             return f"wrote {args['path']} ({len(content)} bytes, {content.count(chr(10)) + 1} lines)"
 
         if name == "replace_in_file":
             path = repo / str(args["path"]).lstrip("/")
             if not path.exists():
                 return f"error: {args['path']} does not exist"
-            body = path.read_text(errors="replace")
+            body = read_text_strict(path)
             old = args.get("old") or ""
             hits = body.count(old)
             # Refusing an ambiguous match is the whole value of this tool over a patch grammar:
@@ -153,7 +212,7 @@ def run_tool(repo: pathlib.Path, name: str, args: dict) -> str:
                 return f"error: `old` not found in {args['path']}; the file is unchanged"
             if hits > 1:
                 return f"error: `old` appears {hits} times in {args['path']}; make it unique"
-            path.write_text(body.replace(old, args.get("new") or "", 1))
+            atomic_write(path, body.replace(old, args.get("new") or "", 1))
             return f"replaced 1 occurrence in {args['path']}"
 
         if name == "run_commands":
@@ -165,15 +224,65 @@ def run_tool(repo: pathlib.Path, name: str, args: dict) -> str:
                 out.append(f"$ {command}\n{body}(exit {proc.returncode})")
             return clamp("\n\n".join(out) or "(no commands)")
 
+    except ToolFault:
+        raise
     except subprocess.TimeoutExpired:
         return f"error: {name} timed out after {TOOL_TIMEOUT}s"
     except Exception as error:  # noqa: BLE001 — a tool fault is a result the model must see
-        return f"error: {name} failed: {type(error).__name__}: {error}"
+        raise ToolFault("io", f"{name} failed: {type(error).__name__}: {error}") from error
     return f"error: unknown tool {name}"
 
 
 # ------------------------------------------------------------------------------------------------
 # the loop
+
+
+def dispatch(repo: pathlib.Path, name: str, parsed: dict, call_id: str, log) -> str:
+    """Every tool call goes through here, so every tool call is logged the same way.
+
+    Returns what the model is told. Emits two things when the harness is at fault: the usual
+    content_end so the trajectory stays readable, tagged with the fault class, AND a separate
+    `error` event whose message tools/journal already knows how to classify. Without the second
+    one a harness fault is invisible to every aggregate view and shows up only as a worse round.
+    """
+    started = time.monotonic()
+    fault = None
+    try:
+        result = run_tool(repo, name, parsed)
+    except ToolFault as bad:
+        fault = bad
+        result = f"error: {bad.detail}"
+
+    event = {
+        "type": "content_end", "contentType": "tool", "toolName": name,
+        "toolCallId": call_id,
+        "output": {"query": json.dumps(parsed)[:400], "result": result,
+                   "success": fault is None and not result.startswith("error:")},
+        "durationMs": int((time.monotonic() - started) * 1000),
+    }
+    if fault is not None:
+        event["fault"] = fault.kind
+    emit(log, "agent_event", event)
+
+    if fault is not None:
+        # Worded so classify_error in tools/journal maps it to its own bucket rather than keeping
+        # it verbatim. "tool-<kind> fault" is the phrase that file matches on.
+        emit(log, "agent_event", {"type": "error", "error": {
+            "message": f"tool-{fault.kind} fault in {name}: {fault.detail}"}})
+    return result
+
+
+def estimate_tokens(messages: list[dict], tools: list[dict]) -> int:
+    """Rough, and deliberately so — 4 characters per token, counted generously."""
+    return (sum(len(json.dumps(m)) for m in messages) + len(json.dumps(tools))) // 4
+
+
+def served_context(host: str, port: int) -> int:
+    try:
+        with urllib.request.urlopen(f"http://{host}:{port}/props", timeout=10) as response:
+            return int(json.loads(response.read())["default_generation_settings"]["n_ctx"])
+    except Exception:  # noqa: BLE001 — not knowing is survivable; guessing is not
+        return 0
 
 
 def call_model(host: str, port: int, model: str, messages: list[dict], tools: list[dict],
@@ -214,8 +323,24 @@ def main() -> int:
     finish = "completed"
 
     with args.log.open("a") as log:
+        window = served_context(args.host, args.port)
         for turn in range(1, args.max_turns + 1):
             emit(log, "agent_event", {"type": "iteration_start", "iteration": turn})
+
+            # Stop before overflowing rather than discovering it in a server error.
+            #
+            # This was claimed in the module docstring and not implemented, which is its own small
+            # lesson. Leaving room for the report turn matters more than leaving room for one more
+            # tool call: a round that stops with a report is usable, and one that dies of overflow
+            # is not.
+            if window:
+                need = estimate_tokens(messages, tool_schemas(True, schema))
+                if need > window - RESERVE_FOR_REPORT:
+                    emit(log, "agent_event", {"type": "error", "error": {"message": (
+                        f"context-budget: conversation is ~{need} tokens against a {window} window; "
+                        f"stopping with {RESERVE_FOR_REPORT} reserved for the report")}})
+                    finish = "context-budget"
+                    break
             try:
                 body = call_model(args.host, args.port, args.model, messages,
                                   tool_schemas(True, schema), args.temp, args.timeout)
@@ -282,14 +407,7 @@ def main() -> int:
                     done = True
                     break
 
-                started = time.monotonic()
-                result = run_tool(args.repo, name, parsed)
-                emit(log, "agent_event", {
-                    "type": "content_end", "contentType": "tool", "toolName": name,
-                    "toolCallId": call.get("id"),
-                    "output": {"query": json.dumps(parsed)[:400], "result": result,
-                               "success": not result.startswith("error:")},
-                    "durationMs": int((time.monotonic() - started) * 1000)})
+                result = dispatch(args.repo, name, parsed, call.get("id"), log)
                 messages.append({"role": "tool", "tool_call_id": call.get("id"),
                                  "name": name, "content": result})
             if done:

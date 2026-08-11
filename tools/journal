@@ -142,6 +142,17 @@ def mine_events(log: Path) -> dict:
 # classes seen in real runs; anything else is kept verbatim, truncated, so a new failure mode
 # shows up as itself rather than being folded into "other".
 ERROR_CLASSES = [
+    # Harness faults first, and named so nobody has to wonder. These come from the native loop's
+    # tool layer, which knows when it was itself at fault — a truncated write, a file that is not
+    # UTF-8, a postcondition that did not hold. Every one of them would otherwise arrive as a
+    # rejected round with a damaged tree and be read as the model writing nonsense.
+    #
+    # Ordered above the generic patterns deliberately: "tool-io fault: ... timed out" must classify
+    # as ours rather than matching the timeout rule below.
+    (r"tool-encoding fault", "harness-encoding"),
+    (r"tool-postcondition fault", "harness-postcondition"),
+    (r"tool-io fault", "harness-io"),
+    (r"context-budget:", "context-budget"),
     (r"does not match the expected .*format", "tool-call-format"),
     (r"maximum output token limit", "output-token-limit"),
     (r"exceeds the available context size", "context-overflow"),

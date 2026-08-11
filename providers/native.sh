@@ -22,6 +22,17 @@ export HANDOFF_MODEL
 
 _native_home() { cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd; }
 
+# Sourced for its token accounting and nothing else; everything it defines about driving a client
+# is overridden below.
+#
+# provider_usage_mark and provider_usage_since read llama-server's own log by byte offset, and
+# native talks to that same server, so the numbers are already correct here. Reimplementing them
+# against native's event log would be a second parser of the same facts — the defect shape that
+# put check-plan and bench/run out of step, and bench/run out of step with verify-round earlier
+# today. Without them bench/run records model_requests=0, which is what the first native runs did.
+# shellcheck disable=SC1090
+source "$(dirname "${BASH_SOURCE[0]}")/lcpp.sh"
+
 provider_name() { echo "native"; }
 
 provider_manifest() {
