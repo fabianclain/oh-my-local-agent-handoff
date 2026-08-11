@@ -114,8 +114,27 @@ else
 fi
 
 if command -v cline >/dev/null 2>&1; then
-    ok "cline $(cline --version 2>/dev/null | head -1)"
-else
+    # RUN it, and check that running worked. `ok "cline $(cline --version 2>/dev/null)"` was here:
+    # the exit status went to the command substitution and was discarded, stderr was thrown away,
+    # and a binary that could not start printed "ok cline " and passed.
+    #
+    # cline 3.0.53 segfaults on every invocation, `--version` included, exit 139. doctor passed it
+    # at the head of a ten-hour queue; the control arm then failed three rounds in five seconds
+    # each and would have produced nothing all night. Being on PATH is not the property that
+    # matters — being able to run is.
+    CLINE_VERSION="$(cline --version 2>&1 | head -1)"
+    CLINE_RC=$?
+    if (( CLINE_RC != 0 )); then
+        bad "cline exits $CLINE_RC when asked its version — it cannot run"
+        [[ "$CLINE_RC" -eq 139 ]] && hint "139 is SIGSEGV. cline 3.0.53 does this; 3.0.52 does not."
+        hint "Pin a working release:  npm i -g cline@3.0.52"
+    elif [[ -z "$CLINE_VERSION" ]]; then
+        bad "cline --version printed nothing — treating that as unusable rather than fine"
+    else
+        ok "cline $CLINE_VERSION"
+    fi
+fi
+if ! command -v cline >/dev/null 2>&1; then
     bad "cline is not on PATH — npm i -g cline"
 fi
 
