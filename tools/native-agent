@@ -250,7 +250,12 @@ def atomic_write(path: pathlib.Path, content: str) -> None:
 # nothing and returns non-zero on a broken file. Anything absent from the machine is skipped.
 SYNTAX_CHECKS = {
     ".php": ["php", "-l"],
-    ".py": ["python3", "-m", "py_compile"],
+    # NOT `python3 -m py_compile`, which writes __pycache__/<name>.pyc next to the file it checks.
+    # That would have the gate create the litter it exists to prevent: an unnamed file appearing in
+    # the tree, charged to the model, on a plan that never mentioned Python. Verified by running it.
+    # `compile()` parses and returns without touching the disk.
+    ".py": ["python3", "-c",
+            "import sys; compile(open(sys.argv[1]).read(), sys.argv[1], 'exec')"],
     ".sh": ["bash", "-n"],
     ".bash": ["bash", "-n"],
 }

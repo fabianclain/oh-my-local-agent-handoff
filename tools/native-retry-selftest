@@ -262,6 +262,8 @@ def check_syntax_note() -> tuple[int, int]:
         ("a valid .php file draws no warning", "ok.php", good_php, False),
         ("diff-prefixed content is caught", "broken.php", broken_php, True),
         ("a truncated .php file is caught", "cut.php", "<?php\nfinal class A {\n", True),
+        ("a valid .py file draws no warning", "ok.py", "x = 1\n", False),
+        ("a broken .py file is caught", "bad.py", "def f(:\n", True),
         ("a valid .sh file draws no warning", "ok.sh", "#!/bin/bash\necho hi\n", False),
         ("a broken .sh file is caught", "bad.sh", "#!/bin/bash\nif true; then\n", True),
         # No checker for this extension, so silence is correct: the tool must not invent a verdict
@@ -276,9 +278,24 @@ def check_syntax_note() -> tuple[int, int]:
             if command and not _shutil.which(command[0]):
                 print(f"skip  syntax: {name} ({command[0]} not installed)")
                 continue
-            path = pathlib.Path(tmp) / filename
+            # Each case in its own directory, so the litter assertion below is about this check
+            # and nothing else.
+            room = pathlib.Path(tmp) / filename.replace(".", "_")
+            room.mkdir()
+            path = room / filename
             path.write_text(content)
             note = native.syntax_note(path)
+
+            # THE CHECK THAT MATTERS MOST HERE. A gate that creates files in the tree it is
+            # guarding hands the model a litter violation it did not earn. `python3 -m py_compile`
+            # does exactly that -- __pycache__/<name>.pyc, next to the file -- which is why the
+            # Python entry does not use it.
+            left = sorted(p.name for p in room.iterdir() if p.name != filename)
+            if left:
+                print(f"FAIL  syntax: {name} — the check wrote {left} into the tree")
+                failures += 1
+                continue
+
             if bool(note) != expect_warning:
                 print(f"FAIL  syntax: {name}")
                 print(f"        warning={bool(note)}, expected {expect_warning}: {note[:120]!r}")
