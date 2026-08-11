@@ -958,6 +958,25 @@ else
 fi
 rm -rf "$REPO/bench/results/surgical/nosuchprovider"
 
+# --- --force deleted a baseline nobody could get back --------------------------------------------
+# docs/BENCHMARK-QUEUE.md warned about this in prose: "--force deletes the provider directory it is
+# about to write. Archive any arm that is a control for published results before re-running its
+# label, or the baseline is gone with no way back." The warning was read, believed, and still not
+# acted on, because acting on it meant remembering at the right moment. A queue's own wave-1
+# --force then deleted a 20-run wide/lcgptossl control that four findings had been computed
+# against, and bench/results is not tracked by git.
+rm -rf "$REPO/bench/results/surgical/archiveprobe" "$REPO/bench/archive/surgical-archiveprobe-"*
+mkdir -p "$REPO/bench/results/surgical/archiveprobe/1"
+echo "outcome=keepme" >"$REPO/bench/results/surgical/archiveprobe/1/metrics"
+( cd "$REPO" && BENCH_LOCK_HELD=1 ./bench/run --plan surgical \
+    --providers archiveprobe --repeat 1 --force >/dev/null 2>&1 ) || true
+if grep -rqs '^outcome=keepme' "$REPO/bench/archive/" 2>/dev/null; then
+    pass "--force archives the results it replaces instead of deleting them"
+else
+    fail "--force destroyed existing results — the baseline is unrecoverable"
+fi
+rm -rf "$REPO/bench/results/surgical/archiveprobe" "$REPO/bench/archive/surgical-archiveprobe-"*
+
 # --- the prompt was never recorded ---------------------------------------------------------------
 # An arm whose whole variable is a prompt layer can be a silent no-op, and every artifact looks
 # identical to a working arm. This was found by being unable to answer that question at all.

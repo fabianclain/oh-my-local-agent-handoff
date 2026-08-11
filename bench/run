@@ -224,7 +224,25 @@ for _provider in "${PROVIDER_LIST[@]}"; do
         echo "or --append to add repetitions to them" >&2
         exit 1
     }
-    rm -rf -- "$_dir"
+    # Move it aside rather than delete it. docs/BENCHMARK-QUEUE.md has warned in prose for weeks —
+    # "archive any arm that is a control for published results before re-running its label, or the
+    # baseline is gone with no way back" — and on 2026-08-11 a queue's own wave-1 --force deleted a
+    # 20-run wide/lcgptossl control that four separate findings had been computed against. The
+    # warning was read, believed, and still not acted on, because acting on it required remembering
+    # at the right moment. bench/results is not tracked by git, so there was nothing to recover.
+    #
+    # An archive costs a few megabytes per arm and one rename. That is the whole trade.
+    _stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    _archive="$BENCH_HOME/archive/${PLAN}-${_provider}-${_stamp}"
+    mkdir -p "$(dirname "$_archive")"
+    if mv -- "$_dir" "$_archive" 2>/dev/null; then
+        echo "archived $(ls "$_archive" 2>/dev/null | wc -l) existing run(s) to ${_archive#"$BENCH_HOME"/}"
+    else
+        # Refuse rather than fall back to deleting. A --force that cannot preserve what it is
+        # replacing is exactly the case worth stopping on.
+        echo "could not archive existing results at $_dir; refusing to delete them" >&2
+        exit 1
+    fi
 done
 
 mkdir -p "$RESULTS_DIR" "$WORK_DIR"
