@@ -324,6 +324,29 @@ def run_tool(repo: pathlib.Path, name: str, args: dict) -> str:
 # the loop
 
 
+def analysable_args(name: str, parsed: dict) -> dict:
+    """The fields an analysis tool needs, without the file contents that force truncation.
+
+    Deliberately narrow. `write_file` carries a whole file in `content` and `replace_in_file`
+    carries two fragments of one; none of that tells you anything about how a round spent its
+    turns, and including it is what made the logged argument unreadable.
+    """
+    args: dict = {}
+    path = parsed.get("path")
+    if isinstance(path, str):
+        args["path"] = path
+    files = parsed.get("files")
+    if isinstance(files, list):
+        args["paths"] = [f.get("path") for f in files
+                         if isinstance(f, dict) and isinstance(f.get("path"), str)]
+    if name in ("search", "search_codebase") and isinstance(parsed.get("query"), str):
+        args["query"] = parsed["query"]
+    commands = parsed.get("commands")
+    if isinstance(commands, list):
+        args["commands"] = [str(c) for c in commands]
+    return args
+
+
 def dispatch(repo: pathlib.Path, name: str, parsed: dict, call_id: str, log) -> str:
     """Every tool call goes through here, so every tool call is logged the same way.
 
@@ -346,6 +369,13 @@ def dispatch(repo: pathlib.Path, name: str, parsed: dict, call_id: str, log) -> 
         "output": {"query": json.dumps(parsed)[:400], "result": result,
                    "success": fault is None and not result.startswith("error:")},
         "durationMs": int((time.monotonic() - started) * 1000),
+        # `query` is capped at 400 characters so the log stays readable, and that cap silently
+        # destroyed a measurement: 15 of 28 run_commands arguments were truncated, so
+        # tools/turn-economy reported "0 repeated commands" over a denominator of 13. Absence of
+        # data, printed as a finding. This field carries the parts worth analysing -- paths,
+        # commands, the search question -- and never file contents, which is what made `query`
+        # long in the first place.
+        "args": analysable_args(name, parsed),
     }
     if fault is not None:
         event["fault"] = fault.kind

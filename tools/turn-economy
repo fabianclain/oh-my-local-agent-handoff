@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+"""turn-economy — where a round's turns actually go.
+
+    tools/turn-economy bench/results/wide/native [...]     one line per run, then a total
+    tools/turn-economy --json bench/results/wide/*/        machine-readable
+    tools/turn-economy --detail bench/results/wide/native/3
+
+A native round on `wide` spends 20 to 58 turns and a Cline round 17 to 173, and until now the only
+thing known about that span was its length. Turns are the budget that runs out: the loop stops at
+--max-turns, and a round that hits the limit ends with no report even though the tree is finished.
+One of the first three native rounds on `wide` did exactly that -- 40 turns, 11 of 11 criteria met,
+no report, because there was no turn left to write one in.
+
+So this splits the span three ways, by the tree rather than by the model's account of itself:
+
+    prologue   calls before the first edit that changed a file -- orientation
+    work       first successful edit to last successful edit
+    epilogue   everything after the last successful edit -- checking, and reporting
+
+and counts the two kinds of turn that buy nothing:
+
+    re-read    a file read again with no successful edit to it in between. Reading a file after
+               changing it is diligence; reading it twice unchanged is a turn spent re-learning
+               what is already in the conversation.
+    re-run     a command run again, byte for byte, with no successful edit in between.
+
+Neither is inferred from what the model said. Every number here comes from the tool calls the
+harness dispatched and the success flag it recorded at the time.
+
+A CAVEAT THAT IS PART OF THE OUTPUT, not a footnote: tools/native-agent truncates each logged
+tool argument to 400 characters, so a call with many paths can arrive here unparseable. Those are
+counted and printed rather than dropped, because a redundancy rate computed over an unknown
+denominator is the kind of number this project has had to retract before.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import sys
+from collections import Counter
+
+# `search` is deliberately NOT a read tool here. Its `path` argument is a directory to search
+# under, not a file being fetched, so treating it as one counts two searches of the same directory
+# as a repeated read of the same file. That artifact put the first version of this tool's re-read
+# rate at 24.6% of all calls, with one run at 45%, entirely from a field that means something else.
+READ = {"read_files", "read_file", "list_files"}
+SEARCH = {"search", "search_codebase"}
+EXPLORE = READ | SEARCH
+EDIT = {"write_file", "replace_in_file", "apply_patch", "edit_file"}
+VERIFY = {"run_commands", "execute_command", "run_command"}
+REPORT = {"submit_report", "attempt_completion"}
+
+
+def paths_in(call: dict) -> list[str]:
+    """Paths a call touched. Raises on a payload truncated past readability."""
+    if isinstance(call.get("args"), dict):
+        args = call["args"]
+        found = []
+        if isinstance(args.get("path"), str):
+            found.append(args["path"])
+        found.extend(p for p in (args.get("paths") or []) if isinstance(p, str))
+        return found
+    parsed = json.loads(call["query"])
+    if not isinstance(parsed, dict):
+        raise ValueError("not an object")
+    found = []
+    if isinstance(parsed.get("path"), str):
+        found.append(parsed["path"])
+    files = parsed.get("files")
+    if isinstance(files, list):
+        for item in files:
+            if isinstance(item, dict) and isinstance(item.get("path"), str):
+                found.append(item["path"])
+            elif isinstance(item, str):
+                found.append(item)
+    return found
+
+
+def command_of(call: dict) -> str | None:
+    if isinstance(call.get("args"), dict):
+        commands = call["args"].get("commands")
+        return "\n".join(str(c) for c in commands) if isinstance(commands, list) else None
+    parsed = json.loads(call["query"])
+    if not isinstance(parsed, dict):
+        return None
+    commands = parsed.get("commands")
+    if isinstance(commands, list):
+        return "\n".join(str(c) for c in commands)
+    for key in ("command", "cmd"):
+        if isinstance(parsed.get(key), str):
+            return parsed[key]
+    return None
+
+
+def analyse(log: pathlib.Path) -> dict:
+    calls = []
+    for line in log.read_text(errors="replace").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        event = record.get("event") or {}
+        if event.get("type") != "content_end" or event.get("contentType") != "tool":
+            continue
+        output = event.get("output") or {}
+        calls.append({"name": event.get("toolName") or "?",
+                      "ok": bool(output.get("success")),
+                      "fault": event.get("fault"),
+                      # `args` is the untruncated, contents-free summary written by
+                      # tools/native-agent. Older logs and Cline logs have only `query`, which is
+                      # capped at 400 characters, so those calls may still be unreadable -- and
+                      # every rate below states the denominator it was computed over.
+                      "args": event.get("output", {}).get("args"),
+                      "query": output.get("query") or ""})
+
+    kinds = Counter()
+    faults = Counter()
+    failed_edits = 0
+    unparseable = 0
+    re_reads = 0
+    re_runs = 0
+    re_searches = 0
+    # Per-measure denominators. A redundancy rate over "all tool calls" is not wrong so much as
+    # unanswerable: the reads and the commands have different readability, and quoting one rate
+    # against the total is how "0 repeated commands" was printed over a denominator of 13.
+    readable = Counter()
+    seen_paths: set[str] = set()
+    seen_commands: set[str] = set()
+    seen_searches: set[tuple[str, str]] = set()
+    first_edit = last_edit = None
+
+    for index, call in enumerate(calls):
+        name = call["name"]
+        if name in EDIT:
+            kinds["edit"] += 1
+            if call["ok"]:
+                if first_edit is None:
+                    first_edit = index
+                last_edit = index
+                # An edit invalidates what the conversation knows about the tree, so reading and
+                # re-running become informative again. Clearing both is what keeps diligence from
+                # being scored as waste.
+                seen_paths.clear()
+                seen_commands.clear()
+                seen_searches.clear()
+            else:
+                failed_edits += 1
+        elif name in READ:
+            kinds["explore"] += 1
+            readable["read"] += 1
+            try:
+                found = paths_in(call)
+            except ValueError:
+                unparseable += 1
+                readable["read"] -= 1
+                continue
+            if found and all(path in seen_paths for path in found):
+                re_reads += 1
+            seen_paths.update(found)
+        elif name in SEARCH:
+            kinds["explore"] += 1
+            kinds["search"] += 1
+            readable["search"] += 1
+            try:
+                parsed = call["args"] if isinstance(call.get("args"), dict) \
+                    else json.loads(call["query"])
+            except ValueError:
+                unparseable += 1
+                readable["search"] -= 1
+                continue
+            # The repeated thing for a search is the question, not the directory.
+            key = (str(parsed.get("query")), str(parsed.get("path") or ""))
+            if key in seen_searches:
+                re_searches += 1
+            seen_searches.add(key)
+        elif name in VERIFY:
+            kinds["verify"] += 1
+            readable["verify"] += 1
+            try:
+                command = command_of(call)
+            except ValueError:
+                unparseable += 1
+                readable["verify"] -= 1
+                continue
+            if command is None:
+                readable["verify"] -= 1
+                continue
+            if command in seen_commands:
+                re_runs += 1
+            seen_commands.add(command)
+        elif name in REPORT:
+            kinds["report"] += 1
+        else:
+            kinds["other"] += 1
+        if call["fault"]:
+            faults[call["fault"]] += 1
+
+    total = len(calls)
+    return {
+        "calls": total,
+        "prologue": first_edit if first_edit is not None else total,
+        "work": (last_edit - first_edit + 1) if first_edit is not None else 0,
+        "epilogue": (total - last_edit - 1) if last_edit is not None else 0,
+        "explore": kinds["explore"], "edit": kinds["edit"], "verify": kinds["verify"],
+        "report": kinds["report"], "other": kinds["other"],
+        "failed_edits": failed_edits, "re_reads": re_reads, "re_runs": re_runs,
+        "re_searches": re_searches, "search": kinds["search"],
+        "readable_read": readable["read"], "readable_search": readable["search"],
+        "readable_verify": readable["verify"],
+        "unparseable": unparseable, "faults": dict(faults),
+    }
+
+
+def metrics_of(run: pathlib.Path) -> dict:
+    values = {}
+    path = run / "metrics"
+    if path.exists():
+        for line in path.read_text().splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                values[key] = value
+    return values
+
+
+def runs_under(target: pathlib.Path) -> list[pathlib.Path]:
+    if (target / "provider.log").exists():
+        return [target]
+    return sorted((p.parent for p in target.glob("*/provider.log")),
+                  key=lambda p: (len(p.name), p.name))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("targets", nargs="+", type=pathlib.Path)
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+
+    rows = []
+    for target in args.targets:
+        for run in runs_under(target):
+            stats = analyse(run / "provider.log")
+            stats["run"] = str(run)
+            stats["outcome"] = metrics_of(run).get("outcome", "?")
+            rows.append(stats)
+
+    if not rows:
+        print("no runs found", file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+
+    print(f'{"run":34} {"out":20} {"calls":>5} {"pro":>4} {"work":>5} {"epi":>4} '
+          f'{"expl":>5} {"edit":>5} {"vfy":>4} {"bad":>4} {"rd2":>4} {"run2":>5}')
+    for row in rows:
+        name = row["run"].replace("bench/results/", "")
+        print(f'{name[-34:]:34} {row["outcome"][:20]:20} {row["calls"]:5d} {row["prologue"]:4d} '
+              f'{row["work"]:5d} {row["epilogue"]:4d} {row["explore"]:5d} {row["edit"]:5d} '
+              f'{row["verify"]:4d} {row["failed_edits"]:4d} {row["re_reads"]:4d} '
+              f'{row["re_runs"]:5d}')
+
+    total = Counter()
+    for row in rows:
+        for key in ("calls", "prologue", "work", "epilogue", "explore", "edit", "verify",
+                    "failed_edits", "re_reads", "re_runs", "re_searches", "search",
+                    "readable_read", "readable_search", "readable_verify", "unparseable"):
+            total[key] += row[key]
+    n = len(rows)
+    calls = total["calls"] or 1
+    print(f'\n{n} run(s), {total["calls"]} tool calls')
+    print(f'  phase      prologue {total["prologue"] / n:5.1f}/run ({total["prologue"] / calls:4.0%})   '
+          f'work {total["work"] / n:5.1f} ({total["work"] / calls:4.0%})   '
+          f'epilogue {total["epilogue"] / n:5.1f} ({total["epilogue"] / calls:4.0%})')
+    print(f'  bought     edits {total["edit"] / n:5.1f}/run, of which {total["failed_edits"]} failed '
+          f'across all runs ({total["failed_edits"] / max(total["edit"], 1):.0%})')
+    def rate(hits: int, base: int) -> str:
+        return f'{hits}/{base} ({hits / base:.0%})' if base else f'{hits}/0 (no readable calls)'
+    print(f'  bought no  re-reads {rate(total["re_reads"], total["readable_read"])}, '
+          f'repeat searches {rate(total["re_searches"], total["readable_search"])}, '
+          f're-runs {rate(total["re_runs"], total["readable_verify"])}')
+    if total["unparseable"]:
+        # Printed unconditionally when non-zero: the rates above are computed over calls this
+        # tool could read, and saying so is the difference between a measurement and a guess.
+        print(f'  UNREAD     {total["unparseable"]} tool argument(s) were truncated at 400 chars '
+              f'in the log and are excluded from the denominators above. Logs written after '
+              f'the `args` field landed do not have this gap.')
+    faults = Counter()
+    for row in rows:
+        faults.update(row["faults"])
+    if faults:
+        print(f'  faults     {dict(faults)}')
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
