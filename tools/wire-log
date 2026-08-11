@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""wire-log — record exactly what the client sends the model, byte for byte.
+
+    tools/wire-log [--listen 8072] [--upstream 8071] [--dir .handoff/wire]
+    # then point the client at http://127.0.0.1:8072/v1 instead of :8071
+
+WHY THIS EXISTS
+
+Every conversation this project has reasoned about has been a reconstruction. `tools/replay-final-
+turn` rebuilds one from the event stream and lands at ~67% of the original's depth, because Cline's
+own system prompt and its full tool schemas are rendered into every request and appear nowhere in
+what it logs. `apply_patch` bodies are absent too, so they are rebuilt from the diff.
+
+That gap is not a detail. Today produced a measurement of 100% reporting on a replayed conversation
+against 57% through Cline on real rounds, and the honest reading was "suggestive, because three
+things vary at once". With the wire captured there is nothing left to reconstruct: the same bytes
+can be replayed directly, and the client is then the only variable.
+
+It also answers the question the whole day failed to: which conversations actually lose their
+report. Capture a wave and every failing round is on disk in the exact form the model saw it.
+
+WHAT IT DOES NOT DO
+
+It does not modify anything. `tools/ollama-ctx-proxy.py` in this repository rewrites requests on
+the way through, which is a different job with different risks; this one is a tap. If a run behaves
+differently with the proxy in the path, that is a bug here, not a finding.
+
+STORAGE
+
+Bodies are large — a 140k-token request is megabytes, and a round can make 173 of them — so each is
+gzipped to its own file and the index stays small enough to grep.
+
+    <dir>/<session>/index.jsonl        one line per exchange: seq, timing, sizes, outcome
+    <dir>/<session>/req-00001.json.gz  the request body, verbatim
+    <dir>/<session>/res-00001.json.gz  the response, verbatim (non-streamed) or reassembled
+
+Streaming is relayed chunk by chunk as it arrives. Buffering it to log it whole would change the
+client's timing behaviour, and a tap that alters what it measures is worthless.
+"""
+
+from __future__ import annotations
+
+import argparse
+import gzip
+import http.client
+import json
+import pathlib
+import sys
+import threading
+import time
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+ARGS = None
+SEQ = 0
+SEQ_LOCK = threading.Lock()
+SESSION_DIR: pathlib.Path | None = None
+INDEX_LOCK = threading.Lock()
+
+
+def next_seq() -> int:
+    global SEQ
+    with SEQ_LOCK:
+        SEQ += 1
+        return SEQ
+
+
+def write_gz(path: pathlib.Path, data: bytes) -> None:
+    with gzip.open(path, "wb") as handle:
+        handle.write(data)
+
+
+def append_index(record: dict) -> None:
+    with INDEX_LOCK:
+        with (SESSION_DIR / "index.jsonl").open("a") as handle:
+            handle.write(json.dumps(record) + "\n")
+
+
+def summarise_request(body: bytes) -> dict:
+    """Enough to find a request later without decompressing every one of them."""
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        return {"parsed": False}
+    messages = payload.get("messages") or []
+    return {
+        "parsed": True,
+        "model": payload.get("model"),
+        "messages": len(messages),
+        "tools": len(payload.get("tools") or []),
+        "stream": bool(payload.get("stream")),
+        "temperature": payload.get("temperature"),
+        # The last message's role and a fragment of it, because "what was the model asked" is the
+        # question that sends anyone to these files in the first place.
+        "last_role": (messages[-1].get("role") if messages else None),
+        "last_head": (str(messages[-1].get("content"))[:160] if messages else None),
+    }
+
+
+def summarise_response(body: bytes, streamed: bool) -> dict:
+    """Did a report come back, and if not, what came instead."""
+    if streamed:
+        # Reassemble only what is needed to classify the turn. The raw stream is stored verbatim
+        # alongside, so nothing is lost by keeping this shallow.
+        content, tools, finish = [], [], None
+        for line in body.decode("utf-8", "replace").splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            chunk = line[5:].strip()
+            if chunk == "[DONE]":
+                continue
+            try:
+                parsed = json.loads(chunk)
+            except ValueError:
+                continue
+            for choice in parsed.get("choices") or []:
+                delta = choice.get("delta") or {}
+                if delta.get("content"):
+                    content.append(delta["content"])
+                for call in delta.get("tool_calls") or []:
+                    name = (call.get("function") or {}).get("name")
+                    if name:
+                        tools.append(name)
+                if choice.get("finish_reason"):
+                    finish = choice["finish_reason"]
+        text = "".join(content)
+        return {"finish_reason": finish, "content_chars": len(text),
+                "tool_calls": tools, "has_content": bool(text.strip())}
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        return {"parsed": False}
+    choices = payload.get("choices") or []
+    if not choices:
+        return {"parsed": True, "choices": 0}
+    message = choices[0].get("message") or {}
+    text = message.get("content") or ""
+    return {
+        "finish_reason": choices[0].get("finish_reason"),
+        "content_chars": len(text),
+        "has_content": bool(text.strip()),
+        "tool_calls": [(c.get("function") or {}).get("name")
+                       for c in (message.get("tool_calls") or [])],
+        "usage": payload.get("usage"),
+    }
+
+
+class Tap(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):  # noqa: A003 — silence the default access log
+        pass
+
+    def _relay(self, method: str) -> None:
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length else b""
+        seq = next_seq()
+        started = time.monotonic()
+
+        interesting = self.path.endswith("/chat/completions")
+        if interesting and body:
+            write_gz(SESSION_DIR / f"req-{seq:05d}.json.gz", body)
+
+        upstream = http.client.HTTPConnection(ARGS.upstream_host, ARGS.upstream, timeout=ARGS.timeout)
+        headers = {k: v for k, v in self.headers.items() if k.lower() != "host"}
+        try:
+            upstream.request(method, self.path, body=body, headers=headers)
+            response = upstream.getresponse()
+        except Exception as error:  # noqa: BLE001 — an upstream failure is data, not a crash
+            self.send_response(502)
+            self.end_headers()
+            if interesting:
+                append_index({"seq": seq, "path": self.path, "error": f"{type(error).__name__}: {error}",
+                              "at": datetime.now(timezone.utc).isoformat()})
+            return
+
+        self.send_response(response.status)
+        streamed = "text/event-stream" in (response.getheader("Content-Type") or "")
+        for key, value in response.getheaders():
+            if key.lower() in ("transfer-encoding", "content-length", "connection"):
+                continue
+            self.send_header(key, value)
+        # Chunked out, so a long generation reaches the client as it is produced. Declaring a
+        # length would mean buffering, which changes the timing this is supposed to observe.
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+
+        captured = bytearray()
+        try:
+            while True:
+                piece = response.read(8192)
+                if not piece:
+                    break
+                captured.extend(piece)
+                self.wfile.write(b"%x\r\n%s\r\n" % (len(piece), piece))
+                self.wfile.flush()
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        except Exception:  # noqa: BLE001 — client hung up; still record what was seen
+            pass
+        finally:
+            upstream.close()
+
+        if interesting:
+            write_gz(SESSION_DIR / f"res-{seq:05d}.json.gz", bytes(captured))
+            append_index({
+                "seq": seq,
+                "at": datetime.now(timezone.utc).isoformat(),
+                "seconds": round(time.monotonic() - started, 2),
+                "status": response.status,
+                "request": summarise_request(body),
+                "response": summarise_response(bytes(captured), streamed),
+            })
+
+    def do_POST(self):  # noqa: N802
+        self._relay("POST")
+
+    def do_GET(self):  # noqa: N802
+        self._relay("GET")
+
+
+def main() -> int:
+    global ARGS, SESSION_DIR
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--listen", type=int, default=8072)
+    parser.add_argument("--upstream", type=int, default=8071)
+    parser.add_argument("--upstream-host", default="127.0.0.1")
+    parser.add_argument("--dir", type=pathlib.Path, default=pathlib.Path(".handoff/wire"))
+    parser.add_argument("--session", default=None, help="subdirectory name; defaults to a timestamp")
+    parser.add_argument("--timeout", type=int, default=1800)
+    ARGS = parser.parse_args()
+
+    name = ARGS.session or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    SESSION_DIR = ARGS.dir / name
+    SESSION_DIR.mkdir(parents=True, exist_ok=True)
+
+    print(f"wire-log: :{ARGS.listen} -> :{ARGS.upstream}, recording to {SESSION_DIR}")
+    print("point the client at this port instead of the server's:")
+    print(f"  cline auth -p openai-compatible -m <model> -b http://127.0.0.1:{ARGS.listen}/v1 -k dummy \\")
+    print("      --config ~/.cline-llamacpp")
+    print()
+    print("Nothing is modified on the way through. If a run behaves differently with this in the")
+    print("path, that is a bug here rather than a finding.")
+
+    server = ThreadingHTTPServer(("127.0.0.1", ARGS.listen), Tap)
+    server.daemon_threads = True
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print(f"\nrecorded {SEQ} exchange(s) to {SESSION_DIR}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

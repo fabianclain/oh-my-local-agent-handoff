@@ -887,6 +887,53 @@ else
     fail "bench/run did not refuse --force and --append together with a usage error"
 fi
 
+# wire-log must relay unchanged and capture byte-exactly. Both halves matter: a tap that alters
+# the traffic invalidates every conclusion drawn from it, and one that mangles the capture is a
+# reconstruction wearing a better name.
+WIRE_DIR="$SANDBOX/wire"
+python3 - "$SANDBOX" <<'UPSTREAM' &
+import http.server, json, socketserver, sys
+class Echo(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def log_message(self, *a): pass
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        out = json.dumps({"choices":[{"message":{"content":"pong","role":"assistant"},
+                                      "finish_reason":"stop"}],"echo_len":len(body)}).encode()
+        self.send_response(200); self.send_header("Content-Type","application/json")
+        self.send_header("Content-Length", str(len(out))); self.end_headers()
+        self.wfile.write(out)
+socketserver.TCPServer.allow_reuse_address = True
+with socketserver.TCPServer(("127.0.0.1", 8079), Echo) as s:
+    s.serve_forever()
+UPSTREAM
+UPSTREAM_PID=$!
+python3 "$REPO/tools/wire-log" --listen 8078 --upstream 8079 --dir "$WIRE_DIR" --session s >/dev/null 2>&1 &
+WIRE_PID=$!
+sleep 1
+
+SENT='{"messages":[{"role":"user","content":"ping"}],"tools":[],"stream":false}'
+GOT="$(curl -fsS --max-time 10 http://127.0.0.1:8078/v1/chat/completions \
+    -H 'Content-Type: application/json' -d "$SENT" 2>/dev/null)"
+kill "$WIRE_PID" "$UPSTREAM_PID" 2>/dev/null
+wait "$WIRE_PID" "$UPSTREAM_PID" 2>/dev/null
+
+if grep -q 'pong' <<<"$GOT"; then
+    pass "wire-log relays the response through unchanged"
+else
+    fail "wire-log did not relay the upstream response (got: ${GOT:0:80})"
+fi
+
+CAPTURED="$(python3 -c "
+import gzip,glob,sys
+f=sorted(glob.glob('$WIRE_DIR/s/req-*.json.gz'))
+print(gzip.open(f[0],'rt').read() if f else '')" 2>/dev/null)"
+if [[ "$CAPTURED" == "$SENT" ]]; then
+    pass "wire-log captures the request body byte for byte"
+else
+    fail "wire-log's capture differs from what was sent — it is a reconstruction, not a tap"
+fi
+
 echo
 if [[ "$FAILURES" -eq 0 ]]; then echo "all checks passed"; else echo "$FAILURES check(s) failed"; fi
 exit $(( FAILURES > 0 ? 1 : 0 ))

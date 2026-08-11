@@ -2,7 +2,7 @@
 """replay-final-turn — re-ask the report question against a conversation that really happened.
 
     tools/replay-final-turn <result-dir> [--variant message|tool|forbid] [--repeat 8]
-    tools/replay-final-turn bench/results/wide/lcgptossl/2 --variant tool
+    tools/replay-final-turn --wire .handoff/wire/<session> [--exchange N] [--variant tool]
 
 `tools/report-probe` provokes the final turn in two minutes, but against a five-message fixture,
 while real rounds run 13 to 173 requests and 20k to 140k prompt tokens. Every conclusion drawn from
@@ -180,6 +180,38 @@ def rebuild(result_dir: pathlib.Path, probe) -> tuple[list[dict], dict]:
     return messages, provenance
 
 
+def from_wire(session: pathlib.Path, exchange: int | None) -> tuple[list[dict], list[dict], dict]:
+    """The messages and tools a client really sent, from tools/wire-log.
+
+    This is the version with nothing reconstructed. rebuild() below infers a conversation from the
+    event stream and reaches ~67% of the original's depth, because the client's system prompt and
+    its tool schemas are rendered into every request and logged nowhere. Captured from the wire
+    there is no gap: these are the exact bytes the model was given.
+
+    Defaults to the LAST exchange, which is the report turn — the one that fails.
+    """
+    index = session / "index.jsonl"
+    if not index.exists():
+        raise SystemExit(f"no index.jsonl in {session}; was wire-log pointed here?")
+    rows = [json.loads(l) for l in index.read_text().splitlines() if l.strip()]
+    if not rows:
+        raise SystemExit(f"{index} is empty")
+    row = rows[exchange - 1] if exchange else rows[-1]
+    body = session / f"req-{row['seq']:05d}.json.gz"
+    with gzip.open(body, "rt", errors="replace") as handle:
+        payload = json.load(handle)
+    provenance = {
+        "source": f"wire exchange {row['seq']} of {len(rows)}",
+        "tool_calls_rebuilt": sum(1 for m in payload.get("messages", []) if m.get("tool_calls")),
+        "patch_bodies_rebuilt": 0,
+        "reasoning_blocks": sum(1 for m in payload.get("messages", [])
+                                if m.get("reasoning_content") or m.get("thinking")),
+        "opening_prompt": "verbatim (captured, not reconstructed)",
+        "original_outcome": row.get("response", {}),
+    }
+    return payload.get("messages", []), payload.get("tools", []), provenance
+
+
 ASKS = {
     "message": ("The work is done. Reply with ONLY a JSON object matching this schema, as your "
                 "final message. No prose, no code fence.\n\n{schema}"),
@@ -187,13 +219,21 @@ ASKS = {
                "this schema, as your final message. No prose, no code fence.\n\n{schema}"),
     "tool": ("The work is done. Call submit_report with your completion report. "
              "Do not reply with prose."),
+    # Only meaningful with --wire: send the captured exchange back untouched. This is the
+    # like-for-like against the client — same bytes, same tools, no added ask — so a difference in
+    # outcome is the client and nothing else.
+    "asis": "",
 }
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("result_dir", type=pathlib.Path)
+    parser.add_argument("result_dir", type=pathlib.Path, nargs="?")
+    parser.add_argument("--wire", type=pathlib.Path, default=None,
+                        help="a tools/wire-log session directory — exact bytes, nothing rebuilt")
+    parser.add_argument("--exchange", type=int, default=None,
+                        help="which captured exchange (1-based); default is the last, the report turn")
     parser.add_argument("--variant", choices=sorted(ASKS), default="message")
     parser.add_argument("--repeat", type=int, default=8)
     parser.add_argument("--host", default="127.0.0.1")
@@ -204,12 +244,28 @@ def main() -> int:
     args = parser.parse_args()
 
     probe = load_probe()
-    messages, provenance = rebuild(args.result_dir, probe)
-
     schema = probe.SCHEMA
-    ask = ASKS[args.variant].replace("{schema}", json.dumps(schema, indent=2))
-    messages = messages + [{"role": "user", "content": ask}]
-    tools = list(probe.TOOLS) + ([probe.REPORT_TOOL] if args.variant == "tool" else [])
+
+    if args.wire:
+        messages, wire_tools, provenance = from_wire(args.wire, args.exchange)
+        # The client's own tools, not the probe's approximation of them. That difference is most
+        # of the depth that reconstruction loses.
+        tools = list(wire_tools)
+        if args.variant == "tool":
+            tools.append(probe.REPORT_TOOL)
+        # A captured report turn already ENDS in the ask the client made. Replacing it would
+        # measure a different question; appending is only right when the last message is not
+        # already the request for a report.
+        if args.variant != "asis":
+            ask = ASKS[args.variant].replace("{schema}", json.dumps(schema, indent=2))
+            messages = messages + [{"role": "user", "content": ask}]
+    else:
+        if not args.result_dir:
+            raise SystemExit("pass a result directory, or --wire <session>")
+        messages, provenance = rebuild(args.result_dir, probe)
+        ask = ASKS[args.variant].replace("{schema}", json.dumps(schema, indent=2))
+        messages = messages + [{"role": "user", "content": ask}]
+        tools = list(probe.TOOLS) + ([probe.REPORT_TOOL] if args.variant == "tool" else [])
 
     # The original's FINAL-TURN depth, which is the thing being reproduced.
     #
@@ -217,7 +273,7 @@ def main() -> int:
     # recorded 143,753 there on a 98k window, which is impossible for one request. The usage
     # events carry per-request inputTokens, and the last of them is the number that matters.
     original = 0
-    for event in read_events(args.result_dir):
+    for event in (read_events(args.result_dir) if args.result_dir else []):
         inner = (event.get("event") or {}) if event.get("type") == "agent_event" else {}
         if inner.get("type") == "usage" and inner.get("inputTokens"):
             original = inner["inputTokens"]
@@ -235,7 +291,10 @@ def main() -> int:
     except Exception:  # noqa: BLE001 — absence is reported, not fatal
         pass
 
-    print(f"replay {args.result_dir}  variant={args.variant}")
+    print(f"replay {args.wire or args.result_dir}  variant={args.variant}")
+    if args.wire:
+        print(f"  {provenance['source']}; the client's own outcome was: "
+              f"{provenance['original_outcome']}")
     print(f"  rebuilt {provenance['tool_calls_rebuilt']} tool calls, "
           f"{provenance['patch_bodies_rebuilt']} patch bodies from tree.diff, "
           f"{provenance['reasoning_blocks']} reasoning blocks")
