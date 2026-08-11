@@ -25,6 +25,7 @@ from a blank.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import sys
 import urllib.error
@@ -300,19 +301,44 @@ def main() -> int:
                         help="both (default) | forbid = prohibition only | results = reason only")
     parser.add_argument("--report-tool", action="store_true",
                         help="offer submit_report as a function — stop fighting the preference")
+    parser.add_argument("--concurrency", type=int, default=1,
+                        help="requests in flight. >1 measurably shifts the rate — see the note "
+                             "in main(); use it for a look, never for a comparison")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
     schema = schema_without_tests(SCHEMA) if args.no_tests_field else SCHEMA
+    # Sequential by default, and that is a measured decision rather than an oversight.
+    #
+    # llama-server runs four slots, so filling them looks free — this measures a rate rather than
+    # a duration, and sharing the card cannot distort a duration nobody records. That reasoning
+    # was written here, and it is wrong. Two pairs of runs, 16 samples each, same seeds:
+    #
+    #   --concurrency 1     93.8%, 87.5% reported      20.9s, 19.2s
+    #   --concurrency 4     75.0%, 68.8% reported      19.5s, 14.6s
+    #
+    # 29/32 against 23/32, the same direction both times, for at most a 1.3x speedup. Continuous
+    # batching changes the order of floating-point reductions, so a batched slot does not generate
+    # what an unbatched one generates from the same seed — and the divert decision is evidently
+    # close enough to a boundary for that to matter.
+    #
+    # A 1.3x speedup that moves the number being measured is not a speedup. --concurrency 4 is
+    # left available for a quick look, never for a comparison.
+    def one(index: int) -> tuple[str, str]:
+        return sample(args.host, args.port, args.model, args.timeout,
+                      args.temp, 1000 + index, args.depth, args.tool_choice,
+                      schema, args.already_verified, args.report_tool)
+
     counts: dict[str, int] = {}
     details: list[str] = []
-    for index in range(args.repeat):
-        kind, detail = sample(args.host, args.port, args.model, args.timeout,
-                              args.temp, 1000 + index, args.depth, args.tool_choice,
-                              schema, args.already_verified, args.report_tool)
-        counts[kind] = counts.get(kind, 0) + 1
-        if detail and len(details) < 5:
-            details.append(f"{kind}: {detail}")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+        # Submitted in order and read in order, so the seed for sample N is the same whether this
+        # runs with one worker or four. A probe whose results depend on its own scheduling could
+        # not be used to compare two variants.
+        for kind, detail in pool.map(one, range(args.repeat)):
+            counts[kind] = counts.get(kind, 0) + 1
+            if detail and len(details) < 5:
+                details.append(f"{kind}: {detail}")
 
     empty = counts.get("empty", 0)
     rate = empty / args.repeat
