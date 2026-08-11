@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+"""replay-final-turn — re-ask the report question against a conversation that really happened.
+
+    tools/replay-final-turn <result-dir> [--variant message|tool|forbid] [--repeat 8]
+    tools/replay-final-turn bench/results/wide/lcgptossl/2 --variant tool
+
+`tools/report-probe` provokes the final turn in two minutes, but against a five-message fixture,
+while real rounds run 13 to 173 requests and 20k to 140k prompt tokens. Every conclusion drawn from
+the probe therefore carries the same caveat, and no number of probe samples removes it.
+
+This closes that gap using rounds already paid for. A completed run's artifacts are enough to
+rebuild the conversation it had, so the report turn can be re-asked against genuine depth at about
+ten seconds a sample instead of the forty minutes a wave costs.
+
+WHAT IS FAITHFUL AND WHAT IS NOT
+
+Read this before quoting a number from it.
+
+  faithful   the opening system and task prompt, verbatim from prompt-attempt-N.md
+  faithful   every tool call's ORDER, name, and result — the results are the bulk of the context
+  faithful   read_files, run_commands and search_codebase inputs, recorded in output[].query
+
+  rebuilt    apply_patch inputs. The event stream records `query: "apply_patch"` and the result
+             message, never the patch body. It is reconstructed from tree.diff, apportioned to
+             each call by the files its result names. A file patched twice gets the net diff on
+             the first call and a stub on the second, because only the net survives.
+
+  faithful   the model's own reasoning. It IS sent back — the chat template renders
+             `message.thinking` into an analysis message on every prior assistant turn — so
+             dropping it cost 40% of the conversation's depth before this was noticed.
+
+So this is a conversation of the same shape, order and depth as the original, not a byte-identical
+one. For "does the report arrive at 40k tokens" that is the right instrument. For anything that
+turns on exact patch bytes, it is not.
+
+The reconstruction reports its own depth against the original's recorded `prompt_tokens`, because a
+replay that lands at half the depth is testing a different question and should say so.
+"""
+
+from __future__ import annotations
+
+import argparse
+import gzip
+import importlib.machinery
+import importlib.util
+import json
+import pathlib
+import re
+import sys
+import urllib.error
+import urllib.request
+
+HERE = pathlib.Path(__file__).resolve().parent
+
+
+def load_probe():
+    """Import report-probe for its schema, tools and classifier — never a second copy of them."""
+    loader = importlib.machinery.SourceFileLoader("report_probe", str(HERE / "report-probe"))
+    spec = importlib.util.spec_from_loader("report_probe", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def read_events(result_dir: pathlib.Path) -> list[dict]:
+    for name in ("provider.log", "events.jsonl"):
+        path = result_dir / name
+        if path.exists():
+            return [json.loads(l) for l in path.read_text(errors="replace").splitlines()
+                    if l.strip().startswith("{")]
+    gz = result_dir / "events.jsonl.gz"
+    if gz.exists():
+        with gzip.open(gz, "rt", errors="replace") as handle:
+            return [json.loads(l) for l in handle if l.strip().startswith("{")]
+    raise SystemExit(f"no event stream in {result_dir}")
+
+
+def patches_from_diff(result_dir: pathlib.Path) -> dict[str, str]:
+    """Per-file patch bodies, keyed by path, taken from the round's own diff."""
+    diff = result_dir / "tree.diff"
+    if not diff.exists():
+        return {}
+    out: dict[str, str] = {}
+    current, buffer = None, []
+    for line in diff.read_text(errors="replace").splitlines():
+        match = re.match(r"^diff --git a/(\S+) b/(\S+)", line)
+        if match:
+            if current:
+                out[current] = "\n".join(buffer)
+            current, buffer = match.group(2), []
+            continue
+        if current:
+            buffer.append(line)
+    if current:
+        out[current] = "\n".join(buffer)
+    return out
+
+
+def rebuild(result_dir: pathlib.Path, probe) -> tuple[list[dict], dict]:
+    """The conversation, plus a note on how faithfully it was rebuilt."""
+    events = read_events(result_dir)
+    patches = patches_from_diff(result_dir)
+    used_patches: set[str] = set()
+
+    messages: list[dict] = []
+    prompt_file = next(iter(sorted(result_dir.glob("prompt-attempt-*.md"))), None)
+    if prompt_file:
+        text = prompt_file.read_text(errors="replace")
+        system, _, task = text.partition("----- 8< ----- task prompt -----")
+        messages.append({"role": "system", "content": system.strip()})
+        messages.append({"role": "user", "content": task.strip() or "Implement the plan."})
+    else:
+        messages.append({"role": "system", "content": "You are the implementer in a two-model workflow."})
+        messages.append({"role": "user", "content": "Implement the plan in .handoff/plans/."})
+
+    rebuilt_patches = 0
+    pending_reasoning = ""
+    for event in events:
+        if event.get("type") != "agent_event":
+            continue
+        inner = event.get("event") or {}
+        if inner.get("type") == "content_end" and inner.get("contentType") == "reasoning":
+            # Held until the tool call it preceded, and attached there. The GGUF's chat template
+            # renders prior `thinking` into an analysis message on every assistant turn, so this
+            # is real context the model saw. Omitting it put the first replay at 61% of the
+            # original's final-turn depth, which the depth guard correctly refused.
+            pending_reasoning = inner.get("reasoning") or ""
+            continue
+        if inner.get("type") != "content_end" or inner.get("contentType") != "tool":
+            continue
+
+        name = inner.get("toolName") or "?"
+        call_id = inner.get("toolCallId") or f"call_{len(messages)}"
+        output = inner.get("output")
+
+        # The call's arguments, recovered from what the tool echoed back.
+        if name == "apply_patch":
+            # Never recorded. Rebuild from the diff, matched on the files the result names.
+            result_text = (output or {}).get("result", "") if isinstance(output, dict) else ""
+            named = [p for p in patches if p in result_text]
+            body = "\n".join(patches[p] for p in named if p not in used_patches)
+            used_patches.update(named)
+            if body:
+                rebuilt_patches += 1
+            arguments = {"input": body or "*** Begin Patch\n*** End Patch"}
+        elif isinstance(output, list):
+            queries = [o.get("query") for o in output if isinstance(o, dict)]
+            if name == "run_commands":
+                arguments = {"commands": [q for q in queries if q]}
+            elif name == "read_files":
+                arguments = {"files": [{"path": q} for q in queries if q]}
+            else:
+                arguments = {"query": queries[0] if queries else ""}
+        else:
+            arguments = {"query": (output or {}).get("query", "") if isinstance(output, dict) else ""}
+
+        assistant = {"role": "assistant", "content": "", "tool_calls": [{
+            "id": call_id, "type": "function",
+            "function": {"name": name, "arguments": json.dumps(arguments)}}]}
+        if pending_reasoning:
+            assistant["reasoning_content"] = pending_reasoning
+            pending_reasoning = ""
+        messages.append(assistant)
+
+        if isinstance(output, list):
+            rendered = "\n\n".join(str(o.get("result", "")) for o in output if isinstance(o, dict))
+        elif isinstance(output, dict):
+            rendered = str(output.get("result", ""))
+        else:
+            rendered = str(output or "")
+        messages.append({"role": "tool", "tool_call_id": call_id, "name": name,
+                         "content": rendered})
+
+    provenance = {
+        "reasoning_blocks": sum(1 for m in messages if m.get("reasoning_content")),
+        "tool_calls_rebuilt": sum(1 for m in messages if m.get("tool_calls")),
+        "patch_bodies_rebuilt": rebuilt_patches,
+        "opening_prompt": "verbatim" if prompt_file else "SUBSTITUTED — no prompt-attempt-N.md",
+    }
+    return messages, provenance
+
+
+ASKS = {
+    "message": ("The work is done. Reply with ONLY a JSON object matching this schema, as your "
+                "final message. No prose, no code fence.\n\n{schema}"),
+    "forbid": ("The work is done. Do not call any tool. Reply with ONLY a JSON object matching "
+               "this schema, as your final message. No prose, no code fence.\n\n{schema}"),
+    "tool": ("The work is done. Call submit_report with your completion report. "
+             "Do not reply with prose."),
+}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("result_dir", type=pathlib.Path)
+    parser.add_argument("--variant", choices=sorted(ASKS), default="message")
+    parser.add_argument("--repeat", type=int, default=8)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8071)
+    parser.add_argument("--model", default="gpt-oss-20b")
+    parser.add_argument("--temp", type=float, default=0.8)
+    parser.add_argument("--timeout", type=int, default=300)
+    args = parser.parse_args()
+
+    probe = load_probe()
+    messages, provenance = rebuild(args.result_dir, probe)
+
+    schema = probe.SCHEMA
+    ask = ASKS[args.variant].replace("{schema}", json.dumps(schema, indent=2))
+    messages = messages + [{"role": "user", "content": ask}]
+    tools = list(probe.TOOLS) + ([probe.REPORT_TOOL] if args.variant == "tool" else [])
+
+    # The original's FINAL-TURN depth, which is the thing being reproduced.
+    #
+    # Not metrics' `prompt_tokens`: that is neither the final request nor the total, and a run
+    # recorded 143,753 there on a 98k window, which is impossible for one request. The usage
+    # events carry per-request inputTokens, and the last of them is the number that matters.
+    original = 0
+    for event in read_events(args.result_dir):
+        inner = (event.get("event") or {}) if event.get("type") == "agent_event" else {}
+        if inner.get("type") == "usage" and inner.get("inputTokens"):
+            original = inner["inputTokens"]
+
+    print(f"replay {args.result_dir}  variant={args.variant}")
+    print(f"  rebuilt {provenance['tool_calls_rebuilt']} tool calls, "
+          f"{provenance['patch_bodies_rebuilt']} patch bodies from tree.diff, "
+          f"{provenance['reasoning_blocks']} reasoning blocks")
+    print(f"  opening prompt: {provenance['opening_prompt']}")
+
+    counts: dict[str, int] = {}
+    depth_seen = 0
+    for index in range(args.repeat):
+        payload = {"model": args.model, "messages": messages, "tools": tools, "stream": False,
+                   "temperature": args.temp, "seed": 2000 + index}
+        request = urllib.request.Request(
+            f"http://{args.host}:{args.port}/v1/chat/completions",
+            data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=args.timeout) as response:
+                body = json.loads(response.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode("utf-8", "replace")[:120]
+            counts["http-error"] = counts.get("http-error", 0) + 1
+            if index == 0:
+                print(f"  first error: HTTP {error.code}: {detail}")
+            continue
+        except Exception as error:  # noqa: BLE001
+            counts["http-error"] = counts.get("http-error", 0) + 1
+            continue
+        depth_seen = (body.get("usage") or {}).get("prompt_tokens", depth_seen)
+        kind, _ = probe.classify_response(body, schema, args.variant == "tool")
+        counts[kind] = counts.get(kind, 0) + 1
+
+    print()
+    # Depth is the whole claim of this tool. A replay that lands far short of the original is
+    # measuring a shallower conversation and must not be quoted as if it were the real one.
+    if original:
+        ratio = depth_seen / original
+        # Judged on the depth BAND, not a percentage. The fault rate is defined per band by
+        # tools/peg-audit — 0.00% below 16k, 0.70% at 16-32k, 2.63% at 32-48k — so two depths in
+        # the same band are as comparable as the measurement itself can distinguish, and a ±30%
+        # rule was an arbitrary threshold dressed up as a criterion.
+        #
+        # The shortfall is real and not recoverable: Cline's own system prompt and its full tool
+        # schemas are rendered into every request and appear nowhere in the event stream. It is
+        # roughly constant per run, so it shifts depth down without changing the conversation's
+        # shape.
+        def band(n: int) -> str:
+            for low, high in ((0, 8000), (8000, 16000), (16000, 32000), (32000, 48000)):
+                if low <= n < high:
+                    return f"{low // 1000}k-{high // 1000}k"
+            return "48k+"
+        same = band(depth_seen) == band(original)
+        print(f"depth: replay {depth_seen:,} against the original's {original:,} ({ratio:.0%}); "
+              f"bands {band(depth_seen)} and {band(original)} — "
+              + ("comparable" if same else "NOT COMPARABLE, different fault-rate band"))
+        print(f"  ({original - depth_seen:,} tokens short: Cline's system prompt and tool schemas,"
+              " which the event stream does not record)")
+    for kind, n in sorted(counts.items(), key=lambda kv: -kv[1]):
+        print(f"  {kind:<12}{n:>4}   {100 * n / args.repeat:5.1f}%")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

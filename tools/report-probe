@@ -235,6 +235,16 @@ def sample(host: str, port: int, model: str, timeout: int,
     except Exception as error:  # noqa: BLE001 — a transport failure is a result here
         return "http-error", f"{type(error).__name__}: {error}"
 
+    return classify_response(body, schema, report_tool)
+
+
+def classify_response(body: dict, schema: dict = SCHEMA, report_tool: bool = False) -> tuple[str, str]:
+    """Classify one completion. Shared with tools/replay-final-turn.
+
+    Module-level and imported rather than reimplemented, because two copies of a classifier is
+    how this repository has been bitten before — check-plan and bench/run once parsed plans with
+    separate copies of the same expressions, and they diverged.
+    """
     choices = body.get("choices") or []
     if not choices:
         return "empty", "no choices in the response"
