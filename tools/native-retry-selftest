@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""native-retry-selftest — does the loop survive a parse fault it is supposed to survive?
+
+    tools/native-retry-selftest
+
+tools/native-agent now re-asks a completion that llama.cpp refused to parse, because a peg fault
+ended the provider call in 13 of 13 archived segments and 22 of 29 runs that hit one lost their
+report. That change is only worth anything if it behaves exactly here:
+
+    recovers      a peg 500 followed by a good answer must NOT end the round
+    gives up      a peg 500 every time must stop after PEG_RETRIES, not spin
+    does not      a 400, or a 500 that is not the peg parser, must be raised on the first
+      retry      occurrence — retrying a malformed request just spends the budget twice
+
+No GPU and no model: a scripted HTTP server plays llama-server and hands back canned bodies in a
+fixed order, so each case is exact rather than probable.
+
+Every case below is mutation-tested in the header of tools/selftest-all's suite list by deleting
+the retry and confirming the first two fail. A guard that cannot fail is worse than no guard, and
+this repository has shipped three of them.
+"""
+
+from __future__ import annotations
+
+import json
+import pathlib
+import subprocess
+import sys
+import tempfile
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+HERE = pathlib.Path(__file__).resolve().parent
+AGENT = HERE / "native-agent"
+
+PEG_BODY = json.dumps({"error": {
+    "code": 500, "type": "server_error",
+    "message": "The model produced output that does not match the expected peg-native format"}})
+OTHER_500 = json.dumps({"error": {"code": 500, "message": "out of memory"}})
+BAD_REQUEST = json.dumps({"error": {"code": 400, "message": "context window exceeded"}})
+
+
+def ok(content: str = "", tool: tuple[str, dict] | None = None) -> tuple[int, str]:
+    message: dict = {"role": "assistant", "content": content}
+    if tool:
+        name, arguments = tool
+        message["tool_calls"] = [{"id": "call-1", "type": "function",
+                                  "function": {"name": name, "arguments": json.dumps(arguments)}}]
+    return 200, json.dumps({"choices": [{"message": message}],
+                            "usage": {"prompt_tokens": 10, "completion_tokens": 5}})
+
+
+class Server(HTTPServer):
+    """Serves a script of (status, body) pairs, and counts what was asked of it."""
+
+    def __init__(self, script: list[tuple[int, str]]):
+        super().__init__(("127.0.0.1", 0), Handler)
+        self.script = list(script)
+        self.completions = 0
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *_args) -> None:  # keep the suite's output readable
+        pass
+
+    def _send(self, status: int, body: str) -> None:
+        raw = body.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_GET(self) -> None:
+        # native-agent asks /props for the window before its first turn. A small one is fine; the
+        # cases here never approach it.
+        self._send(200, json.dumps({"default_generation_settings": {"n_ctx": 32768}}))
+
+    def do_POST(self) -> None:
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        self.server.completions += 1
+        if self.server.script:
+            status, body = self.server.script.pop(0)
+        else:
+            # Running off the end of a script means the loop asked more than the case expected.
+            # Answer with a report so it terminates, and let the assertion on `completions` be the
+            # thing that fails — a hang here would read as a broken suite rather than a broken loop.
+            status, body = ok('{"status": "complete", "summary": "script exhausted"}')
+        self._send(status, body)
+
+
+def run_case(name: str, script: list[tuple[int, str]], expect_completions: int,
+             expect_report: bool, expect_finish: set[str]) -> bool:
+    server = Server(script)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    port = server.server_address[1]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp)
+        (root / ".handoff").mkdir()
+        (root / "notes.txt").write_text("a file for the loop to read\n")
+        schema = root / "schema.json"
+        schema.write_text(json.dumps({"type": "object",
+                                      "properties": {"status": {"type": "string"},
+                                                     "summary": {"type": "string"}}}))
+        result, log = root / "result.json", root / "log.jsonl"
+        proc = subprocess.run(
+            [sys.executable, str(AGENT), "--repo", str(root), "--schema", str(schema),
+             "--result", str(result), "--log", str(log), "--host", "127.0.0.1",
+             "--port", str(port), "--prompt", "do the thing", "--max-turns", "4",
+             "--timeout", "20"],
+            capture_output=True, text=True, timeout=120)
+        server.shutdown()
+
+        finish = ""
+        for line in log.read_text().splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if event.get("type") == "run_result":
+                finish = event.get("finishReason", "")
+        report = result.read_text().strip()
+
+    problems = []
+    if server.completions != expect_completions:
+        problems.append(f"asked the server {server.completions}x, expected {expect_completions}")
+    if bool(report) != expect_report:
+        problems.append(f"report present={bool(report)}, expected {expect_report}")
+    if finish not in expect_finish:
+        problems.append(f"finishReason={finish!r}, expected one of {sorted(expect_finish)}")
+    if proc.returncode != 0:
+        problems.append(f"exit {proc.returncode}: {proc.stderr[-200:]}")
+
+    if problems:
+        print(f"FAIL  {name}")
+        for problem in problems:
+            print(f"        {problem}")
+        return False
+    print(f"pass  {name}")
+    return True
+
+
+def check_extractor() -> tuple[int, int]:
+    """extract_json_object, against the prose that actually defeated the regex it replaced.
+
+    The old expression was `re.search(r"\\{.*\\}", text, re.S)`: greedy, string-blind, and happy to
+    start a match on a shell brace in the middle of a sentence.
+    """
+    # native-agent has no .py suffix, so spec_from_file_location cannot pick a loader by
+    # extension and returns None. Name the loader instead of renaming the tool.
+    import importlib.util
+    from importlib.machinery import SourceFileLoader
+
+    spec = importlib.util.spec_from_file_location(
+        "native_agent", AGENT, loader=SourceFileLoader("native_agent", str(AGENT)))
+    native = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(native)
+    extract = native.extract_json_object
+
+    cases = [
+        ("plain object", '{"status": "complete"}', {"status": "complete"}),
+        ("object after prose", 'Sure thing.\n{"status": "ok"}', {"status": "ok"}),
+        ("fenced", '```json\n{"status": "ok"}\n```', {"status": "ok"}),
+        # The observed failure: a shell brace in reasoning, then nothing else. The old regex
+        # matched from `${f}` onwards and raised JSONDecodeError; the answer is that there is no
+        # object here, so the caller can re-ask instead of dying.
+        ("shell brace in prose is not JSON",
+         'I ran `for f in *.php; do php -l ${f} >/dev/null; done` and it passed.', None),
+        # A model that reasons and then answers: the answer is last, and it is the one that counts.
+        ("takes the last object when several are present",
+         'First I considered {"status": "blocked"} but then\n{"status": "complete"}',
+         {"status": "complete"}),
+        # A truncated trailing object must not shadow the complete one before it.
+        ("ignores a truncated trailing object",
+         '{"status": "complete"}\nand then {"status": "par',
+         {"status": "complete"}),
+        # The brace inside the string must be UNBALANCED, or the case is vacuous: a string-blind
+        # scanner counts `${HOME}` up and back down again and lands on the same answer, so an
+        # earlier version of this check passed against the very implementation it was written to
+        # reject. Verified by mutation — replacing the in-string guard now fails this line.
+        ("an unbalanced brace inside a string does not confuse the scan",
+         '{"summary": "there is an unmatched { here", "status": "complete"}',
+         {"summary": "there is an unmatched { here", "status": "complete"}),
+        ("empty response", "", None),
+        ("an array is not a report", '[1, 2, 3]', None),
+    ]
+    failures = 0
+    for name, text, expected in cases:
+        # Catching here is not defensive padding: the implementation this replaced RAISED
+        # JSONDecodeError on the shell-brace case, and a traceback out of the suite would read as
+        # a broken test rather than as the defect being caught.
+        try:
+            got = extract(text)
+        except Exception as error:  # noqa: BLE001
+            got = f"raised {type(error).__name__}"
+        if got != expected:
+            print(f"FAIL  extractor: {name}")
+            print(f"        got {got!r}, expected {expected!r}")
+            failures += 1
+        else:
+            print(f"pass  extractor: {name}")
+    return len(cases), failures
+
+
+def main() -> int:
+    if not AGENT.exists():
+        print("native-agent not found", file=sys.stderr)
+        return 2
+
+    cases = [
+        # A peg fault, then the model works and reports through the tool. One retry, the loop
+        # carries on, and the round ends with a report and no extra turn.
+        #
+        # Without the retry this ends at the first 500: one completion, no report, finish=error —
+        # which is the `patch-ok-no-report` signature this whole change exists to remove.
+        ("recovers from a peg 500 mid-loop", [
+            (500, PEG_BODY),
+            ok(tool=("read_files", {"files": [{"path": "notes.txt"}]})),
+            ok(tool=("submit_report", {"status": "complete", "summary": "done"})),
+        ], 3, True, {"completed"}),
+
+        # Every call faults. PEG_RETRIES=3 means four attempts on the loop turn; the report turn
+        # then tries four more before the loop gives up on it too.
+        ("gives up after PEG_RETRIES", [(500, PEG_BODY)] * 8, 8, False, {"error"}),
+
+        # Not the peg parser. Raised at once — one loop call, then the report turn's four.
+        ("does not retry a non-peg 500", [(500, OTHER_500)] + [(500, PEG_BODY)] * 4,
+         5, False, {"error"}),
+
+        # A 400 is the request's fault and would be wrong again.
+        ("does not retry a 400", [(400, BAD_REQUEST)] + [(400, BAD_REQUEST)],
+         2, False, {"error"}),
+
+        # The report turn answers with prose the first time and JSON when told what was wrong.
+        # Observed on `wide` at 14-25k depth, where the model stops using the report tool and the
+        # fallback turn carries every round: three of the first four produced no JSON at all.
+        ("re-asks a report turn that carried no JSON", [
+            ok(tool=("read_files", {"files": [{"path": "notes.txt"}]})),
+            ok("I have finished the work."),
+            ok("Let me summarise. I ran the loop `for f in *.php; do php -l ${f}; done` and "
+               "everything passed, so the status is complete."),
+            ok('{"status": "complete", "summary": "done"}'),
+        ], 4, True, {"completed"}),
+    ]
+
+    extractor_cases, extractor_failures = check_extractor()
+    loop_failures = sum(0 if run_case(*case) else 1 for case in cases)
+    failures = extractor_failures + loop_failures
+    total = extractor_cases + len(cases)
+    print()
+    if failures:
+        print(f"{failures} check(s) failed")
+        return 1
+    print(f"{total} check(s) passed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

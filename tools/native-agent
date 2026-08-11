@@ -72,6 +72,18 @@ OUTPUT_CAP = 20000
 # overflow. A usable tree with an account beats a full window every time.
 RESERVE_FOR_REPORT = 4096
 
+# How many times to re-ask a completion llama.cpp could not parse. See call_model_retrying for the
+# evidence; three is chosen because the fault ran at roughly 1% per completion, so a second failure
+# on the same turn is already unlikely and a third is not worth waiting for.
+PEG_RETRIES = 3
+# The server's own words for the fault, from the 500 body:
+#   "The model produced output that does not match the expected peg-native format"
+# Matching the parser's name rather than the sentence, which upstream may reword.
+PEG_MARKER = "peg-native"
+# How many times to ask for the report when the answer carries no JSON object. Two, because the
+# second ask says what was wrong with the first and a third has nothing new to add.
+REPORT_ATTEMPTS = 2
+
 
 def emit(log, kind: str, event: dict) -> None:
     log.write(json.dumps({"type": kind, "event": event} if kind == "agent_event" else
@@ -373,6 +385,100 @@ def call_model(host: str, port: int, model: str, messages: list[dict], tools: li
         return json.loads(response.read().decode("utf-8", "replace"))
 
 
+def extract_json_object(text: str):
+    """Find the report inside whatever the model actually said, or return None.
+
+    `re.search(r"\\{.*\\}", text, re.S)` was here, and it is wrong in both directions. It is greedy,
+    so on a turn that reasons before answering it spans from the first brace in the prose to the
+    last one anywhere — and it matches braces that are not JSON at all. An observed report turn
+    reasoned about a shell loop containing `>/dev/null` and `${f}`, and the regex handed
+    `json.loads` a slice starting mid-sentence: JSONDecodeError, report lost, round recorded as
+    `patch-ok-no-report` although the model had done the work.
+
+    Instead: walk the string tracking brace depth (ignoring braces inside JSON strings), collect
+    every balanced candidate, and return the LAST one that parses to an object. Last, because a
+    model that reasons and then answers puts the answer at the end, and because a truncated final
+    object leaves the earlier complete ones intact.
+    """
+    candidates = []
+    depth = 0
+    start = -1
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}":
+            if depth:
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    candidates.append(text[start:index + 1])
+    for candidate in reversed(candidates):
+        try:
+            parsed = json.loads(candidate)
+        except ValueError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def call_model_retrying(host: str, port: int, model: str, messages: list[dict], tools: list[dict],
+                        temperature: float, timeout: int, log, where: str) -> dict:
+    """Re-ask a completion that llama.cpp refused to parse, instead of losing the round to it.
+
+    The fault is in the serving stack, not in the conversation. The model generated output,
+    llama.cpp's harmony parser could not map it to the grammar, and the server answered 500. The
+    messages are unchanged and still valid, so re-asking costs one completion — where breaking
+    costs every turn the loop had left.
+
+    Measured across the 71 archived runs that existed before this was written:
+
+      * a peg fault ended the provider call in 13 of 13 segments, under this loop AND under Cline.
+        Neither retried. Zero tool calls followed the fault in any of them.
+      * 22 of 29 runs that hit one ended `patch-ok-no-report`, against 1 of 42 that did not
+        (Fisher p = 2.5e-11).
+
+    So this is the mechanism behind the missing reports, and it was previously recorded as the
+    model declining to report. It does not decline. It is cut off.
+
+    A retry helps because production runs at temperature 0.8, where re-asking draws a genuinely
+    different sample. It will NOT rescue the deterministic repro in docs/local-models.md, which
+    reproduces the same malformed harmony under greedy decoding — that one is for upstream.
+
+    Only a 500 naming the peg parser is retried. Every other HTTPError is raised: a 400 means the
+    request is wrong and would be wrong again, and retrying an overflow would burn the budget on a
+    request that cannot fit.
+    """
+    for attempt in range(1, PEG_RETRIES + 2):
+        try:
+            return call_model(host, port, model, messages, tools, temperature, timeout)
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode("utf-8", "replace")[:300]
+            # Logged on every occurrence, recovered or not, so tools/peg-audit and the journal
+            # still see the fault rate. The retry event below is what distinguishes a fault that
+            # cost the round from one that cost a completion.
+            emit(log, "agent_event", {"type": "error",
+                                      "error": {"message": f"HTTP {error.code}: {detail}"}})
+            if error.code != 500 or PEG_MARKER not in detail or attempt > PEG_RETRIES:
+                raise
+            emit(log, "agent_event", {"type": "peg_retry", "where": where,
+                                      "attempt": attempt, "of": PEG_RETRIES})
+    raise AssertionError("unreachable: the loop either returns or raises")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -437,12 +543,12 @@ def main() -> int:
                     finish = "context-budget"
                     break
             try:
-                body = call_model(args.host, args.port, args.model, messages,
-                                  tool_schemas(True, schema), args.temp, args.timeout)
-            except urllib.error.HTTPError as error:
-                detail = error.read().decode("utf-8", "replace")[:300]
-                emit(log, "agent_event", {"type": "error",
-                                          "error": {"message": f"HTTP {error.code}: {detail}"}})
+                body = call_model_retrying(args.host, args.port, args.model, messages,
+                                           tool_schemas(True, schema), args.temp, args.timeout,
+                                           log, f"turn-{turn}")
+            except urllib.error.HTTPError:
+                # call_model_retrying has already logged the body and exhausted any retry the
+                # fault was eligible for.
                 finish = "error"
                 break
             except Exception as error:  # noqa: BLE001
@@ -517,24 +623,60 @@ def main() -> int:
         # asked to attest to work it could still go and check; removing the option removes the
         # temptation without forbidding anything, which is what made tool_choice:"none" produce
         # silence instead of reports.
-        if report is None:
-            emit(log, "agent_event", {"type": "iteration_start", "iteration": "report"})
+        # The 100% was measured on a SHALLOW fixture, and it does not survive depth. Audited over
+        # the first native rounds: below ~9k the model reports through the tool and this turn is
+        # never reached, but on `wide` at 14–25k the tool goes unused, this turn is reached every
+        # time, and it failed in three of four — one empty response, one truncated mid-reasoning,
+        # one 62 characters of prose. So it is asked up to REPORT_ATTEMPTS times, and every attempt
+        # is logged with what came back and why it was rejected.
+        #
+        # Nothing here reduces the reasoning effort, which is the obvious lever and a disproved
+        # one: docs/local-models.md records missing finals at 33% on `low` against 40% on `off`.
+        for attempt in range(1, REPORT_ATTEMPTS + 1):
+            if report is not None:
+                break
+            emit(log, "agent_event", {"type": "iteration_start",
+                                      "iteration": "report" if attempt == 1 else
+                                      f"report-{attempt}"})
             ask = ("The work is finished. Reply with ONLY a JSON object matching this schema, "
                    "as your final message. No prose, no code fence.\n\n"
                    + json.dumps(schema, indent=2))
+            if attempt > 1:
+                # Say what was wrong with the last answer. An empty response and a page of
+                # reasoning are different failures and the same instruction does not fix both.
+                ask += ("\n\nYour previous reply did not contain a JSON object. Do not explain, "
+                        "do not reason, do not restate the work. Emit the object and nothing "
+                        "else, beginning with { and ending with }.")
             try:
-                body = call_model(args.host, args.port, args.model,
-                                  messages + [{"role": "user", "content": ask}],
-                                  [], args.temp, args.timeout)
-                final = ((body.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+                body = call_model_retrying(args.host, args.port, args.model,
+                                           messages + [{"role": "user", "content": ask}],
+                                           [], args.temp, args.timeout, log,
+                                           f"report-{attempt}")
+                choice = (body.get("choices") or [{}])[0]
+                final = (choice.get("message") or {}).get("content") or ""
+                usage = body.get("usage") or {}
                 emit(log, "agent_event", {"type": "content_end", "contentType": "text",
                                           "text": final})
-                match = re.search(r"\{.*\}", final, re.S)
-                if match:
-                    report = json.loads(match.group(0))
+                # Without this the report turn is a black box, which is exactly how "100%" went
+                # unchallenged: a truncated answer and a refusal look identical from outside.
+                emit(log, "agent_event", {
+                    "type": "report_turn", "attempt": attempt,
+                    "finishReason": choice.get("finish_reason"),
+                    "chars": len(final),
+                    "inputTokens": usage.get("prompt_tokens"),
+                    "outputTokens": usage.get("completion_tokens")})
+                totals["in"] += usage.get("prompt_tokens") or 0
+                totals["out"] += usage.get("completion_tokens") or 0
+                report = extract_json_object(final)
+                if report is None:
+                    emit(log, "agent_event", {"type": "error", "error": {"message": (
+                        f"report turn {attempt}: no JSON object in "
+                        f"{len(final)} chars (finish_reason="
+                        f"{choice.get('finish_reason')})")}})
             except Exception as error:  # noqa: BLE001
                 emit(log, "agent_event", {"type": "error", "error": {
                     "message": f"report turn: {type(error).__name__}: {error}"}})
+                break
 
         # A round whose conclusion was discarded by the parser and then recovered is not an
         # error round, and labelling it one would send the journal's classifier to the wrong
