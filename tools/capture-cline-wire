@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+#
+# capture-cline-wire — record one real Cline round, byte for byte, on the wire.
+#
+#   tools/capture-cline-wire [--plan surgical] [--dir DIR]
+#
+# WHY THIS IS WORTH A ROUND OF GPU TIME
+#
+# Cline is the largest unexplained variable in this project. Direct HTTP reports at 100% on the
+# report turn where Cline reports at 57%, and every explanation offered for that gap has been an
+# inference about what the client sends, because nobody has ever looked. Cline's own logs record
+# what it decided, not what it transmitted: not the system prompt, not the tool schemas, not the
+# exact message array. One capture settles all three, and makes tools/replay-final-turn byte-exact
+# instead of a reconstruction.
+#
+# HOW
+#
+# tools/wire-log sits between Cline and llama-server as a transparent proxy, gzipping every request
+# and response with a greppable index. A second Cline config points at the proxy instead of the
+# server, so the real configuration is not disturbed and can still be used while this runs.
+#
+# WHAT IT WILL NOT DO
+#
+# It refuses while a benchmark holds the lock. A capture shares the GPU with whatever is running,
+# and — worse — its completions land in the same llama-server log that tools/peg-audit counts as
+# its denominator, so running one during a measured night silently corrupts that night's fault
+# rate. That is not hypothetical: the whole reason this was not captured on 2026-08-11 is that the
+# queue held the GPU from 22:42 to 08:00.
+
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$HERE/.." && pwd)"
+
+PLAN="surgical"
+DIR="$HOME/.cache/agent-handoff/wire/$(date -u +%Y%m%dT%H%M%SZ)"
+UPSTREAM_PORT="${LLAMACPP_PORT:-8071}"
+PROXY_PORT="${WIRE_PORT:-8072}"
+
+while (( $# > 0 )); do
+    case "$1" in
+    --plan) PLAN="${2:?--plan needs a slug}"; shift 2 ;;
+    --dir) DIR="${2:?--dir needs a path}"; shift 2 ;;
+    --port) PROXY_PORT="${2:?--port needs a number}"; shift 2 ;;
+    *) echo "unknown argument: $1" >&2; exit 64 ;;
+    esac
+done
+
+# The refusal that matters. See the header.
+if ! flock -n "${TMPDIR:-/tmp}/agent-handoff-bench.lock" -c true 2>/dev/null; then
+    echo "a benchmark is running and holds the bench lock." >&2
+    echo "A capture would share the GPU with it AND put its completions into the same" >&2
+    echo "llama-server log that tools/peg-audit counts, corrupting that run's fault rate." >&2
+    exit 1
+fi
+
+curl -fsS --max-time 5 "http://127.0.0.1:$UPSTREAM_PORT/health" >/dev/null 2>&1 || {
+    echo "no llama-server on :$UPSTREAM_PORT" >&2
+    exit 1
+}
+command -v cline >/dev/null || { echo "cline is not on PATH" >&2; exit 1; }
+
+mkdir -p "$DIR"
+CONFIG="$HOME/.cline-wire"
+
+echo "==> proxy :$PROXY_PORT -> :$UPSTREAM_PORT, capturing to $DIR"
+"$HERE/wire-log" --listen "$PROXY_PORT" --upstream "$UPSTREAM_PORT" --dir "$DIR" &
+PROXY_PID=$!
+# Kill the proxy however this exits, including on a failed round. A listener surviving its parent
+# would hold the port and make the next capture fail in a way that reads as a broken tool.
+trap 'kill "$PROXY_PID" 2>/dev/null' EXIT
+
+for _ in $(seq 20); do
+    curl -fsS --max-time 2 "http://127.0.0.1:$PROXY_PORT/health" >/dev/null 2>&1 && break
+    sleep 0.5
+done
+curl -fsS --max-time 2 "http://127.0.0.1:$PROXY_PORT/health" >/dev/null 2>&1 || {
+    echo "the proxy never came up on :$PROXY_PORT" >&2
+    exit 1
+}
+
+echo "==> writing a Cline config at $CONFIG pointed at the proxy"
+LLAMACPP_PORT="$PROXY_PORT" HANDOFF_CLINE_CONFIG="$CONFIG" \
+    "$HERE/setup-local-implementer" >/dev/null || {
+    echo "setup-local-implementer failed" >&2
+    exit 1
+}
+
+echo "==> one round of '$PLAN' through the proxy"
+CLONE="${BENCH_CLONE:-$HOME/dev/agent-handoff-bench}"
+( cd "$CLONE" && HANDOFF_CLINE_CONFIG="$CONFIG" LLAMACPP_PORT="$PROXY_PORT" \
+    ./bench/run --plan "$PLAN" --providers lcgptossl --repeat 1 --force )
+RC=$?
+
+echo
+echo "capture in $DIR"
+[[ -f "$DIR/index.jsonl" ]] && echo "  $(wc -l <"$DIR/index.jsonl") exchange(s) recorded"
+cat <<EOF
+
+What it is for, in the order the questions were asked:
+
+  the system prompt   zcat \$(ls $DIR/*req*.gz | head -1) | python3 -c \\
+                        'import json,sys; print(json.load(sys.stdin)["messages"][0]["content"])'
+  the tool schemas    ... | python3 -c 'import json,sys; print([t["function"]["name"] for t in json.load(sys.stdin)["tools"]])'
+  the report turn     the last request in $DIR/index.jsonl — feed it to
+                      tools/replay-final-turn --wire $DIR, which is byte-exact against this
+EOF
+exit "$RC"
