@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""report-audit-selftest — the channel classification, against logs built to confuse it.
+
+    tools/report-audit-selftest
+
+The first version of tools/report-audit decided "a report arrived" from the size of
+handoff-report.json, and reported 100% of rounds as having reported — including two whose metrics
+said patch-ok-no-report, because their report files held `(no final text captured)` and
+`{"final_text":""}`. A non-empty file is not a report.
+
+So every case here fixes both the channel AND the reason, and one of them exists purely to check
+that the tool still disagrees with itself loudly when its two derivations diverge.
+"""
+
+from __future__ import annotations
+
+import json
+import pathlib
+import subprocess
+import sys
+import tempfile
+
+HERE = pathlib.Path(__file__).resolve().parent
+TOOL = HERE / "report-audit"
+
+GOOD_REPORT = {"status": "complete", "summary": "done"}
+
+
+def ev(event: dict) -> str:
+    return json.dumps({"type": "agent_event", "event": event})
+
+
+def usage(tokens: int) -> str:
+    return ev({"type": "usage", "inputTokens": tokens, "outputTokens": 10})
+
+
+def tool_call(name: str) -> str:
+    return ev({"type": "content_end", "contentType": "tool", "toolName": name,
+               "output": {"query": "{}", "result": "ok", "success": True}})
+
+
+def peg() -> str:
+    return ev({"type": "error", "error": {"message":
+              "HTTP 500: does not match the expected peg-native format"}})
+
+
+CASES = [
+    ("submit_report is the tool channel",
+     [usage(5000), tool_call("submit_report")], GOOD_REPORT, "accepted",
+     {"channel": "tool", "depth": 5000}),
+
+    ("the fallback turn reports on attempt 1",
+     [usage(15000), ev({"type": "report_turn", "attempt": 1,
+                        "finishReason": "stop", "chars": 200})],
+     GOOD_REPORT, "accepted", {"channel": "fallback-1"}),
+
+    ("the fallback turn reports on attempt 2",
+     [usage(15000),
+      ev({"type": "report_turn", "attempt": 1, "finishReason": "stop", "chars": 900}),
+      ev({"type": "report_turn", "attempt": 2, "finishReason": "stop", "chars": 200})],
+     GOOD_REPORT, "accepted", {"channel": "fallback-2"}),
+
+    # The defect this suite exists for: a non-empty report file that is not a report.
+    ("a report file holding no status is not a report",
+     [usage(15000), peg()], {"final_text": ""}, "patch-ok-no-report",
+     {"channel": "none", "reason": "peg fault ended the call"}),
+
+    ("a retried peg fault is not blamed for the loss",
+     [usage(15000), peg(), ev({"type": "peg_retry", "attempt": 1, "of": 3}),
+      ev({"type": "report_turn", "attempt": 1, "finishReason": "stop", "chars": 40}),
+      ev({"type": "content_end", "contentType": "text", "text": "nope"})],
+     {"final_text": ""}, "patch-ok-no-report",
+     {"channel": "none", "reason": "fallback carried no report (40 chars)", "peg_retries": 1}),
+
+    ("an empty fallback is named as such",
+     [usage(15000), ev({"type": "report_turn", "attempt": 1,
+                        "finishReason": "stop", "chars": 0}),
+      ev({"type": "content_end", "contentType": "text", "text": ""})],
+     {}, "patch-ok-no-report", {"channel": "none", "reason": "fallback returned nothing"}),
+
+    ("depth is the largest request, not the last",
+     [usage(3000), usage(21000), usage(9000), tool_call("submit_report")],
+     GOOD_REPORT, "accepted", {"depth": 21000}),
+]
+
+
+def main() -> int:
+    if not TOOL.exists():
+        print("report-audit not found", file=sys.stderr)
+        return 2
+
+    failures = 0
+    with tempfile.TemporaryDirectory() as tmp:
+        for index, (name, lines, report, outcome, expected) in enumerate(CASES):
+            run = pathlib.Path(tmp) / f"case{index}"
+            run.mkdir()
+            (run / "provider.log").write_text("\n".join(lines) + "\n")
+            (run / "handoff-report.json").write_text(json.dumps(report))
+            (run / "metrics").write_text(f"outcome={outcome}\n")
+            proc = subprocess.run([sys.executable, str(TOOL), "--json", str(run)],
+                                  capture_output=True, text=True)
+            if proc.returncode != 0:
+                print(f"FAIL  {name}\n        exit {proc.returncode}: {proc.stderr[-200:]}")
+                failures += 1
+                continue
+            got = json.loads(proc.stdout)[0]
+            wrong = {k: (got.get(k), v) for k, v in expected.items() if got.get(k) != v}
+            if wrong:
+                print(f"FAIL  {name}")
+                for key, (actual, want) in wrong.items():
+                    print(f"        {key}: got {actual!r}, expected {want!r}")
+                failures += 1
+            else:
+                print(f"pass  {name}")
+
+        # The cross-check must fire when the two derivations disagree: a round whose metrics say
+        # the report was lost, but whose report file carries a status.
+        run = pathlib.Path(tmp) / "disagree"
+        run.mkdir()
+        (run / "provider.log").write_text(usage(9000) + "\n" + tool_call("submit_report") + "\n")
+        (run / "handoff-report.json").write_text(json.dumps(GOOD_REPORT))
+        (run / "metrics").write_text("outcome=patch-ok-no-report\n")
+        proc = subprocess.run([sys.executable, str(TOOL), str(run)],
+                              capture_output=True, text=True)
+        if "DISAGREEMENT" in proc.stdout:
+            print("pass  a channel that contradicts bench/run's outcome is reported, not hidden")
+        else:
+            print("FAIL  a channel that contradicts bench/run's outcome was not reported")
+            failures += 1
+
+    print()
+    if failures:
+        print(f"{failures} check(s) failed")
+        return 1
+    print(f"{len(CASES) + 1} check(s) passed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

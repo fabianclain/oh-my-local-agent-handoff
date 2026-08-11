@@ -15,6 +15,7 @@
 #   shim-selftest        the tool-call shim (needs no model either)
 #   native-retry-selftest the native loop against a scripted server that returns parse faults
 #   turn-economy-selftest the redundancy counters, against a log built to trip them
+#   report-audit-selftest which channel each round's report came through, and why not
 #
 # smoke-e2e runs first and takes two seconds. It is the one to read when something is broken: the
 # others tell you a unit misbehaves, it tells you the pieces are no longer wired together.
@@ -29,7 +30,7 @@ REPO="$(cd "$HERE/.." && pwd)"
 cd "$REPO"
 FAILED=()
 
-for suite in smoke-e2e harness-selftest verifier-selftest feedback-selftest patch-shape-selftest shim-selftest native-retry-selftest turn-economy-selftest; do
+for suite in smoke-e2e harness-selftest verifier-selftest feedback-selftest patch-shape-selftest shim-selftest native-retry-selftest turn-economy-selftest report-audit-selftest; do
     [[ -x "$HERE/$suite" ]] || { echo "SKIP  $suite (missing)"; continue; }
     printf '%-24s ' "$suite"
     out="$(timeout 900 "$HERE/$suite" 2>&1)"; rc=$?

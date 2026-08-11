@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""report-audit — where each round's report came from, and where the lost ones went.
+
+    tools/report-audit bench/results/wide/native [...]
+    tools/report-audit --json bench/results/wide/*/
+
+The project spent months attributing missing reports to the model declining to write one. It does
+not decline. Two mechanisms account for nearly all of it, and they need different fixes:
+
+  * llama.cpp's harmony parser rejects the completion, the server answers 500, and the provider
+    call ENDS. Across 71 archived runs a peg fault ended the call in 13 of 13 segments, and 22 of
+    29 runs that hit one lost their report against 1 of 42 that did not (Fisher p = 2.5e-11).
+  * the fallback turn is reached and produces something that is not a report: an empty response,
+    reasoning truncated mid-sentence, prose, or -- the one that took longest to see -- a tool call
+    emitted as plain text, with the real report nested inside its `content` argument.
+
+So the useful question is not "did the round report" but "through which channel, at what depth,
+and if not, which of those happened". That is what this prints.
+
+CHANNELS
+
+    tool          submit_report was called. Costs no extra turn. Dominant below ~9k.
+    fallback-N    the no-tools report turn, on attempt N.
+    none          no report reached the harness.
+
+Every fact here comes from the event log the harness wrote at the time, never from the report's own
+claims. Depth is the largest `inputTokens` the round reached, which is the conversation's own size
+rather than a proxy for it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import sys
+from collections import Counter
+
+
+def metrics_of(run: pathlib.Path) -> dict:
+    values = {}
+    path = run / "metrics"
+    if path.exists():
+        for line in path.read_text().splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                values[key] = value
+    return values
+
+
+def analyse(run: pathlib.Path) -> dict:
+    depth = 0
+    peg_faults = 0
+    peg_retries = 0
+    report_turns = []
+    saw_report_tool = False
+    finishes = []
+    last_text = ""
+
+    for line in (run / "provider.log").read_text(errors="replace").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if record.get("type") == "run_result":
+            finishes.append(record.get("finishReason"))
+            continue
+        event = record.get("event") or {}
+        kind = event.get("type")
+        if kind == "usage":
+            depth = max(depth, event.get("inputTokens") or 0)
+        elif kind == "error":
+            if "peg-native" in str(event.get("error")):
+                peg_faults += 1
+        elif kind == "peg_retry":
+            peg_retries += 1
+        elif kind == "report_turn":
+            report_turns.append(event)
+        elif kind == "content_end":
+            if event.get("contentType") == "tool" and event.get("toolName") in (
+                    "submit_report", "attempt_completion"):
+                saw_report_tool = True
+            elif event.get("contentType") == "text":
+                last_text = event.get("text") or ""
+
+    # "A report arrived" means a JSON object carrying `status`, not a non-empty file. The first
+    # version tested `size > 2` and called every round reported, including two whose metrics said
+    # patch-ok-no-report: one file held the literal text "(no final text captured)" and another
+    # {"final_text":""}. Both are the harness recording that nothing usable came back.
+    report_file = run / "handoff-report.json"
+    reported = False
+    if report_file.exists():
+        try:
+            body = json.loads(report_file.read_text())
+            reported = isinstance(body, dict) and bool(body.get("status"))
+        except ValueError:
+            reported = False
+    outcome = metrics_of(run).get("outcome", "?")
+
+    if saw_report_tool:
+        channel = "tool"
+    elif reported and report_turns:
+        channel = f"fallback-{report_turns[-1].get('attempt', '?')}"
+    elif reported:
+        # A report reached the harness with no report_turn event: an older log, from before that
+        # event existed. Say so rather than guessing a channel.
+        channel = "fallback-unlogged"
+    else:
+        channel = "none"
+
+    # Why it was lost, when it was. Ordered by which fix it argues for.
+    reason = ""
+    if channel == "none":
+        if peg_faults and peg_faults > peg_retries:
+            reason = "peg fault ended the call"
+        elif "turn-limit" in finishes:
+            reason = "turn limit reached"
+        elif "context-budget" in finishes:
+            reason = "context budget reached"
+        elif report_turns and not last_text.strip():
+            reason = "fallback returned nothing"
+        elif report_turns:
+            last = report_turns[-1]
+            if last.get("finishReason") == "length":
+                reason = "fallback truncated"
+            else:
+                reason = f"fallback carried no report ({last.get('chars', '?')} chars)"
+        else:
+            reason = "no fallback turn recorded"
+
+    return {"run": str(run), "outcome": outcome, "depth": depth, "channel": channel,
+            "reason": reason, "peg_faults": peg_faults, "peg_retries": peg_retries,
+            "report_turns": len(report_turns), "finishes": finishes}
+
+
+def runs_under(target: pathlib.Path) -> list[pathlib.Path]:
+    if (target / "provider.log").exists():
+        return [target]
+    return sorted((p.parent for p in target.glob("*/provider.log")),
+                  key=lambda p: (len(p.name), p.name))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("targets", nargs="+", type=pathlib.Path)
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+
+    rows = [analyse(run) for target in args.targets for run in runs_under(target)]
+    if not rows:
+        print("no runs found", file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+
+    print(f'{"run":34} {"depth":>7} {"channel":18} {"peg":>5} why')
+    for row in rows:
+        parts = pathlib.Path(row["run"]).parts
+        name = "/".join(parts[-3:]) if len(parts) >= 3 else row["run"]
+        peg = f'{row["peg_faults"]}/{row["peg_retries"]}r' if row["peg_faults"] else "-"
+        print(f'{name:34} {row["depth"]:7d} {row["channel"]:18} {peg:>5} {row["reason"]}')
+
+    # A cross-check rather than a comment. `outcome` is derived from the tree by bench/run, and
+    # this tool derives its channel from the event log and the report file. Two derivations of the
+    # same fact must be compared, or one of them silently becomes fiction -- which is how a first
+    # version of this tool printed "100% reported" over runs whose metrics said otherwise.
+    disagreements = [r for r in rows
+                     if (r["channel"] == "none") != (r["outcome"] == "patch-ok-no-report")
+                     and r["outcome"] in ("accepted", "patch-ok-no-report")]
+    if disagreements:
+        print("\n  DISAGREEMENT with bench/run's outcome on "
+              f"{len(disagreements)} run(s) — one of the two is wrong:")
+        for row in disagreements:
+            print(f'    {row["run"]}: channel={row["channel"]} outcome={row["outcome"]}')
+
+    channels = Counter(r["channel"] for r in rows)
+    print(f'\n{len(rows)} run(s)')
+    for channel, count in channels.most_common():
+        print(f'  {channel:20} {count:3d}  ({count / len(rows):.0%})')
+
+    faults = sum(r["peg_faults"] for r in rows)
+    retries = sum(r["peg_retries"] for r in rows)
+    if faults:
+        print(f'  peg faults {faults}, of which {retries} were retried '
+              f'({retries / faults:.0%} recovered rather than ending the call)')
+
+    # Depth is the variable the shallow-fixture result missed, so it is printed rather than
+    # available on request.
+    bands = [(0, 9000, "below 9k"), (9000, 20000, "9k-20k"), (20000, 10 ** 9, "above 20k")]
+    print('\n  depth band     n   reported   via tool')
+    for low, high, label in bands:
+        band = [r for r in rows if low <= r["depth"] < high]
+        if not band:
+            continue
+        got = sum(1 for r in band if r["channel"] != "none")
+        tool = sum(1 for r in band if r["channel"] == "tool")
+        print(f'  {label:12} {len(band):3d}   {got:3d} ({got / len(band):3.0%})  '
+              f'{tool:3d} ({tool / len(band):3.0%})')
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
