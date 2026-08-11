@@ -768,6 +768,105 @@ Written the same day, each caught by testing the guard against the exact failure
 than the model have produced this?* — and none by inspection or reasoning. A guard that has not
 been run against the failure it was written for is an assumption wearing a test's clothes.
 
+### The missing reports, finally attributed — 2026-08-11, overnight
+
+The entry above says the report is *"written in full, and llama.cpp's harmony parser discards it."*
+That is half the mechanism, and the missing half is the actionable one.
+
+**The 500 ends the provider call, and nothing retries.** Measured over the 71 archived runs that
+predate the fix, by segmenting each `provider.log` on `run_result` rather than reading it whole:
+
+| | n | Ended `patch-ok-no-report` |
+| --- | ---: | ---: |
+| a peg fault occurred | 29 | **22 (76%)** |
+| none occurred | 42 | 1 (2%) |
+
+Fisher p = 2.5 × 10⁻¹¹. And in **13 of 13** provider calls containing a fault, *zero* tool calls
+followed it — under the native loop and under Cline alike. Neither client re-asks.
+
+Two instrument errors on the way to that number, both caught by cross-checks:
+
+- The first count said the fault appeared in native arms only, 3 of 8 against 0 of 63. It was a
+  grep for `"HTTP 500`, which is native's formatting; Cline records the identical fault as an
+  `Error` event naming the peg parser. It hits both, at 8 of 20 on `lcgptossl`.
+- The second said native *recovered* — 29 tool calls after the fault. Those were attempt 2. Per
+  provider call the figure is zero, every time.
+
+**`tools/native-agent` now retries a peg 500 with the conversation unchanged.** A retry costs one
+completion; breaking costs every turn the loop had left. It cannot help the deterministic repro
+recorded above — greedy decoding reproduces the same malformed harmony — but production runs at
+temperature 0.8, where re-asking draws a different sample.
+
+### And the 100% that was measured on a shallow fixture
+
+Removing tools for the report turn measured 44% → 100%, and that number was taken on a conversation
+of a few hundred tokens. Audited across the native rounds that existed:
+
+| Conversation depth | The report arrives by | Fallback turn needed | Fallback failed |
+| --- | --- | ---: | ---: |
+| 4.4k–8.8k (`surgical`, `semantic`) | the `submit_report` **tool** | 1 of 7 | 0 |
+| 14k–25k (`wide`) | the fallback, always | 4 of 4 | **3 of 4** |
+
+The three failures are three different things: an empty response, a page of reasoning truncated
+mid-sentence, and 62 characters of prose. So "no tools ⇒ 100%" is a shallow-conversation result,
+and deep rounds were relying on it.
+
+Worse, the harness could not see any of it: the report turn logged no `finish_reason`, no length
+and no usage, so a truncated answer and a refusal looked identical from outside. It logs all three
+now, is asked twice — the second time saying what was wrong with the first — and its JSON is found
+by a brace-balanced scan rather than `re.search(r"\{.*\}")`, which was greedy and string-blind and
+had already lost a report by matching a shell brace inside reasoning about `php -l ${f}`.
+
+### Wrong about which stack was under test, for forty minutes of a ten-hour night
+
+The queue file said 98304. The handoff prompt said 98304. The server was running `-c 32768`, left
+over from an afternoon of report probing, and the queue adopted it because nothing asserted it:
+
+- `doctor` prints the served context and only objects **below** 32768, so at exactly 32768 it
+  passed in silence.
+- `provider_preflight` checks `/health`, which cannot report settings.
+- `native`'s `provider_manifest` **replaced** the one it inherits from `lcpp.sh`, and that is the
+  only place `server_props` is recorded. Every Cline result file had carried `n_ctx` all along;
+  the native arms — the three that ran — carried nothing.
+
+Found by reading a `context-budget` message that named the wrong window, not by any check. The
+distortion was not hypothetical: `nativewhole` stopped on the context budget in **three of three**
+provider calls at ~28.8k, which reads as whole-file writes exhausting the window and is really the
+window being a third of the stated size. Round 15 would have been answered wrongly.
+
+`HANDOFF_EXPECT_CTX` now makes the served context an assertion, and native's manifest extends the
+inherited one instead of replacing it. Same lesson as `.handoff/scratch/`: **two tools that record
+or judge the same fact must be checked against each other**, and the one that quietly records
+*less* is the dangerous one, because nothing it produces can contradict you.
+
+### Whole-file writes do not truncate. They invite diff syntax
+
+Round 15's feared trade-off was truncation. Across the runs measured, whole-file writes truncated
+nothing — every file came back complete. What went wrong instead:
+
+    -}
+    ++
+    ++    /**
+    ++     * Render the total in the requested currency.
+    ++     */
+    ++    public function summaryIn(...): string
+    + }
+
+Read past the diff's own `+` column: the file contains a literal `+` on every added line and a
+literal leading space on the unchanged closing brace. Forced to write whole files, the model
+rendered its addition **as a patch** and wrote the patch into the `.php` file. One parse error at
+line 67 failed all nine functional criteria, because every one loads the file before testing it —
+2 of 11, through two attempts, 394 seconds and 71 model requests.
+
+Rare: 2 runs of 73 across the archive. Total when it happens. `write_file` and `replace_in_file`
+now run the language's parse check as a **postcondition** and hand the error back on the turn the
+file is written — which is not the disproved arm that *instructed* the model to run a linter
+(n=20 per side, damage identical at 5/20, 38% slower). Instructions are not a mechanism.
+
+Also corrected in passing: a first count of "3 runs hit a syntax error" matched `PHP Fatal error`
+as well, and `Call to undefined method` means the work is unfinished, not that the file is corrupt.
+Different failure, different fix.
+
 ---
 
 ## 9. Harness improvements
