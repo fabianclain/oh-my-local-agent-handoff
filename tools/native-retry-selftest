@@ -148,16 +148,7 @@ def check_extractor() -> tuple[int, int]:
     The old expression was `re.search(r"\\{.*\\}", text, re.S)`: greedy, string-blind, and happy to
     start a match on a shell brace in the middle of a sentence.
     """
-    # native-agent has no .py suffix, so spec_from_file_location cannot pick a loader by
-    # extension and returns None. Name the loader instead of renaming the tool.
-    import importlib.util
-    from importlib.machinery import SourceFileLoader
-
-    spec = importlib.util.spec_from_file_location(
-        "native_agent", AGENT, loader=SourceFileLoader("native_agent", str(AGENT)))
-    native = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(native)
-    extract = native.extract_json_object
+    extract = load_agent().extract_json_object
 
     cases = [
         ("plain object", '{"status": "complete"}', {"status": "complete"}),
@@ -204,6 +195,72 @@ def check_extractor() -> tuple[int, int]:
     return len(cases), failures
 
 
+def check_syntax_note() -> tuple[int, int]:
+    """The post-write parse check, against the corruption that motivated it.
+
+    The `+`-prefixed content below is verbatim from wide/nativewhole/1, where the model was forced
+    into whole-file writes and rendered its addition in diff syntax. One parse error at line 67
+    failed all nine functional criteria, because every one loads the file first.
+    """
+    native = load_agent()
+    import shutil as _shutil
+
+    broken_php = (
+        "<?php\n"
+        "final class OrderReport\n"
+        "{\n"
+        "    public function summary(): string { return 'x'; }\n"
+        "+\n"
+        "+    public function summaryIn(string $c): string\n"
+        "+    {\n"
+        "+        return 'Total';\n"
+        "+    }\n"
+        " }\n"
+    )
+    good_php = "<?php\nfinal class A { public function b(): int { return 1; } }\n"
+
+    cases = [
+        ("a valid .php file draws no warning", "ok.php", good_php, False),
+        ("diff-prefixed content is caught", "broken.php", broken_php, True),
+        ("a truncated .php file is caught", "cut.php", "<?php\nfinal class A {\n", True),
+        ("a valid .sh file draws no warning", "ok.sh", "#!/bin/bash\necho hi\n", False),
+        ("a broken .sh file is caught", "bad.sh", "#!/bin/bash\nif true; then\n", True),
+        # No checker for this extension, so silence is correct: the tool must not invent a verdict
+        # about a language it cannot parse.
+        ("an extension with no checker is left alone", "notes.txt", "+ this is fine\n", False),
+    ]
+    failures = 0
+    with tempfile.TemporaryDirectory() as tmp:
+        for name, filename, content, expect_warning in cases:
+            suffix = pathlib.Path(filename).suffix
+            command = native.SYNTAX_CHECKS.get(suffix)
+            if command and not _shutil.which(command[0]):
+                print(f"skip  syntax: {name} ({command[0]} not installed)")
+                continue
+            path = pathlib.Path(tmp) / filename
+            path.write_text(content)
+            note = native.syntax_note(path)
+            if bool(note) != expect_warning:
+                print(f"FAIL  syntax: {name}")
+                print(f"        warning={bool(note)}, expected {expect_warning}: {note[:120]!r}")
+                failures += 1
+            else:
+                print(f"pass  syntax: {name}")
+    return len(cases), failures
+
+
+def load_agent():
+    """native-agent has no .py suffix, so a loader must be named explicitly."""
+    import importlib.util
+    from importlib.machinery import SourceFileLoader
+
+    spec = importlib.util.spec_from_file_location(
+        "native_agent", AGENT, loader=SourceFileLoader("native_agent", str(AGENT)))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def main() -> int:
     if not AGENT.exists():
         print("native-agent not found", file=sys.stderr)
@@ -246,9 +303,10 @@ def main() -> int:
     ]
 
     extractor_cases, extractor_failures = check_extractor()
+    syntax_cases, syntax_failures = check_syntax_note()
     loop_failures = sum(0 if run_case(*case) else 1 for case in cases)
-    failures = extractor_failures + loop_failures
-    total = extractor_cases + len(cases)
+    failures = extractor_failures + syntax_failures + loop_failures
+    total = extractor_cases + syntax_cases + len(cases)
     print()
     if failures:
         print(f"{failures} check(s) failed")

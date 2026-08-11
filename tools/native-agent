@@ -48,6 +48,7 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -245,6 +246,51 @@ def atomic_write(path: pathlib.Path, content: str) -> None:
                         f"({len(content)} bytes requested, {len(landed)} on disk)")
 
 
+# A syntax checker per extension, run after a write. Each must be a pure parse check that touches
+# nothing and returns non-zero on a broken file. Anything absent from the machine is skipped.
+SYNTAX_CHECKS = {
+    ".php": ["php", "-l"],
+    ".py": ["python3", "-m", "py_compile"],
+    ".sh": ["bash", "-n"],
+    ".bash": ["bash", "-n"],
+}
+
+
+def syntax_note(path: pathlib.Path) -> str:
+    """Parse what was just written, and say so in the tool result if it is broken.
+
+    This is a POSTCONDITION, not an instruction, and the distinction is the whole point.
+    docs/local-models.md records an arm that told the model to run the syntax checker after every
+    write: n=20 per side, damage identical at 5/20, 38% slower, 37% more tokens. Instructions are
+    not a mechanism. Running the check in the tool is.
+
+    What it targets, from an observed round: forced into whole-file writes, the model rendered its
+    addition in DIFF syntax -- every new line prefixed with `+`, the context line with a literal
+    space -- and wrote that into the .php file. One parse error at line 67 made every one of the
+    nine functional criteria fail, because each one loads the file first. The round scored 2 of 11
+    and stayed broken through a second attempt, since nothing told the model the file would not
+    parse. It cost 394 seconds and 71 model requests.
+
+    The file is NOT reverted. A write that parses badly may still be most of the work, and the
+    model is the thing best placed to fix it -- it just has to be told.
+    """
+    command = SYNTAX_CHECKS.get(path.suffix)
+    if not command or not shutil.which(command[0]):
+        return ""
+    try:
+        done = subprocess.run(command + [str(path)], capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        # A checker that will not run is not evidence about the file, so say nothing rather than
+        # reporting a syntax error the file may not have.
+        return ""
+    if done.returncode == 0:
+        return ""
+    detail = (done.stdout + done.stderr).strip().splitlines()
+    return ("\nWARNING: the file does not parse. " +
+            (detail[0] if detail else f"{command[0]} exited {done.returncode}") +
+            "\nFix it before doing anything else; every check that loads this file will fail.")
+
+
 def clamp(text: str) -> str:
     if len(text) <= OUTPUT_CAP:
         return text
@@ -279,7 +325,8 @@ def run_tool(repo: pathlib.Path, name: str, args: dict) -> str:
             content = args.get("content") or ""
             atomic_write(path, content)
             where = path.relative_to(repo.resolve())
-            return f"wrote {where} ({len(content)} bytes, {content.count(chr(10)) + 1} lines)"
+            return (f"wrote {where} ({len(content)} bytes, {content.count(chr(10)) + 1} lines)"
+                    + syntax_note(path))
 
         if name == "replace_in_file":
             path = resolve(repo, args["path"])
@@ -296,7 +343,7 @@ def run_tool(repo: pathlib.Path, name: str, args: dict) -> str:
             if hits > 1:
                 return f"error: `old` appears {hits} times in {args['path']}; make it unique"
             atomic_write(path, body.replace(old, args.get("new") or "", 1))
-            return f"replaced 1 occurrence in {args['path']}"
+            return f"replaced 1 occurrence in {args['path']}" + syntax_note(path)
 
         if name == "run_commands":
             out = []
