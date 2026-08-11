@@ -935,5 +935,175 @@ else
 fi
 
 echo
+echo "11. regressions — one check per bug found on 2026-08-11"
+
+# Each of these is a defect that shipped, produced a confident wrong number, and was found by
+# accident or by a cross-check rather than by a test. The point of the phase is that none of them
+# can come back quietly.
+
+# --- bench/run crashed on every early-failure path -----------------------------------------------
+# write_metrics read ATTEMPTS, which only the attempt loop set. Under `set -u` a preflight failure
+# aborted with "line 408: unbound variable" and no record of the actual cause — the worst possible
+# behaviour for an unattended run, and it masked a real "provider adapter not found".
+rm -rf "$REPO/bench/results/surgical/nosuchprovider"
+EARLY="$( cd "$REPO" && BENCH_LOCK_HELD=1 ./bench/run --plan surgical \
+    --providers nosuchprovider --repeat 1 2>&1 )"
+if grep -q 'unbound variable' <<<"$EARLY"; then
+    fail "bench/run still aborts on an unbound variable when a provider is missing"
+elif [[ -f "$REPO/bench/results/surgical/nosuchprovider/1/metrics" ]] &&
+     grep -q '^attempts=' "$REPO/bench/results/surgical/nosuchprovider/1/metrics"; then
+    pass "a missing provider is recorded with a reason instead of crashing"
+else
+    fail "bench/run left no metrics for a missing provider"
+fi
+rm -rf "$REPO/bench/results/surgical/nosuchprovider"
+
+# --- the prompt was never recorded ---------------------------------------------------------------
+# An arm whose whole variable is a prompt layer can be a silent no-op, and every artifact looks
+# identical to a working arm. This was found by being unable to answer that question at all.
+PROMPT_FILE="$(ls "$SANDBOX"/*/.handoff/runs/*/prompt.md 2>/dev/null | head -1)"
+if [[ -n "$PROMPT_FILE" ]] && grep -q 'EDITING RULES' "$PROMPT_FILE" 2>/dev/null; then
+    pass "each run records the prompt it was actually sent, rules included"
+else
+    fail "no prompt.md recorded — a prompt-layer change cannot be verified after the fact"
+fi
+
+# --- a stale server passed for a new one ---------------------------------------------------------
+# Structural rather than behavioural on purpose: exercising cmd_start would kill whatever
+# llama-server is running on this machine, which is not something a test suite may do.
+if grep -q 'pgrep -x "llama-server"' "$REPO/tools/llamacpp-serve"; then
+    pass "llamacpp-serve stops servers by name, so a different build is still found"
+else
+    fail "cmd_stop matches \$LLAMA_SERVER again — changing builds orphans the running server"
+fi
+if grep -q 'serving_path" != "\$gguf' "$REPO/tools/llamacpp-serve"; then
+    pass "start verifies which model the port is actually serving"
+else
+    fail "start accepts any answer on the port — a stale server passes for a new one"
+fi
+
+# --- replay accepted a conversation with no room to answer ---------------------------------------
+# 16,145 tokens against a 16,384 window leaves 239 to generate in. Every sample came back empty and
+# read as a total model failure.
+mkdir -p "$SANDBOX/wire-fix"
+python3 - "$SANDBOX/wire-fix" <<'MKWIRE'
+import gzip, json, pathlib, sys
+d = pathlib.Path(sys.argv[1]); d.mkdir(parents=True, exist_ok=True)
+body = {"messages": [{"role": "user", "content": "x" * 40000}], "tools": []}
+with gzip.open(d / "req-00001.json.gz", "wt") as h:
+    json.dump(body, h)
+(d / "index.jsonl").write_text(json.dumps({"seq": 1, "response": {}}) + "\n")
+MKWIRE
+python3 - <<'SMALLCTX' &
+import http.server, json, socketserver
+class P(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def log_message(self, *a): pass
+    def do_GET(self):
+        out = json.dumps({"default_generation_settings": {"n_ctx": 4096}}).encode()
+        self.send_response(200); self.send_header("Content-Length", str(len(out))); self.end_headers()
+        self.wfile.write(out)
+socketserver.TCPServer.allow_reuse_address = True
+with socketserver.TCPServer(("127.0.0.1", 8077), P) as s: s.serve_forever()
+SMALLCTX
+CTX_PID=$!
+sleep 1
+( "$REPO/tools/replay-final-turn" --wire "$SANDBOX/wire-fix" --port 8077 --repeat 1 ) >/dev/null 2>&1
+REPLAY_STATUS=$?
+kill "$CTX_PID" 2>/dev/null; wait "$CTX_PID" 2>/dev/null
+if [[ "$REPLAY_STATUS" -eq 2 ]]; then
+    pass "replay refuses a conversation with no headroom to answer in"
+else
+    fail "replay ran a conversation larger than the window (exit $REPLAY_STATUS); every sample would be empty"
+fi
+
+# --- native: the tool layer must own its own faults ----------------------------------------------
+if python3 - <<'NATIVE'
+import importlib.machinery, importlib.util, io, json, pathlib, sys, tempfile
+l = importlib.machinery.SourceFileLoader("na", "tools/native-agent")
+na = importlib.util.module_from_spec(importlib.util.spec_from_loader("na", l)); l.exec_module(na)
+d = pathlib.Path(tempfile.mkdtemp())
+
+# errors="replace" would return mangled text and say nothing; the model then writes the corruption
+# back and it is attributed to the model.
+(d / "bad.php").write_bytes(b"<?php\n\xff\xfe\n")
+buf = io.StringIO()
+out = na.dispatch(d, "read_files", {"files": [{"path": "bad.php"}]}, "c", buf)
+events = [json.loads(x) for x in buf.getvalue().splitlines()]
+assert "not valid UTF-8" in out, "a non-UTF8 file was read without complaint"
+assert any(e.get("event", {}).get("fault") == "encoding" for e in events), "no fault tag"
+assert any("tool-encoding fault" in (e.get("event", {}).get("error", {}) or {}).get("message", "")
+           for e in events), "no classifiable error event"
+
+# a write must land whole, verify, and leave nothing behind
+buf = io.StringIO()
+na.dispatch(d, "write_file", {"path": "n.php", "content": "<?php\n// ok\n"}, "c2", buf)
+assert (d / "n.php").read_text() == "<?php\n// ok\n", "write did not land"
+assert not list(d.glob("*.native-tmp")), "a temporary file was left behind"
+
+# the context budget the docstring promised and did not have
+assert na.RESERVE_FOR_REPORT > 0, "no reserve for the report turn"
+sys.exit(0)
+NATIVE
+then
+    pass "native tools raise named faults instead of corrupting silently"
+else
+    fail "native's tool layer no longer distinguishes a harness fault from a model failure"
+fi
+
+# --- a harness fault must not be filed under the model's errors ----------------------------------
+if python3 - <<'CLASSES'
+import importlib.machinery, importlib.util, sys
+l = importlib.machinery.SourceFileLoader("j", "tools/journal")
+j = importlib.util.module_from_spec(importlib.util.spec_from_loader("j", l)); l.exec_module(j)
+cases = {
+    "tool-encoding fault in read_files: not UTF-8": "harness-encoding",
+    "tool-postcondition fault in write_file: mismatch": "harness-postcondition",
+    # must beat the generic timeout rule, which sits below it
+    "tool-io fault in write_file: timed out": "harness-io",
+    "context-budget: ~95000 tokens against 32768": "context-budget",
+    "exceeds the available context size": "context-overflow",
+}
+for message, want in cases.items():
+    got = j.classify_error(message)
+    assert got == want, f"{message!r} classified {got}, expected {want}"
+sys.exit(0)
+CLASSES
+then
+    pass "journal files harness faults as harness faults, ordering included"
+else
+    fail "journal's classifier lost the harness-* classes or their ordering"
+fi
+
+# --- native reported model_requests=0 -------------------------------------------------------------
+# It never defined the usage hooks, so bench/run counted nothing and cost comparisons were
+# impossible. It borrows lcpp's, which read the same server's log.
+if ( source "$REPO/providers/native.sh" >/dev/null 2>&1; declare -F provider_usage_since >/dev/null ); then
+    pass "native provides token accounting, so its rounds can be priced"
+else
+    fail "native defines no usage hooks — bench/run will record model_requests=0 again"
+fi
+
+# --- report-probe counted tool calls as discarded reports -----------------------------------------
+# The first version reported a 50% fault rate that did not exist. peg-audit disproved it by showing
+# the server had logged no parse failures for those turns.
+if python3 - <<'PROBE'
+import importlib.machinery, importlib.util, sys
+l = importlib.machinery.SourceFileLoader("rp", "tools/report-probe")
+rp = importlib.util.module_from_spec(importlib.util.spec_from_loader("rp", l)); l.exec_module(rp)
+diverted = {"choices": [{"message": {"role": "assistant", "content": "",
+                                     "tool_calls": [{"function": {"name": "run_commands"}}]}}]}
+discarded = {"choices": [{"message": {"role": "assistant", "content": ""}}], "usage": {}}
+assert rp.classify_response(diverted)[0] == "tool-call", "a tool call was counted as empty"
+assert rp.classify_response(discarded)[0] == "empty", "a discarded message was not counted"
+sys.exit(0)
+PROBE
+then
+    pass "a tool call is not counted as a discarded report"
+else
+    fail "report-probe conflates diverting to a tool with the parser discarding a message"
+fi
+
+echo
 if [[ "$FAILURES" -eq 0 ]]; then echo "all checks passed"; else echo "$FAILURES check(s) failed"; fi
 exit $(( FAILURES > 0 ? 1 : 0 ))
