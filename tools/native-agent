@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+"""native-agent — the implementation loop, owned by the harness instead of rented.
+
+    tools/native-agent --repo DIR --schema FILE --result FILE --log FILE \\
+        --system TEXT --prompt TEXT [--max-turns 40]
+
+WHY
+
+The harness already owns the plan, the prompt layers, the gates, the verification and the journal.
+The loop was the one rented part, and measurement kept arriving at fixes that could not be applied
+through it:
+
+  - dropping tools for the report turn measured 100% reporting against 44% with them registered,
+    and no client here exposes per-turn tool selection
+  - the client's system prompt and 25-tool schema add ~8k tokens to every request, invisible in
+    anything it logs, and conversation depth is what correlates with discarded output
+  - one round made 117 requests and 143k prompt tokens for a six-file change; that is loop
+    granularity, not the model needing 117 turns
+
+This is not a replacement for Cline. It is a second provider, so the two can be compared on the
+same plans, and so a bad idea here is reversible.
+
+WHAT IT CONTROLS THAT A CLIENT DOES NOT
+
+  the tool set          five tools, not twenty-five
+  the report turn       tools are REMOVED for it, which is the single largest measured effect
+  sampling              per turn, not per server
+  the turn budget       and what happens when it runs out
+  the context           it can refuse to overflow rather than discovering it afterwards
+
+EVENT LOG COMPATIBILITY
+
+The log is written in Cline's event shape on purpose. tools/journal, tools/final-turn-shape and
+tools/replay-final-turn all mine that format, and a native loop that logged its own dialect would
+silently drop out of every existing measurement.
+
+SAFETY
+
+run_commands executes arbitrary shell in the repository, exactly as the rented loop did. Nothing
+here sandboxes that, and the guidance is unchanged: run against a git worktree with its own
+database, never a live one.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+TOOL_TIMEOUT = 120
+OUTPUT_CAP = 20000
+
+
+def emit(log, kind: str, event: dict) -> None:
+    log.write(json.dumps({"type": kind, "event": event} if kind == "agent_event" else
+                         {"type": kind, **event}) + "\n")
+    log.flush()
+
+
+# ------------------------------------------------------------------------------------------------
+# tools
+
+
+def tool_schemas(include_report: bool, schema: dict) -> list[dict]:
+    tools = [
+        {"type": "function", "function": {
+            "name": "read_files",
+            "description": "Read files from the repository.",
+            "parameters": {"type": "object", "required": ["files"], "properties": {
+                "files": {"type": "array", "items": {"type": "object", "properties": {
+                    "path": {"type": "string"}}}}}}}},
+        {"type": "function", "function": {
+            "name": "search",
+            "description": "Search the repository for a regular expression.",
+            "parameters": {"type": "object", "required": ["query"], "properties": {
+                "query": {"type": "string"}, "path": {"type": "string"}}}}},
+        {"type": "function", "function": {
+            "name": "write_file",
+            "description": "Write a file in full. Creates it if absent, replaces it if present.",
+            "parameters": {"type": "object", "required": ["path", "content"], "properties": {
+                "path": {"type": "string"}, "content": {"type": "string"}}}}},
+        {"type": "function", "function": {
+            "name": "replace_in_file",
+            "description": ("Replace one exact occurrence of `old` with `new` in a file. "
+                            "Fails if `old` is absent or appears more than once."),
+            "parameters": {"type": "object", "required": ["path", "old", "new"], "properties": {
+                "path": {"type": "string"}, "old": {"type": "string"}, "new": {"type": "string"}}}}},
+        {"type": "function", "function": {
+            "name": "run_commands",
+            "description": "Run shell commands in the repository root and return their output.",
+            "parameters": {"type": "object", "required": ["commands"], "properties": {
+                "commands": {"type": "array", "items": {"type": "string"}}}}}},
+    ]
+    if include_report:
+        tools.append({"type": "function", "function": {
+            "name": "submit_report",
+            "description": "Submit the completion report. Call this when the work is finished.",
+            "parameters": schema}})
+    return tools
+
+
+def clamp(text: str) -> str:
+    if len(text) <= OUTPUT_CAP:
+        return text
+    return text[:OUTPUT_CAP] + f"\n[... {len(text) - OUTPUT_CAP} bytes truncated]"
+
+
+def run_tool(repo: pathlib.Path, name: str, args: dict) -> str:
+    try:
+        if name == "read_files":
+            out = []
+            for item in args.get("files") or []:
+                path = repo / str(item.get("path", "")).lstrip("/")
+                if not path.exists():
+                    out.append(f"--- {item.get('path')} ---\n(no such file)")
+                    continue
+                # Deliberately NOT line-numbered. The rented loop returns numbered lines, and a
+                # model wrote the gutter back into a file — `  1 | # Add a discount` — corrupting
+                # it. Content in, content out.
+                out.append(f"--- {item.get('path')} ---\n{path.read_text(errors='replace')}")
+            return clamp("\n\n".join(out) or "(no files requested)")
+
+        if name == "search":
+            query = str(args.get("query", ""))
+            where = str(args.get("path") or ".")
+            proc = subprocess.run(["grep", "-rnE", "--", query, where], cwd=repo,
+                                  capture_output=True, text=True, timeout=TOOL_TIMEOUT)
+            return clamp(proc.stdout or f"no matches for {query!r}")
+
+        if name == "write_file":
+            path = repo / str(args["path"]).lstrip("/")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            content = args.get("content") or ""
+            path.write_text(content)
+            return f"wrote {args['path']} ({len(content)} bytes, {content.count(chr(10)) + 1} lines)"
+
+        if name == "replace_in_file":
+            path = repo / str(args["path"]).lstrip("/")
+            if not path.exists():
+                return f"error: {args['path']} does not exist"
+            body = path.read_text(errors="replace")
+            old = args.get("old") or ""
+            hits = body.count(old)
+            # Refusing an ambiguous match is the whole value of this tool over a patch grammar:
+            # the failure is reported on the turn it happens, not discovered in the diff.
+            if hits == 0:
+                return f"error: `old` not found in {args['path']}; the file is unchanged"
+            if hits > 1:
+                return f"error: `old` appears {hits} times in {args['path']}; make it unique"
+            path.write_text(body.replace(old, args.get("new") or "", 1))
+            return f"replaced 1 occurrence in {args['path']}"
+
+        if name == "run_commands":
+            out = []
+            for command in args.get("commands") or []:
+                proc = subprocess.run(["bash", "-o", "pipefail", "-c", command], cwd=repo,
+                                      capture_output=True, text=True, timeout=TOOL_TIMEOUT)
+                body = (proc.stdout or "") + (proc.stderr or "")
+                out.append(f"$ {command}\n{body}(exit {proc.returncode})")
+            return clamp("\n\n".join(out) or "(no commands)")
+
+    except subprocess.TimeoutExpired:
+        return f"error: {name} timed out after {TOOL_TIMEOUT}s"
+    except Exception as error:  # noqa: BLE001 — a tool fault is a result the model must see
+        return f"error: {name} failed: {type(error).__name__}: {error}"
+    return f"error: unknown tool {name}"
+
+
+# ------------------------------------------------------------------------------------------------
+# the loop
+
+
+def call_model(host: str, port: int, model: str, messages: list[dict], tools: list[dict],
+               temperature: float, timeout: int) -> dict:
+    payload = {"model": model, "messages": messages, "stream": False,
+               "temperature": temperature}
+    if tools:
+        payload["tools"] = tools
+    request = urllib.request.Request(f"http://{host}:{port}/v1/chat/completions",
+                                     data=json.dumps(payload).encode(),
+                                     headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8", "replace"))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--repo", type=pathlib.Path, required=True)
+    parser.add_argument("--schema", type=pathlib.Path, required=True)
+    parser.add_argument("--result", type=pathlib.Path, required=True)
+    parser.add_argument("--log", type=pathlib.Path, required=True)
+    parser.add_argument("--system", default="")
+    parser.add_argument("--prompt", default="")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8071)
+    parser.add_argument("--model", default="gpt-oss-20b")
+    parser.add_argument("--temp", type=float, default=0.8)
+    parser.add_argument("--max-turns", type=int, default=40)
+    parser.add_argument("--timeout", type=int, default=600)
+    args = parser.parse_args()
+
+    schema = json.loads(args.schema.read_text())
+    messages = [{"role": "system", "content": args.system},
+                {"role": "user", "content": args.prompt}]
+    totals = {"in": 0, "out": 0}
+    report = None
+    finish = "completed"
+
+    with args.log.open("a") as log:
+        for turn in range(1, args.max_turns + 1):
+            emit(log, "agent_event", {"type": "iteration_start", "iteration": turn})
+            try:
+                body = call_model(args.host, args.port, args.model, messages,
+                                  tool_schemas(True, schema), args.temp, args.timeout)
+            except urllib.error.HTTPError as error:
+                detail = error.read().decode("utf-8", "replace")[:300]
+                emit(log, "agent_event", {"type": "error",
+                                          "error": {"message": f"HTTP {error.code}: {detail}"}})
+                finish = "error"
+                break
+            except Exception as error:  # noqa: BLE001
+                emit(log, "agent_event", {"type": "error",
+                                          "error": {"message": f"{type(error).__name__}: {error}"}})
+                finish = "error"
+                break
+
+            usage = body.get("usage") or {}
+            totals["in"] += usage.get("prompt_tokens") or 0
+            totals["out"] += usage.get("completion_tokens") or 0
+            emit(log, "agent_event", {"type": "usage",
+                                      "inputTokens": usage.get("prompt_tokens"),
+                                      "outputTokens": usage.get("completion_tokens"),
+                                      "totalInputTokens": totals["in"],
+                                      "totalOutputTokens": totals["out"]})
+
+            choice = (body.get("choices") or [{}])[0]
+            message = choice.get("message") or {}
+            reasoning = message.get("reasoning_content")
+            if reasoning:
+                emit(log, "agent_event", {"type": "content_end", "contentType": "reasoning",
+                                          "reasoning": reasoning})
+            text = (message.get("content") or "").strip()
+            calls = message.get("tool_calls") or []
+
+            if text:
+                emit(log, "agent_event", {"type": "content_end", "contentType": "text",
+                                          "text": text})
+
+            if not calls:
+                # Nothing called and nothing to execute. The turn is spent; ask for the report
+                # below rather than looping on an empty exchange.
+                messages.append({"role": "assistant", "content": text or ""})
+                break
+
+            messages.append({"role": "assistant", "content": text or "",
+                             "tool_calls": calls})
+            done = False
+            for call in calls:
+                function = call.get("function") or {}
+                name = function.get("name") or "?"
+                raw = function.get("arguments")
+                try:
+                    parsed = json.loads(raw) if isinstance(raw, str) else (raw or {})
+                except ValueError:
+                    parsed = {}
+                    emit(log, "agent_event", {"type": "error", "error": {
+                        "message": f"{name} arguments did not parse as JSON"}})
+
+                if name == "submit_report":
+                    report = parsed
+                    emit(log, "agent_event", {"type": "content_end", "contentType": "tool",
+                                              "toolName": name, "toolCallId": call.get("id"),
+                                              "output": {"query": name, "result": "report received",
+                                                         "success": True}})
+                    done = True
+                    break
+
+                started = time.monotonic()
+                result = run_tool(args.repo, name, parsed)
+                emit(log, "agent_event", {
+                    "type": "content_end", "contentType": "tool", "toolName": name,
+                    "toolCallId": call.get("id"),
+                    "output": {"query": json.dumps(parsed)[:400], "result": result,
+                               "success": not result.startswith("error:")},
+                    "durationMs": int((time.monotonic() - started) * 1000)})
+                messages.append({"role": "tool", "tool_call_id": call.get("id"),
+                                 "name": name, "content": result})
+            if done:
+                break
+        else:
+            finish = "turn-limit"
+
+        # The report turn, asked with NO TOOLS IN SCOPE.
+        #
+        # This is the whole reason the loop is worth owning. Measured on the shallow fixture:
+        # 44% reporting with tools registered, 100% with none. The model diverts because it is
+        # asked to attest to work it could still go and check; removing the option removes the
+        # temptation without forbidding anything, which is what made tool_choice:"none" produce
+        # silence instead of reports.
+        if report is None:
+            emit(log, "agent_event", {"type": "iteration_start", "iteration": "report"})
+            ask = ("The work is finished. Reply with ONLY a JSON object matching this schema, "
+                   "as your final message. No prose, no code fence.\n\n"
+                   + json.dumps(schema, indent=2))
+            try:
+                body = call_model(args.host, args.port, args.model,
+                                  messages + [{"role": "user", "content": ask}],
+                                  [], args.temp, args.timeout)
+                final = ((body.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+                emit(log, "agent_event", {"type": "content_end", "contentType": "text",
+                                          "text": final})
+                match = re.search(r"\{.*\}", final, re.S)
+                if match:
+                    report = json.loads(match.group(0))
+            except Exception as error:  # noqa: BLE001
+                emit(log, "agent_event", {"type": "error", "error": {
+                    "message": f"report turn: {type(error).__name__}: {error}"}})
+
+        # A round whose conclusion was discarded by the parser and then recovered is not an
+        # error round, and labelling it one would send the journal's classifier to the wrong
+        # outcome. This happened on the very first native run: four clean tool calls, the work
+        # verified, then HTTP 500 "does not match the expected peg-native format" on the turn the
+        # model tried to conclude — and the no-tools report turn recovered a complete report.
+        # Under the rented loop that round is recorded as patch-ok-no-report.
+        if finish == "error" and report is not None:
+            finish = "recovered-report"
+
+        emit(log, "run_result", {"finishReason": finish,
+                                 "usage": {"inputTokens": totals["in"],
+                                           "outputTokens": totals["out"]},
+                                 "text": json.dumps(report) if report else ""})
+
+    args.result.write_text(json.dumps(report) if report is not None else "")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
