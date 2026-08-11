@@ -46,11 +46,39 @@
 #
 # It is also the reason doctor's cline check earns its keep. Without it the control arm would have
 # failed every round for a missing binary, and the native arms would have looked better for it.
+# A SECOND CONFOUND, and the reason this queue was restarted at 23:35.
+#
+# The first launch ran for forty minutes against a server started with `-c 32768`. Every document
+# involved -- this file, the handoff prompt, the roadmap -- said 98304. The server was a leftover
+# from an afternoon of report probing and nothing objected: doctor prints the served context but
+# only complains BELOW 32768, provider_preflight checks /health which cannot report settings, and
+# native's provider_manifest replaced the inherited one, which is the only place server_props is
+# recorded. The Cline arms had carried n_ctx in every result file all along. The native arms, which
+# were the three that ran, carried nothing.
+#
+# It was found by reading a context-budget message that named the wrong window, not by any check.
+# HANDOFF_EXPECT_CTX below is that check, and it now fails the queue before any GPU time is spent.
+#
+# Those forty minutes are in bench/archive/wide-*-ctx32768 rather than deleted. They are the only
+# measurement of this loop against a window it can exhaust -- nativewhole stopped on the context
+# budget in three of three provider calls at ~28.8k -- and at 98304 that will not reproduce. Read
+# as whole-file writes exhausting the window, it would have answered round 15 wrongly.
+#
+# A THIRD THING CHANGED, deliberately. The harness under test now includes tonight's fixes: the
+# peg-fault retry, the post-write syntax check, and the report turn asked twice with a brace-
+# balanced parser. The first two arms of the night measured the loop as it was; from here it is
+# the loop as it should be. Question 1 is unaffected -- both arms still run under ONE harness
+# commit, which is what it asks -- but nothing here is comparable with this morning's native
+# numbers, which were taken under a different harness AND a different window.
 CLONE="${BENCH_CLONE:-$HOME/dev/agent-handoff-bench}"
 HANDOFF="${HANDOFF_HOME:-$PWD}"
 
 export BENCH_TIMEOUT_SECONDS=1200
 export BENCH_MAX_ATTEMPTS=2
+
+# The stack, stated once and asserted rather than assumed. b10331, gpt-oss-20b, 98304, default
+# sampling. doctor fails if the server is serving anything else.
+export HANDOFF_EXPECT_CTX=98304
 
 # --- before any GPU time is spent ----------------------------------------------------------------
 

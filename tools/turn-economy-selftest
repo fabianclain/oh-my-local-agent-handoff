@@ -35,11 +35,15 @@ def call(name: str, args: dict, ok: bool = True, query: str | None = None) -> st
     """
     output = {"query": json.dumps(args) if query is None else query,
               "result": "ok" if ok else "error: nope", "success": ok}
+    event = {"type": "content_end", "contentType": "tool", "toolName": name,
+             "toolCallId": "x", "output": output}
+    # `args` is a sibling of `output`, not a member of it -- `output` is the tool's RESULT in
+    # Cline's shape and these are its inputs. The first version of this fixture put it inside
+    # `output`, matching what tools/turn-economy read but not what tools/native-agent writes, so
+    # every case passed against a format nothing produces. Verified against a real provider.log.
     if query is None:
-        output["args"] = args
-    return json.dumps({"type": "agent_event", "event": {
-        "type": "content_end", "contentType": "tool", "toolName": name,
-        "toolCallId": "x", "output": output}})
+        event["args"] = args
+    return json.dumps({"type": "agent_event", "event": event})
 
 
 CASES = [

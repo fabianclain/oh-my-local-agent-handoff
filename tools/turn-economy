@@ -115,7 +115,7 @@ def analyse(log: pathlib.Path) -> dict:
                       # tools/native-agent. Older logs and Cline logs have only `query`, which is
                       # capped at 400 characters, so those calls may still be unreadable -- and
                       # every rate below states the denominator it was computed over.
-                      "args": event.get("output", {}).get("args"),
+                      "args": event.get("args"),
                       "query": output.get("query") or ""})
 
     kinds = Counter()
