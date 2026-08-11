@@ -27,9 +27,9 @@ rendering tests.
 
 On mechanical change to code that exists: **90–100% of rounds produce a tree a reviewer can take**,
 measured over 48 runs, roughly five minutes each. About one round in four produces a correct patch
-with **no report at all**. That is a defect in the serving stack, not the model and not your plan —
-the report is generated in full and llama.cpp's harmony parser discards it. Judge the tree; never
-read anything into a missing report.
+with **no report at all**, and that is not a defect in your plan. One mechanism is confirmed — the
+report is generated in full and llama.cpp's harmony parser discards it — but it has not been shown
+to account for all of them. Judge the tree; never read anything into a missing report.
 
 **Hard arithmetic is a good fit, if you specify it completely.** Six runs on a plan requiring
 integer proration with largest-remainder allocation and half-up rounding produced five
@@ -223,12 +223,15 @@ If the **writes** column is 0, the model never attempted the task: an adapter fa
 overflow ate the round. Re-run the same plan once; do not re-specify it. Backfilling three real
 runs found a context overflow in all three, which had been read as the model failing.
 
-**A missing report is not a diagnosis.** It has exactly one known cause here, and it is not yours:
-the model emits the report, llama.cpp's harmony parser cannot map it, and the turn arrives as an
-error with no text. Across 48 runs the signature was identical every time — attempt 1 finishes in
-error with no text block, attempt 2 completes. Do not re-specify a plan over a missing report, and
-do not add instructions telling the model to remember to report. Both have been tried; neither can
-work, because the report is already being written.
+**A missing report is not a diagnosis, and it is not yours to fix.** Roughly a quarter of real
+rounds end this way. One mechanism is confirmed — the model emits the report, llama.cpp's harmony
+parser cannot map it, and the turn arrives as an error with no text — but it is **not confirmed to
+be the whole story**: replaying real conversations back at the model returns clean reports every
+time, so whatever costs the other rounds their report has not been reproduced yet.
+
+What follows holds either way. Do not re-specify a plan over a missing report, and do not add
+instructions telling the model to remember to report — that has been tried and cannot work, because
+the report is already being written. Judge the tree.
 
 `tools/peg-audit` reads the server's own log and will tell you how many were discarded, and at what
 conversation depth. If the depths cluster high, that is your step-size signal.
