@@ -25,15 +25,23 @@ rendering tests.
 
 ## What to expect
 
-~78% work on the first attempt, ~93% within three, roughly five minutes each — **on refactors**.
-About one run in three produces a correct patch with no report at all. That is normal. Judge the
-tree.
+On mechanical change to code that exists: **90–100% of rounds produce a tree a reviewer can take**,
+measured over 48 runs, roughly five minutes each. About one round in four produces a correct patch
+with **no report at all**. That is a defect in the serving stack, not the model and not your plan —
+the report is generated in full and llama.cpp's harmony parser discards it. Judge the tree; never
+read anything into a missing report.
+
+**Hard arithmetic is a good fit, if you specify it completely.** Six runs on a plan requiring
+integer proration with largest-remainder allocation and half-up rounding produced five
+implementations, and all five were correct under 4000 randomised trials each — including the
+tie-break rule and an odd-divisor rounding edge the plan did not spell out. Money, rounding and
+allocation are not the danger zone. *Underspecified* money is.
 
 **On greenfield work, expect much worse.** One real feature — new service, new Livewire view,
 aggregate SQL — went **0 accepted in 7 rounds**, best round 9 of 12 criteria. The reviewer then
-wrote the same service by hand and it passed 8/8 first run. Reach for this on mechanical change to
-code that exists; on greenfield design, expect to write the hard part yourself and hand the model
-the mechanical remainder.
+wrote the same service by hand and it passed 8/8 first run. The difference is not difficulty, it is
+who decides: the model executes a complete specification well and invents a poor one. On greenfield
+design, write the decisions yourself and hand over the mechanical remainder.
 
 ## The procedure
 
@@ -54,6 +62,26 @@ you could describe in a sentence and verify in three commands.
 
 Rough sizing, from what has been measured: **one to two files, three to six criteria, one
 coherent behaviour.** A step touching six files is a round; a step touching one is a step.
+
+**The real budget is conversation depth, not the context window.** The serving stack discards
+malformed output at a rate that tracks how deep the conversation has gone, and the cliff is sharp:
+
+| Conversation depth | Completions discarded |
+| --- | ---: |
+| below 16k tokens | 0.00% |
+| 16k–32k | 0.76% |
+| 32k–48k | 2.17% |
+| above 48k | 2.55–6.06% |
+
+A discarded call is not a retry — it is a turn that never reaches the client, so the model can
+spend its whole budget reading files and write nothing. Measured across two sessions at 96k and
+128k windows, and *the window made no difference*: a conversation that reaches 50k fails at the
+same rate whichever ceiling it runs under. Enlarging the window does not buy you a bigger step. It
+only stops you overflowing.
+
+So size a step by the conversation it will produce, not by the window it has available. A step that
+needs the model to read six files before it can write one is a deep conversation regardless of how
+few files it changes.
 
 **Be honest about what this buys.** It does *not* make the model more likely to succeed per step —
 the six-file plan actually scored slightly better on first attempt (87%) than the four-file one
@@ -138,6 +166,12 @@ Plans go where `.handoff/config.sh` says. Shape from `templates/plan.md`.
    caught it was an acceptance command returning 404. If you find yourself writing "remember to",
    you have found a missing criterion.
 
+   This has now been measured directly rather than argued. An arm whose only difference was an
+   instruction to run the syntax checker after every write, and to repair before continuing, was
+   run 20 times against 20 controls: **damage identical at 5/20, every outcome measure
+   indistinguishable, and 38% slower.** Two prompt-layer variants have now been tested and neither
+   moved anything. Instructions are not a mechanism. Criteria, gates and smaller steps are.
+
 ### 6. Check it
 
 `handoff check <slug>`. Fix what it rejects; read the advisories. Acceptance is not quality.
@@ -182,6 +216,16 @@ handoff log <slug>          # outcome, criteria score, writes, adapter errors �
 If the **writes** column is 0, the model never attempted the task: an adapter fault or a context
 overflow ate the round. Re-run the same plan once; do not re-specify it. Backfilling three real
 runs found a context overflow in all three, which had been read as the model failing.
+
+**A missing report is not a diagnosis.** It has exactly one known cause here, and it is not yours:
+the model emits the report, llama.cpp's harmony parser cannot map it, and the turn arrives as an
+error with no text. Across 48 runs the signature was identical every time — attempt 1 finishes in
+error with no text block, attempt 2 completes. Do not re-specify a plan over a missing report, and
+do not add instructions telling the model to remember to report. Both have been tried; neither can
+work, because the report is already being written.
+
+`tools/peg-audit` reads the server's own log and will tell you how many were discarded, and at what
+conversation depth. If the depths cluster high, that is your step-size signal.
 
 `handoff stats` aggregates this across every run in the project, and `handoff retro <slug>` asks
 the model — read-only, after it has been shown the verdict — what it would change about the plan.

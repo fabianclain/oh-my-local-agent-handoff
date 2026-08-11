@@ -83,12 +83,25 @@ The **writes** column decides what to do next, and getting this wrong wastes the
 | What you see | What it means | What to do |
 | --- | --- | --- |
 | `writes` is 0, adapter errors present | The round never happened | **Re-run the same plan once.** Do not re-specify |
+| `patch-ok-no-report` | The tree is fine. The serving stack discarded the report | **Nothing.** Accept it and move on — see below |
 | `context-overflow` | The task did not fit the window | Split the step. More instructions make it worse |
 | `output-token-limit` | The turn was cut off mid-write | Expect a truncated file. Split the step |
 | Criteria score dropped from the round before | The repair is damaging the tree | Stop. Revert to the last good state and take a different approach |
 | A real, specific criterion failed | The model got it wrong | Repair once, then narrow the step |
 
-`handoff stats` gives the same picture across every run in the project.
+`handoff stats` gives the same picture across every run in the project, and `tools/peg-audit` reads
+the model server's own log for faults that never reach the harness at all.
+
+**`patch-ok-no-report` is the one row that needs no action, and it is the most common.** The model
+writes the report in full; llama.cpp's harmony parser cannot map it and discards it, so the turn
+arrives as an error with no text. Measured across 48 runs, the signature was identical every time:
+attempt 1 finishes in error with no text block, attempt 2 completes. **22 of those 48 runs spent a
+second attempt chasing it, and 15 still ended without a report** — roughly 40% of runs paying
+double for a defect no retry can fix.
+
+So when the tree is usable and the only thing missing is the report: accept the step, commit it,
+and move on. Do not retry, do not re-specify, and do not report it to the planner as a problem with
+the plan. Judge the tree — which is the rule for everything here anyway.
 
 ## 5. Repair once, then narrow
 

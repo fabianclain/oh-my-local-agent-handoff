@@ -663,6 +663,38 @@ than by argument.
 | Token counts will be a lower-variance instrument than wall clock | They are not. Throughput holds a 5.4% band while wall clock spans 4.9x |
 | Sampling temperature explains the run-to-run spread | Deterministic sampling made spread **wider**: CV 61% to 76% |
 | Asserting original lines keep their order closes the mis-placed-insertion hole | It does not. Nothing is deleted or reordered by an insertion; a hunk bound is what constrains it |
+| Telling the model to run the syntax checker after every write will catch truncation while it is still repairable | n=20 per arm: **damage identical at 5/20**, every outcome measure indistinguishable, 38% slower and 37% more tokens. Second prompt-layer variant to move nothing. Instructions are not a mechanism |
+| Money and aggregates are where this model breaks down | Not when the arithmetic is specified. Five of five implementations of integer proration with largest-remainder allocation were correct under 4000 randomised trials each, including the tie-break and an odd-divisor rounding edge the plan never spelled out. The greenfield 0/7 was about deciding, not computing |
+
+### Wrong for a long time about the two loudest numbers, 2026-08-11
+
+Both were attributed to the model for weeks. Both are the serving stack, and both were sitting in
+`llama-server`'s own log under a warning nobody read. `tools/peg-audit` now reads it.
+
+| Believed | Actually |
+| --- | --- |
+| Roughly a quarter of rounds end with the model declining to write a report | The report is written **in full**, and llama.cpp's harmony parser discards it — addressed to the `final` channel with a `<\|constrain\|>JSON` tag instead of emitted as a tool call. Across 48 runs the signature was identical every time: attempt 1 finishes in error with no text block, attempt 2 completes |
+| The retry recovers those rounds | **22 of 48 runs spent a second attempt and 15 still ended without a report.** Around 40% of runs paid double for a defect no retry can address |
+| Tool-call corruption is an intermittent adapter fault, depressing every arm uniformly | Two distinct faults with different fixes, cleanly separated by conversation depth: reports discarded shallow, harmony headers transposed deep |
+| Context window size is a variable worth an arm | It is not. 96k against 128k moved nothing (1.11% against 1.32% discarded). **Conversation depth** is the variable: 0.00% below 16k, 2.17% at 32–48k, up to 6.06% above 48k. A conversation reaching 50k fails the same under either ceiling |
+| Upstream has probably fixed the harmony parsing by now | Asserted with no evidence, in a commit message. The 26 builds between `b10331` and `b10357` touch `common/chat.cpp` **only** for an unrelated chat template. Check the diff before recommending an upgrade |
+
+The last row is the one to remember. The other five were overturned by measurement; that one was an
+invention that survived a commit message because it sounded like the kind of thing that is true.
+
+### Wrong about the benchmark, which was scoring the model down for obeying it
+
+`templates/agent-rules.md` grants the model `.handoff/scratch/` in as many words — *"that directory
+is yours, it is ignored by the verifier and by git."* `tools/verify-round` excluded it. `bench/run`
+did not, and nothing compared the two.
+
+**8 of 40 runs were recorded as `patch-damaged` for creating files they were explicitly permitted to
+create**, dropping the measured usable-tree rate from 90%/100% to 75%/75%. `bench/summary`'s second
+opinion had already flagged all ten disagreements in its own output; nobody read that either.
+
+Same shape as `tools/check-plan` and `bench/run` once parsing plans with separate copies of the same
+expressions. Two tools that judge the same artifact must be tested against each other, not only
+against their own idea of correctness. `tools/smoke-e2e` now does that.
 
 ### Wrong about the harness, by the harness's own author
 
