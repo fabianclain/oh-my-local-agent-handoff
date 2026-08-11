@@ -150,11 +150,27 @@ What follows instead:
 2. **`tools/engine-conformance` cannot detect a fix for this.** It passed 21/21 on the broken build,
    twice. It exercises tool calls; this fault is a `final`-channel message. Any test of a candidate
    build has to measure the no-report rate per round over a wave, not conformance.
-3. **The untested lever is sampling.** The server runs at llama.cpp's default temperature of 0.8 — a
-   creative-writing profile — and malformed control tokens are exactly what high temperature
-   produces. Sampling has been varied before, but only ever against outcome variance, never against
-   the parse-failure rate. `LLAMACPP_EXTRA_ARGS="--temp 0 --top-p 1 --top-k 0"` and one wave would
-   answer it.
+3. ~~**The untested lever is sampling.**~~ **Tested, and it is not the cause.** Eight runs at
+   `--temp 0 --top-p 1 --top-k 0 --seed 42`, same plan and same 98304 window as the control:
+
+   | | temp 0.8 | temp 0 |
+   | --- | ---: | ---: |
+   | no-report rounds | 5/8 | 3/8 (p = 0.62) |
+   | completions discarded | 1.11% | 1.17% |
+   | usable tree | 8/8 | 8/8 |
+
+   Against the 33% no-report baseline over 48 runs, 3/8 is 37.5% — not an improvement, and the
+   queue file said in advance that 3/8 reads as "no effect at this n" rather than as a small gain.
+
+   **The consequence matters more than the null result.** At temperature 0, top_k 0 and a fixed
+   seed, the model still emits `<|channel|>final <|constrain|>JSON<|message|>` for its report, and
+   still transposes `run_commands` headers — one of them with three `<|channel|>` tokens in a row.
+   These are not sampling noise. They are what greedy decoding produces, which means no sampler
+   setting can avoid them, and equally that the fault is **deterministic and therefore
+   reproducible**. That is what makes it worth reporting upstream rather than working around.
+
+   Before filing, check the GGUF's own chat template. If it renders prior turns in non-canonical
+   harmony the model would be imitating it, and the defect would be on this side of the line.
 
 ### Round 17 — answered from the server's own log, in seconds
 
