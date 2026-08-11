@@ -326,3 +326,29 @@ than a control, and the tool must not pretend otherwise.
 
 Expect `chance`. At n≈15 this plan's noise floor is roughly 20 percentage points, measured from two
 arms that were identical by construction and still differed by that much.
+
+### Round 15 at the right window: the budget that binds is turns, not context
+
+Re-run at 98304 after the 32768 episode, n=3 per arm, same harness commit:
+
+| | `native` | `nativewhole` |
+| --- | ---: | ---: |
+| stopped on the context budget | 0/3 | **0/3** — was 3/3 at 32768 |
+| stopped on the turn limit | 0/3 | **2/3** |
+| criteria met | 11/11 in all three | 11/11 in all three |
+| accepted | 3/3 | 2/3 |
+
+Two things follow, and the second is the useful one.
+
+The context-budget stops were the **window**, exactly as suspected: they disappear entirely when
+the server serves what every document said it was serving. Nothing about whole-file writes
+exhausted the context.
+
+What whole-file writes actually cost is **turns**. `nativewhole` hit the 40-turn limit in two of
+three rounds, `native` in none — and the round that lost its report had already met 11 of 11
+criteria. The tree was finished and there was no turn left to say so. So round 15's arm does not
+produce worse code; it produces the same code and runs out of budget describing it.
+
+That makes `--max-turns` the variable worth an arm, not the editing style. Raising it trades
+against depth, which is what correlates with discarded output — so it has to be measured, not
+assumed. n is 3 per arm at the time of writing and the night runs to 18.
