@@ -90,6 +90,9 @@ Two files. Changing any other file fails this round.
 - [ ] A line active zero days in the period appears in the allocation with 0 cents
 - [ ] With unequal remainders, the allocation keys are still in the order the lines were added,
       not in remainder order — the distribution sort must not survive into the returned array
+- [ ] When more than one cent is left over, each goes to a *different* line: three lines of 500
+      cents active 1, 2 and 3 days of a 7-day period give `subtotal()` 429 and the allocation
+      `[72, 143, 214]`, not `[71, 144, 214]`
 - [ ] `Invoice::proration()` returns a `Proration`, and the existing `Invoice` methods still work
 - [ ] Exactly two files changed: one created, one modified
 
@@ -103,6 +106,7 @@ php -r 'foreach (glob("bench/fixtures/billing/*.php") as $f) { require_once $f; 
 php -r 'foreach (glob("bench/fixtures/billing/*.php") as $f) { require_once $f; } use Bench\Fixture\Billing as B; $p=new B\Period(0,30); $i=new B\Invoice($p); foreach (["x","y"] as $n) { $i->addLine(new B\Subscription($n, new B\Money(999), new B\Period(0,15))); } $pr=$i->proration(); $a=array_map(fn($m)=>$m->cents(), $pr->allocation()); exit($pr->subtotal()->cents()===999 && array_values($a)===[500,499] ? 0 : 1);'
 php -r 'foreach (glob("bench/fixtures/billing/*.php") as $f) { require_once $f; } use Bench\Fixture\Billing as B; $p=new B\Period(0,30); $i=new B\Invoice($p); $i->addLine(new B\Subscription("live", new B\Money(3000), new B\Period(0,30))); $i->addLine(new B\Subscription("gone", new B\Money(3000), new B\Period(40,50))); $a=array_map(fn($m)=>$m->cents(), $i->proration()->allocation()); exit((count($a)===2 && $a["gone"]===0 && $a["live"]===3000) ? 0 : 1);'
 php -r 'foreach (glob("bench/fixtures/billing/*.php") as $f) { require_once $f; } use Bench\Fixture\Billing as B; $p=new B\Period(0,11); $i=new B\Invoice($p); $i->addLine(new B\Subscription("a", new B\Money(2663), new B\Period(0,3))); $i->addLine(new B\Subscription("b", new B\Money(2909), new B\Period(0,8))); $i->addLine(new B\Subscription("c", new B\Money(693), new B\Period(0,8))); exit(array_keys($i->proration()->allocation())===["a","b","c"] ? 0 : 1);'
+php -r 'foreach (glob("bench/fixtures/billing/*.php") as $f) { require_once $f; } use Bench\Fixture\Billing as B; $p=new B\Period(0,7); $i=new B\Invoice($p); $i->addLine(new B\Subscription("a", new B\Money(500), new B\Period(0,1))); $i->addLine(new B\Subscription("b", new B\Money(500), new B\Period(0,2))); $i->addLine(new B\Subscription("c", new B\Money(500), new B\Period(0,3))); $pr=$i->proration(); $a=array_map(fn($m)=>$m->cents(), $pr->allocation()); exit($pr->subtotal()->cents()===429 && array_values($a)===[72,143,214] ? 0 : 1);'
 php -r 'foreach (glob("bench/fixtures/billing/*.php") as $f) { require_once $f; } use Bench\Fixture\Billing as B; $p=new B\Period(0,30); $i=new B\Invoice($p); $s=new B\Subscription("a", new B\Money(1000), new B\Period(0,10)); $i->addLine($s); exit(($i->proration() instanceof B\Proration && count($i->lines())===1 && $i->billing()->days()===30) ? 0 : 1);'
 test "$(git status --porcelain -- . ':(exclude).handoff' | wc -l)" -eq 2
 ```
