@@ -167,22 +167,63 @@ done < <(cd "$WORKTREE" && find .handoff -name evidence.jsonl -maxdepth 4 2>/dev
     git -c core.quotePath=false ls-files --others --exclude-standard -- . "${EXCLUDES[@]}"
 } 2>/dev/null | sort -u >"$CHANGED"
 
-# Files that were already untracked when the run started are not the model's work.
+# Files that were already untracked when the run started are not the model's work — unless the
+# model CHANGED them.
 #
-# `git ls-files --others` above lists every untracked path in the tree with no idea who created
-# it, so anything a person left lying about was reported as invented and counted toward
-# patch-damaged. Six unrelated files in one real round did exactly that. bin/handoff records the
-# baseline before the provider runs; without it this is a no-op, which is correct for bench/run,
-# whose worktrees are cut fresh from a commit and have nothing untracked to begin with.
+# `git ls-files --others` above lists every untracked path in the tree with no idea who created it,
+# so anything a person left lying about was reported as invented and counted toward patch-damaged.
+# Six unrelated files in one real round did exactly that. bin/handoff records the baseline before
+# the provider runs; without it this is a no-op, which is correct for bench/run, whose worktrees are
+# cut fresh from a commit and have nothing untracked to begin with.
+#
+# Presence, though, is the wrong question — and answering it cost a round in the other direction.
+# The first version subtracted a pre-existing untracked path unconditionally, so a file that was
+# untracked before and after read as unchanged however much it was edited. That is the ordinary
+# state mid-sequence: the plan creates a view in round 1, round 1b edits it, and nothing has been
+# committed in between because the procedure says to review before committing. The round that
+# rewrote that file was reported as "the working tree is unchanged; nothing was implemented" — and
+# the advice for that signature is to re-run the plan rather than change it, which would have thrown
+# away correct work. Two pieces of the harness's own guidance collided.
+#
+# So the subtraction is by CONTENT, against the run-start snapshot bin/handoff already captures for
+# the read-only gate. Same file, same bytes: not this run's doing. Different bytes: the model's
+# work, whoever created it. With no snapshot there is nothing to compare against, and the forgiving
+# answer is kept — a false accusation is the worse error, and it is the one that was reported.
+PREEXISTING_EDITED="$OUT_DIR/preexisting-edited.txt"
+: >"$PREEXISTING_EDITED"
 if [[ -n "${HANDOFF_UNTRACKED_BEFORE:-}" && -s "${HANDOFF_UNTRACKED_BEFORE:-}" ]]; then
     PREEXISTING="$(mktemp)"
     sort -u "$HANDOFF_UNTRACKED_BEFORE" >"$PREEXISTING"
-    KEPT="$(mktemp)"
-    comm -23 "$CHANGED" "$PREEXISTING" >"$KEPT"
-    IGNORED=$(( $(wc -l <"$CHANGED") - $(wc -l <"$KEPT") ))
+    KEPT="$(mktemp)"; : >"$KEPT"
+    IGNORED=0
+    while IFS= read -r file; do
+        [[ -n "$file" ]] || continue
+        if ! grep -Fqx -- "$file" "$PREEXISTING"; then
+            printf '%s\n' "$file" >>"$KEPT"
+            continue
+        fi
+        BASELINE=""
+        if [[ -n "$RUN_START_TREE" ]] && git cat-file -e "$RUN_START_TREE:$file" 2>/dev/null; then
+            BASELINE="$(git rev-parse "$RUN_START_TREE:$file")"
+        fi
+        if [[ -z "$BASELINE" ]]; then
+            # Untracked before, and no snapshot to compare against. Nothing here can tell an edit
+            # from a file that was simply lying about, so keep the answer that does not accuse.
+            IGNORED=$(( IGNORED + 1 ))
+            continue
+        fi
+        if [[ -f "$WORKTREE/$file" && "$(git hash-object -- "$WORKTREE/$file")" == "$BASELINE" ]]; then
+            IGNORED=$(( IGNORED + 1 ))
+            continue
+        fi
+        printf '%s\n' "$file" >>"$KEPT"
+        printf '%s\n' "$file" >>"$PREEXISTING_EDITED"
+    done <"$CHANGED"
     mv "$KEPT" "$CHANGED"
     rm -f "$PREEXISTING"
-    (( IGNORED == 0 )) || echo "note: $IGNORED file(s) were already untracked before this run and are not counted against it" >&2
+    (( IGNORED == 0 )) || echo "note: $IGNORED file(s) were already untracked before this run and came back unchanged; they are not counted against it" >&2
+    EDITED_COUNT="$(grep -c . "$PREEXISTING_EDITED" 2>/dev/null || echo 0)"
+    (( EDITED_COUNT == 0 )) || echo "note: $EDITED_COUNT untracked file(s) that existed before this run were modified by it, and ARE counted" >&2
 fi
 
 if [[ ! -s "$CHANGED" ]]; then
@@ -343,6 +384,11 @@ if [[ -s "$ALLOWED" ]]; then
         OUT_OF_SCOPE=$(( OUT_OF_SCOPE + 1 ))
         if git cat-file -e "$BASE_COMMIT:$file" 2>/dev/null; then
             echo "modified out of scope: $file" >>"$SCOPE_OUT"
+        elif grep -Fqx -- "$file" "$PREEXISTING_EDITED" 2>/dev/null; then
+            # Existed before the run, untracked, and came back with different bytes. Out of scope,
+            # but not invented: something else created it, and calling it litter names the wrong
+            # act — the reviewer would go looking for a file to delete rather than a diff to read.
+            echo "modified out of scope (was untracked before this run): $file" >>"$SCOPE_OUT"
         else
             LITTER=$(( LITTER + 1 ))
             echo "invented: $file" >>"$SCOPE_OUT"
