@@ -572,17 +572,17 @@ scored 6/6. It had a 1.7:1 wordmark, a 3.0:1 link, an unscrollable overflow and 
 Two of those three are arithmetic, so they are commands now. Put them in the plan:
 
 ```bash
-tools/css-contrast resources/views/pages/thing.blade.php --min 4.5
-tools/view-lint resources/views/pages/thing.blade.php
+handoff contrast resources/views/pages/thing.blade.php --min 4.5
+handoff view-lint resources/views/pages/thing.blade.php
 ```
 
-**`css-contrast`** resolves the cascade — selectors, specificity, inheritance, the nearest ancestor
+**`handoff contrast`** resolves the cascade — selectors, specificity, inheritance, the nearest ancestor
 background, alpha, and `prefers-color-scheme` layered on top of the base sheet — and computes the
 WCAG ratio for every text/background pair it can reach. It catches the specific defect that a dark
 block overrode `body` and `.card` and forgot the two colours declared elsewhere. It reports what it
 could **not** resolve on every run; read that part.
 
-**`view-lint`** checks tag balance. Unbalanced HTML renders and passes everything, which is why the
+**`handoff view-lint`** checks tag balance. Unbalanced HTML renders and passes everything, which is why the
 malformed page above survived 85 tests. It also reports the `align-items: center` +
 `min-height: 100vh` trap, which clips the top of an over-tall card with nothing to scroll to.
 

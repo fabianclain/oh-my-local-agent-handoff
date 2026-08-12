@@ -14,6 +14,8 @@
 #   handoff retro <slug>    ask the model what it thinks went wrong, and record the answer
 #   handoff auto <slug>     the ladder: local tries, a hosted planner re-specifies, local retries
 #   handoff doctor          can this machine run a round right now? read-only
+#   handoff contrast <file> WCAG contrast for every colour pair a view declares
+#   handoff view-lint <file>  tag balance, the 100vh overflow trap, missing heading
 #
 # `do` verifies automatically when it finishes. HANDOFF_NO_VERIFY=1 suppresses that, for
 # callers running the same gates themselves.
@@ -142,9 +144,25 @@ if [[ "$MODE" == "log" || "$MODE" == "stats" ]]; then
     exec "$HANDOFF_HOME/tools/journal" --repo "$REPO_ROOT" stats "$@"
 fi
 
+# The two view gates, reachable from any project.
+#
+# They exist to be written into a plan's `## Verification` block, and a plan cannot say
+# `tools/css-contrast` — that path only resolves inside this checkout, and the whole point of
+# installing `handoff` on PATH is that a project never needs to know where the harness lives. A
+# criterion naming a path the project does not have is a criterion that fails for the wrong reason,
+# which is the exact failure mode this repository keeps finding.
+if [[ "$MODE" == "contrast" || "$MODE" == "view-lint" ]]; then
+    HANDOFF_HOME="$(cd "$(dirname "$(_handoff_real_self)")/.." && pwd)"
+    TOOL="$HANDOFF_HOME/tools/$([[ "$MODE" == "contrast" ]] && echo css-contrast || echo view-lint)"
+    [[ -x "$TOOL" ]] || { echo "no $MODE gate at $TOOL" >&2; exit 1; }
+    shift
+    exec "$TOOL" "$@"
+fi
+
 if [[ -z "$MODE" || -z "$SLUG" ]]; then
     echo "usage: handoff {do|prepare|check|resume|diff|verify|retro|auto} <slug>" >&2
     echo "       handoff {init|log|stats|doctor}" >&2
+    echo "       handoff {contrast|view-lint} <file>" >&2
     exit 64
 fi
 
@@ -557,7 +575,7 @@ retro)
     ;;
 
 *)
-    echo "unknown mode: $MODE (expected do|prepare|check|resume|diff|verify|retro|auto|overnight|log|stats|init|doctor)" >&2
+    echo "unknown mode: $MODE (expected do|prepare|contrast|view-lint|check|resume|diff|verify|retro|auto|overnight|log|stats|init|doctor)" >&2
     exit 64
     ;;
 esac
