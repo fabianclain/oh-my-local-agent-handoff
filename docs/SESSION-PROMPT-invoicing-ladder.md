@@ -62,8 +62,8 @@ Everything else below is in service of answering that.
 
 ## 2. Current state — exact, checkable
 
-**Product repo:** `/home/fabbs/dev/monolith`, branch `invoicing`, commit `0a131df`
-**Harness checkout:** `/home/fabbs/dev/monolith/agent-handoff` (its own git repo, at `5983c58`)
+**Product repo:** the private application repository, on its feature branch
+**Harness checkout:** this repository, checked out beside it (its own git repo)
 **Plans dir:** `.claude/plans/` — *not* `.handoff/plans/`; `.handoff/config.sh` overrides it
 **`handoff` is not on PATH:** `export PATH="$PWD/agent-handoff/bin:$PATH"`
 
@@ -353,7 +353,7 @@ new dependency; anything touching production data or the phone/ADB services.
 ## 8. How to start the run
 
 ```bash
-cd /home/fabbs/dev/monolith
+cd "$PRODUCT_REPO"
 git checkout invoicing                       # already at 0a131df, tree clean
 export PATH="$PWD/agent-handoff/bin:$PATH"
 handoff doctor                               # settles environment-vs-model before anything runs

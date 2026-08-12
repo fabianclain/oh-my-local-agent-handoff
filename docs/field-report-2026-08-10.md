@@ -4,7 +4,7 @@ One real feature, built with `/local-implement` against `gpt-oss-20b` on a 16 GB
 model rounds. Nothing here is hypothetical: every claim below is traceable to an evidence bundle
 under `.handoff/runs/`, a kernel log line, or a test run.
 
-The task was **Search Log Rankings v2** in the `monolith` Laravel app: a new read-only dashboard
+The task was a real feature in a private Laravel application: a new read-only dashboard
 page, built as a service plus a Livewire view.
 
 **Headline:** 8 model rounds, **1 substantively successful** — and that one was the narrowest
@@ -22,7 +22,7 @@ most useful calibration datum in this report.
 
 ## 1. What was delivered
 
-### Product work (branch `rankingsv2`, worktree `/home/fabbs/dev/monolith-rankingsv2`)
+### Product work (a feature branch, in its own worktree)
 
 | Commit | What |
 | --- | --- |
@@ -46,7 +46,7 @@ service joins on `query_hash` alone and reports the engine mismatch as its own f
 | --- | --- |
 | `scripts/ops/backup-sqlite.sh` + systemd timer | The dev database corrupted with no backup. Online `.backup`, integrity-checked before keeping, 14 rotated, every 6h |
 | `scripts/ops/resource-watch.sh` + service | A silent OOM froze the desktop and killed a run. Warns on *approach*, can stop the model server before the kernel picks a victim |
-| `~/.config/systemd/user/monolith-llama.service` | llama-server at 32k context, `MemoryMax=12G`, outside the terminal scope |
+| a user systemd unit for llama-server | llama-server at 32k context, `MemoryMax=12G`, outside the terminal scope |
 
 All four `scripts/ops/*` files are untracked in the main tree, awaiting a decision to commit.
 
@@ -253,8 +253,9 @@ counts the bars, rather than trusting an instruction.
 
 - Step 3 (`rankingsv2-3-nav`) is written and checked, not yet run. The page itself is done and
   committed (`eeebd3a`); step 3 only adds the sidebar entry and the docs paragraph.
-- `search_log_tracked_keywords` is empty after the rebuild; restoring the 45 needs a Search Console
-  re-auth then `php artisan search-log:sync-keywords`.
-- **`.env` is tracked in git** in the monolith repo, with live API keys, and is in the history.
-- `storage/app/private/search-log/pages/` holds 295 `example.test` files — the `PageFetch` tests
+- A tracked-keywords table was left empty by the rebuild; restoring it needs an upstream
+  re-auth and a sync command. Recorded because the rebuild looked complete and was not.
+- A tracked `.env` was found in the product repository. Any secret committed once is in the
+  history until the history is rewritten, so rotation comes first and `git rm --cached` second.
+- A storage directory holds 295 `example.test` files — the `PageFetch` tests
   write to the real local disk. A test-isolation leak, harmless but worth fixing.

@@ -5,7 +5,7 @@ Paste this after a compaction. Everything below is committed and pushed on
 
 ---
 
-Continue improving `agent-handoff` in `~/dev/monolith/agent-handoff`. The harness drives a local
+Continue improving `agent-handoff` in `~/dev/agent-handoff`. The harness drives a local
 model (gpt-oss-20b via llama.cpp, provider `local`) as an implementer, with a hosted model planning
 and the harness verifying.
 
