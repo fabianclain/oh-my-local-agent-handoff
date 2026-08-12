@@ -600,3 +600,34 @@ those. The failures this project has recorded on real work are mis-anchored edit
 150 lines on a second pass, which is an EDITING shape rather than a creation one, and greenfield
 work carrying design decisions rather than a dictated spec. A plan that reliably fails once, which
 roadmap item 1 has needed since round 7, is still unbuilt.
+
+### Fuzzing the gates, and what it did and did not find
+
+Two of the night's defects came from throwing pathological input at the gates rather than from
+reasoning about them: `darkscheme` passing a page whose light sheet coloured nothing, and
+`view-lint` certifying an empty file as well-formed. About fifteen minutes for both.
+
+The same treatment over the core tools found **nothing**, and that is worth recording as a result
+rather than as a gap in the exercise. Thirty malformed inputs — empty, binary, truncated JSON,
+50,000-term selectors, 20,000-deep nesting, unterminated media queries, tool outputs of the wrong
+JSON type — across `plan-lint`, `turn-economy`, `report-audit`, `final-turn-shape`, `view-lint` and
+`css-contrast`. No crashes, no hangs, and every refusal came back as a clean verdict.
+
+The plan gates in particular are correctly layered, which was checked rather than assumed:
+
+| Tool | Role | Empty plan | 2 criteria, 1 command |
+| --- | --- | --- | --- |
+| `plan-lint` | advisory notes | exit 0 | exit 0 |
+| `check-plan` | a verdict | **exit 1**, both reasons named | **exit 1**, best achievable score stated |
+| `bench/run` | the hard gate | **exit 1** | **exit 1** |
+
+Three layers with three different jobs, and the advisory one exiting 0 is the design rather than a
+hole. `handoff prepare` runs check and lint together, so the verdict is never reached only through
+the advisory.
+
+**Where fuzzing pays and where it does not.** The core tools have been through many rounds of real
+malformed artifacts — truncated payloads, restarted server logs, reports that were not reports —
+and are hardened by that history. The view gates were days old and had been validated only against
+a reference and a trap written by the same hand as the gate, which shares its blind spots by
+construction. Both of mine were written without CSS comments, so neither could catch a comment bug.
+Fuzz the young gate; the old one has already met its adversary.
