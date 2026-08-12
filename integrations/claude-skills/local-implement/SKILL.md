@@ -199,7 +199,7 @@ Plans go where `.handoff/config.sh` says. Shape from `templates/plan.md`.
 ### 7. Run it
 
 ```bash
-HANDOFF_PROVIDER=local handoff do <slug> >/tmp/run.log 2>&1; echo "verdict exit=$?"
+HANDOFF_PROVIDER=native handoff do <slug> >/tmp/run.log 2>&1; echo "verdict exit=$?"
 ```
 
 **Redirect; do not pipe.** `handoff do x | tail` returns *tail's* exit status, not the verdict, and
@@ -363,7 +363,16 @@ other plausible improvements to the retry path already were.
 
 ## Setup
 
-`tools/setup-local-implementer` from the agent-handoff checkout. `llama-server` does not survive a
-reboot: `tools/llamacpp-serve start gpt-oss-20b 32768`. Use 32768 on any machine whose GPU also
-drives a desktop — 64k needs ~15 GB *free*, and llama.cpp spills to host RAM rather than refusing,
+`tools/install-local` from the agent-handoff checkout — it links `handoff` into `~/.local/bin` and
+writes `~/.config/agent-handoff/config.sh`, so any repository works with no per-project setup and
+no `HANDOFF_PROVIDER` on the command line. `tools/install-local --check` reports it the way a
+non-interactive shell sees it, which is the case a PATH export in `~/.bashrc` does not cover.
+
+`llama-server` does not survive a reboot: `tools/llamacpp-serve start gpt-oss-20b 98304`.
+
+**Say the context out loud, and assert it.** A server left running at 32768 while every document
+said 98304 cost a benchmark night its first hour, and nothing objected — `doctor` only complained
+*below* 32768. `HANDOFF_EXPECT_CTX=98304` makes it a failure rather than a line of output. On a
+machine whose GPU also drives a desktop, `CALIBRATE_MARGIN_MIB=1500 tools/llamacpp-serve calibrate`
+picks the largest window that stays resident; llama.cpp spills to host RAM rather than refusing,
 which ends in swap thrashing and an OOM kill. Full guide: `docs/START-HERE.md`.

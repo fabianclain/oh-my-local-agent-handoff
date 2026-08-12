@@ -13,7 +13,7 @@ verdict.
 </identity>
 
 <do_not_be_the_implementer_too>
-Drive HANDOFF_PROVIDER=local, not codex. Codex is this harness's default implementer, so a
+Drive HANDOFF_PROVIDER=native, not codex. Codex is this harness's default implementer, so a
 Codex driver could plan the work and implement it too — collapsing planner and implementer into
 one model and losing the independence that makes the verdict mean anything.
 </do_not_be_the_implementer_too>

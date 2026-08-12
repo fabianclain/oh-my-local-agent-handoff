@@ -53,7 +53,7 @@ landed, and knowing where you are going changes how you read a failure.
 ## 3. Run one step at a time
 
 ```bash
-HANDOFF_PROVIDER=local handoff do <slug>
+HANDOFF_PROVIDER=native handoff do <slug>
 ```
 
 It implements, verifies, and folds the verdict into its exit status, so a round the gates reject
@@ -104,7 +104,7 @@ The harness will hand the model its own failing commands if you point it at the 
 
 ```bash
 HANDOFF_FEEDBACK_FILE=.handoff/runs/<slug>/feedback.md \
-  HANDOFF_PROVIDER=local handoff do <slug>
+  HANDOFF_PROVIDER=native handoff do <slug>
 ```
 
 Or let the ladder do the whole loop, including a hosted planner writing a narrower plan when two

@@ -14,7 +14,7 @@ Both are global once installed — every project on the machine, nothing per-pro
 
 ## Keep the driver and the implementer different
 
-The procedure tells the driver to use `HANDOFF_PROVIDER=local`. That matters most in Codex, where
+The procedure tells the driver to use `HANDOFF_PROVIDER=native`. That matters most in Codex, where
 `codex` is also a perfectly good *implementer* and is in fact this harness's default provider. If
 the same model both writes the plan and implements it, the independence that makes a verdict worth
 anything is gone — a model checking its own work is the thing this whole repository exists to
