@@ -341,6 +341,13 @@ def gate_darkscheme(doc: Doc) -> int:
         return found
 
     light, dark = coloured(light_css), coloured(dark_css)
+    # A light sheet that colours nothing makes the comparison below vacuous: `light - dark` is
+    # empty and the gate passes having checked nothing, which is the failure this whole project is
+    # organised around. Found by fuzzing the gate with a page whose only rules were inside the
+    # dark block.
+    if not light:
+        return bad("the light sheet declares no colours at all",
+                   "with nothing to cover, this gate would pass without checking anything")
     # Pseudo-class rules are the contrast gate's blind spot; requiring them here would demand an
     # override nothing can then verify, so they are out of scope for this gate too.
     uncovered = sorted(s for s in light - dark if ":" not in s)

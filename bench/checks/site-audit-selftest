@@ -176,6 +176,7 @@ def main() -> int:
                  "    .stat .label { color: #c9d1d9; }\n", ""),
                 ("no dark block at all",
                  "@media (prefers-color-scheme: dark) {", "@media (min-width: 1px) {"),
+
             ]:
                 if find not in dark_source:
                     print(f"FAIL  {name}\n        anchor text absent, so this case tests nothing")
@@ -187,6 +188,29 @@ def main() -> int:
                     failures += 1
                 else:
                     print(f"pass  {name}")
+
+        # Standalone pages, because these edges cannot be reached by mutating the reference:
+        # emptying its light sheet means deleting twenty-odd rules, not replacing one.
+        for name, html, should_pass in [
+            ("a light sheet that colours nothing",
+             "<html><head><style>@media (prefers-color-scheme: dark)"
+             "{body{color:#fff;background:#000}}</style></head><body><p>x</p></body></html>",
+             False),
+            ("a dark block nested inside @supports",
+             "<html><head><style>body{color:#556270;background:#ffffff}"
+             "@media (prefers-color-scheme: dark){@supports (display:grid)"
+             "{body{color:#c9d1d9;background:#1e1e1e}}}</style></head><body><p>x</p></body></html>",
+             True),
+        ]:
+            page.write_text(html)
+            got = score(page, DARK_GATES)["darkscheme"]
+            if got != should_pass:
+                print(f"FAIL  {name}\n        darkscheme "
+                      f"{'passed' if got else 'rejected'} a page it should "
+                      f"{'reject' if should_pass is False else 'accept'}")
+                failures += 1
+            else:
+                print(f"pass  {name}")
 
     print()
     if failures:
