@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""site-audit-selftest — every gate, against a page built to trip it.
+
+    bench/checks/site-audit-selftest
+
+A gate nobody has watched fail is an assumption. The reference page passes all nine, which proves
+only that they can say yes; each case below breaks exactly one thing and asserts that the matching
+gate says no AND that the others still say yes. That second half is what catches a gate so broad it
+fires on everything, which is how a check becomes noise and then gets switched off.
+
+The mutations are drawn from what a model plausibly does, not from what is easy to detect:
+an anchor off by one character, a heading level swapped, a stat label moved away from its figure.
+"""
+
+from __future__ import annotations
+
+import pathlib
+import subprocess
+import sys
+import tempfile
+
+HERE = pathlib.Path(__file__).resolve().parent
+AUDIT = HERE / "site-audit"
+REFERENCE = HERE / "site-cases" / "reference" / "index.html"
+GATES = ["headline", "sections", "anchors", "stats", "features", "testimonials",
+         "alt", "meta", "selfcontained"]
+
+# (name, gate that must fail, mutation as a (find, replace) pair)
+CASES = [
+    ("an anchor off by one character", "anchors",
+     ('<a href="#features">Funcționalități</a>', '<a href="#feature">Funcționalități</a>')),
+
+    ("a landmark id renamed", "sections",
+     ('<section id="testimonials">', '<section id="reviews">')),
+
+    ("two landmarks swapped", "sections",
+     ('<section id="features">', '<section id="cta">')),
+
+    ("the headline reworded", "headline",
+     ("Transformă-ți Protecția Muncii în Era Digitală",
+      "Transformă-ți Protecția Muncii în Era Digitala")),
+
+    ("a second h1", "headline",
+     ("<h2>Funcționalități</h2>", "<h1>Funcționalități</h1>")),
+
+    ("a stat figure dropped", "stats",
+     ('<div class="figure">80,000+</div>', '<div class="figure"></div>')),
+
+    ("a feature card gutted to a stub", "features",
+     ("<p>Bibliotecă completă cu modele pentru toate nevoile SSM, disponibile gratuit.</p>",
+      "<p>TODO</p>")),
+
+    ("two feature cards share a heading", "features",
+     ("<h3>Semnare prin SMS</h3>", "<h3>Modele de Documente</h3>")),
+
+    ("a testimonial loses its attribution", "testimonials",
+     ("<cite>Andrei Ionescu, Administrator, Construct Plus SRL</cite>", "")),
+
+    ("an image with no alt", "alt",
+     ('<a class="wordmark" href="#hero">SSMatic</a>',
+      '<a class="wordmark" href="#hero"><img src="logo.png"></a>')),
+
+    ("an unlabelled inline svg", "alt",
+     ('<a class="wordmark" href="#hero">SSMatic</a>',
+      '<a class="wordmark" href="#hero"><svg viewBox="0 0 10 10"></svg></a>')),
+
+    ("the wrong language", "meta",
+     ('<html lang="ro">', '<html lang="en">')),
+
+    ("a meta description trimmed too short", "meta",
+     ("Platformă SSM pentru digitalizarea completă a proceselor de protecția muncii: "
+      "generare automată de fișe și semnătură electronică.", "Platformă SSM.")),
+
+    ("a CDN stylesheet", "selfcontained",
+     ("<style>", '<link rel="stylesheet" href="https://cdn.example.com/x.css">\n<style>')),
+
+    ("a remote image", "selfcontained",
+     ('<a class="wordmark" href="#hero">SSMatic</a>',
+      '<a class="wordmark" href="#hero"><img alt="SSMatic" src="//cdn.example.com/l.png"></a>')),
+]
+
+
+def score(path: pathlib.Path) -> dict[str, bool]:
+    out = {}
+    for gate in GATES:
+        proc = subprocess.run([sys.executable, str(AUDIT), gate, str(path)],
+                              capture_output=True, text=True)
+        out[gate] = proc.returncode == 0
+    return out
+
+
+def main() -> int:
+    if not REFERENCE.is_file():
+        print(f"reference page missing: {REFERENCE}", file=sys.stderr)
+        return 2
+    source = REFERENCE.read_text()
+
+    failures = 0
+    with tempfile.TemporaryDirectory() as tmp:
+        page = pathlib.Path(tmp) / "index.html"
+
+        page.write_text(source)
+        base = score(page)
+        if not all(base.values()):
+            print(f"FAIL  the reference page does not pass every gate: "
+                  f"{[g for g, ok in base.items() if not ok]}")
+            return 1
+        print(f"pass  the reference page passes all {len(GATES)} gates")
+
+        for name, expected_gate, (find, replace) in CASES:
+            if find not in source:
+                print(f"FAIL  {name}\n        the mutation's anchor text is not in the reference "
+                      f"page, so this case tests nothing: {find[:60]!r}")
+                failures += 1
+                continue
+            page.write_text(source.replace(find, replace, 1))
+            got = score(page)
+            broke = [gate for gate, ok in got.items() if not ok]
+            if expected_gate not in broke:
+                print(f"FAIL  {name}\n        expected `{expected_gate}` to fail; "
+                      f"gates that failed: {broke or 'none'}")
+                failures += 1
+            elif len(broke) > 1:
+                # Not automatically wrong -- one mutation can genuinely break two things -- but it
+                # must be declared, or a gate that fires on everything looks like a gate that works.
+                extra = [g for g in broke if g != expected_gate]
+                print(f"pass  {name}  (also tripped {', '.join(extra)})")
+            else:
+                print(f"pass  {name}")
+
+    print()
+    if failures:
+        print(f"{failures} check(s) failed")
+        return 1
+    print(f"{len(CASES)} check(s) passed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

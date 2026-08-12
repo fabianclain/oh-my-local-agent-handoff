@@ -20,6 +20,7 @@
 #   roundup-selftest      what the round-up states, and what it refuses to state
 #   plan-lint-selftest    every plan-linter check, from both sides
 #   view-selftest         the contrast and markup gates, against the page they come from
+#   site-audit-selftest   every structural gate of the site plan, each mutation-tested
 #
 # smoke-e2e runs first and takes two seconds. It is the one to read when something is broken: the
 # others tell you a unit misbehaves, it tells you the pieces are no longer wired together.
@@ -34,10 +35,17 @@ REPO="$(cd "$HERE/.." && pwd)"
 cd "$REPO"
 FAILED=()
 
-for suite in smoke-e2e harness-selftest verifier-selftest feedback-selftest patch-shape-selftest shim-selftest native-retry-selftest turn-economy-selftest report-audit-selftest journal-selftest roundup-selftest plan-lint-selftest view-selftest; do
-    [[ -x "$HERE/$suite" ]] || { echo "SKIP  $suite (missing)"; continue; }
+for suite in smoke-e2e harness-selftest verifier-selftest feedback-selftest patch-shape-selftest shim-selftest native-retry-selftest turn-economy-selftest report-audit-selftest journal-selftest roundup-selftest plan-lint-selftest view-selftest site-audit-selftest; do
+    # Suites live in tools/, except the ones that test a bench fixture and belong beside it.
+    # Resolving only tools/ made a real suite report `SKIP (missing)` — which this file's own next
+    # comment calls the failure it exists to avoid, one line before failing to avoid it.
+    path=""
+    for candidate in "$HERE/$suite" "$REPO/bench/checks/$suite"; do
+        [[ -x "$candidate" ]] && { path="$candidate"; break; }
+    done
+    [[ -n "$path" ]] || { echo "SKIP  $suite (missing)"; continue; }
     printf '%-24s ' "$suite"
-    out="$(timeout 900 "$HERE/$suite" 2>&1)"; rc=$?
+    out="$(timeout 900 "$path" 2>&1)"; rc=$?
     # Exit 2 means a suite could not run at all — a missing interpreter, not a broken harness.
     # Reporting that as a pass would convert "nothing was checked" into apparent evidence, which
     # is the exact failure the verifier's `skipped` status exists to avoid.
