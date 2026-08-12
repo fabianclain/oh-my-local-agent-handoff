@@ -1,6 +1,6 @@
 # Field report — 2026-08-10
 
-One real feature, built with `/local-implement` against `gpt-oss-20b` on a 16 GB card, over seven
+One real feature, built with `/local-implementer` against `gpt-oss-20b` on a 16 GB card, over seven
 model rounds. Nothing here is hypothetical: every claim below is traceable to an evidence bundle
 under `.handoff/runs/`, a kernel log line, or a test run.
 

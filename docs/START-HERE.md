@@ -250,13 +250,13 @@ the easiest thing in a codebase to satisfy with three lines that mean nothing.
 
 ### Or drive it from Claude Code
 
-`integrations/claude-skills/local-implement/SKILL.md` is a Claude Code skill that does all of the
+`integrations/claude-skills/local-implementer/SKILL.md` is a Claude Code skill that does all of the
 above: it interviews you about the change, writes the plan in verifiable form, checks it, runs it,
 and reports the harness's verdict rather than the model's account of itself.
 
 ```bash
 mkdir -p ~/.claude/skills
-cp -r integrations/claude-skills/local-implement ~/.claude/skills/   # every project on the machine
+cp -r integrations/claude-skills/local-implementer ~/.claude/skills/   # every project on the machine
 ```
 
 There are two skills, one per seat, and both install for both CLIs:
@@ -265,7 +265,7 @@ There are two skills, one per seat, and both install for both CLIs:
 tools/build-integrations --install
 ```
 
-`/local-implement` writes the plan; `/local-drive` gets an existing plan through the gates and
+`/local-implementer` writes the plan; `/local-drive` gets an existing plan through the gates and
 reports. The intended pairing is Claude planning and Codex driving — the expensive model spends its
 turn on the specification, which is the part that decides everything, and a cheaper one runs the
 loop. See [DRIVING.md](DRIVING.md).

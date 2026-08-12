@@ -1,5 +1,5 @@
 ---
-name: local-implement
+name: local-implementer
 description: Design a feature, write a machine-verifiable plan, and have a local model on this machine implement it while the harness verifies the result. Use when the user asks to build or change something with the local model, mentions agent-handoff, or says "implement this locally". Also use when they want a plan written in verifiable form.
 user-invocable: true
 ---

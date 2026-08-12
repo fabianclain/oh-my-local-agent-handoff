@@ -24,6 +24,42 @@ the tree: did the acceptance commands pass, did it touch only the files the plan
 quietly rewrite a file it was told to patch. A model that says "all tests pass" and changed nothing
 is scored as a failure, automatically.
 
+## How you use it
+
+Three steps. The rule underneath them is that **whoever writes the plan does not decide whether the
+result is acceptable** — a model reviewing its own work accepts its own misreading of the task,
+every time.
+
+**1. Plan with the hosted model, and ask for _only_ the plan.**
+
+Describe what you want, and say plainly: write the plan, do not implement it. Left to itself a
+capable model starts editing, and then it is both author and reviewer of its own work. What comes
+back is `.handoff/plans/<slug>.md` — the files it may touch, one criterion per line, and one shell
+command per criterion. `handoff check <slug>` refuses it if those disagree.
+
+**2. Hand it to the local model.**
+
+```bash
+/local-implementer     # from Claude Code, or `handoff do <slug>` directly
+```
+
+It implements, the harness verifies, and `handoff do` exits non-zero if the gates reject. Nothing
+is committed — you own the commit.
+
+**3. Read the gaps, not the report.**
+
+The model's account of its own work is the least reliable artifact available and is never trusted;
+every verdict comes from the files on disk. Read what the gates rejected, read the diff, and write
+down what the round missed. That list is the input to the next plan.
+
+The criteria are the deliverable, and prose is only advice. One plan said in bold *"do not comment
+out the removed blocks, delete them"*; the model commented the import out anyway, because the line
+above it was already a commented import and local convention beat the instruction.
+`test "$(grep -c 'SearchConsole' …)" -eq 0` caught what the sentence did not.
+
+**[docs/WORKFLOW.md](docs/WORKFLOW.md)** has the whole loop, including how to read each verdict and
+what to do about it.
+
 ## What it costs you, honestly
 
 - **Specification takes longer than the change** on small tasks. A five-minute edit is not worth a
@@ -53,10 +89,13 @@ handoff do <slug>                # implement the plan, verify it, print the diff
 `handoff do` exits non-zero if the gates reject the round. Nothing is committed — the reviewer owns
 the commit, always.
 
+**[docs/WORKFLOW.md](docs/WORKFLOW.md)** — how this is used day to day: plan with the hosted model
+and ask for *only* the plan, hand it to the local one, then read the gaps rather than the report.
+
 **[docs/START-HERE.md](docs/START-HERE.md)** — the same thing at walking pace, including how to
 read a verdict.
 
-**[docs/DRIVING.md](docs/DRIVING.md)** — the three seats. Claude plans with `/local-implement`,
+**[docs/DRIVING.md](docs/DRIVING.md)** — the three seats. Claude plans with `/local-implementer`,
 Codex runs the loop with `/local-drive`, the local model writes the code. Whoever writes the plan
 must not be whoever decides a rejected round was fine.
 

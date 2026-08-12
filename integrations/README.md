@@ -6,8 +6,8 @@ the harness's verdict rather than the model's account of itself.
 
 | CLI | Install |
 | --- | --- |
-| Claude Code | `cp -r integrations/claude-skills/local-implement ~/.claude/skills/` |
-| Codex | `cp integrations/codex-prompts/local-implement.md ~/.codex/prompts/` |
+| Claude Code | `cp -r integrations/claude-skills/local-implementer ~/.claude/skills/` |
+| Codex | `cp integrations/codex-prompts/local-implementer.md ~/.codex/prompts/` |
 
 Both are global once installed — every project on the machine, nothing per-project beyond
 `handoff init`.

@@ -19,7 +19,7 @@ Today the three seats are:
 
 | Seat | Runs as | Job |
 | --- | --- | --- |
-| **Planner** | Claude Code, `/local-implement` | Turn a request into a mechanically checkable specification |
+| **Planner** | Claude Code, `/local-implementer` | Turn a request into a mechanically checkable specification |
 | **Operator** | Codex, `/local-drive` | Get plans through the gates; repair, narrow, commit, report |
 | **Implementer** | gpt-oss-20b, `HANDOFF_PROVIDER=local` | Write the code |
 
@@ -89,7 +89,7 @@ A throwaway reference implementation of steps 1–3 was written, **all 40 assert
 file-count gates, which correctly failed with all four files present at once), and the
 implementation was then deleted. So: the plans are known-satisfiable and the hand-computed numbers
 are known-correct. **This is the one thing a planner can do that removes an entire class of wasted
-rounds, and it is not currently in the `/local-implement` procedure.** See §6.
+rounds, and it is not currently in the `/local-implementer` procedure.** See §6.
 
 ---
 
@@ -301,7 +301,7 @@ So a typo'd or drifted filter fails closed. **No change needed — record it so 
 
 `.husky/pre-commit` runs `php artisan test --compact`. Committing a judge before its implementation
 therefore *requires* `--no-verify`, and so does every implementation commit until the last test in
-the batch goes green. The `/local-implement` skill says "commit the tests before the run" without
+the batch goes green. The `/local-implementer` skill says "commit the tests before the run" without
 mentioning this, and `/local-drive` step 6 says `git add -A && git commit` with no `--no-verify`.
 **An operator following the skill literally will be blocked and will not know why.** Either the
 skill should name it, or the guidance should be to commit judges one step at a time.
@@ -313,7 +313,7 @@ cost ~10 minutes here and would have caught: a wrong hand-computed number, an un
 assertion, a filter that matches nothing, a Pint disagreement, and both file-count traps above.
 
 Against a documented 0/7 on greenfield, a planner-side dry run is cheap. **Proposed:** add it to
-`/local-implement` as an explicit step, or as `handoff dryrun <slug>` that runs a plan's
+`/local-implementer` as an explicit step, or as `handoff dryrun <slug>` that runs a plan's
 verification block and reports which commands can pass at all.
 
 ---

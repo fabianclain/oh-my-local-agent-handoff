@@ -12,7 +12,7 @@
 # already been bitten by exactly this shape once, when tools/check-plan and bench/run parsed plans
 # with copies of the same expressions.
 #
-#   integrations/procedure.md              /local-implement — writing the plan. Edit THIS.
+#   integrations/procedure.md              /local-implementer — writing the plan. Edit THIS.
 #   integrations/drive.md                  /local-drive     — running an existing plan. Edit THIS.
 #   integrations/headers/*.md              per-CLI frontmatter and framing
 #
@@ -27,14 +27,14 @@ cd "$REPO"
 
 # header : body : target. Two procedures, two CLIs, four generated files.
 #
-# The seats are separate skills on purpose. `local-implement` is for the model that turns a request
+# The seats are separate skills on purpose. `local-implementer` is for the model that turns a request
 # into a specification; `local-drive` is for the model that gets an existing specification through
 # the gates. Merging them produces a driver that quietly re-plans whenever a round is rejected,
 # which is the failure this split exists to prevent — the planner's judgement is the thing being
 # checked, and an operator that rewrites it has removed the check.
 BUILDS=(
-    "integrations/headers/claude-skill.md:integrations/procedure.md:integrations/claude-skills/local-implement/SKILL.md"
-    "integrations/headers/codex-prompt.md:integrations/procedure.md:integrations/codex-prompts/local-implement.md"
+    "integrations/headers/claude-skill.md:integrations/procedure.md:integrations/claude-skills/local-implementer/SKILL.md"
+    "integrations/headers/codex-prompt.md:integrations/procedure.md:integrations/codex-prompts/local-implementer.md"
     "integrations/headers/claude-drive-skill.md:integrations/drive.md:integrations/claude-skills/local-drive/SKILL.md"
     "integrations/headers/codex-drive-prompt.md:integrations/drive.md:integrations/codex-prompts/local-drive.md"
 )
@@ -71,13 +71,13 @@ done
 
 if [[ "$MODE" == "--install" ]]; then
     mkdir -p "$HOME/.claude/skills" "$HOME/.codex/prompts"
-    cp -r integrations/claude-skills/local-implement "$HOME/.claude/skills/"
+    cp -r integrations/claude-skills/local-implementer "$HOME/.claude/skills/"
     cp -r integrations/claude-skills/local-drive "$HOME/.claude/skills/"
-    cp integrations/codex-prompts/local-implement.md "$HOME/.codex/prompts/"
+    cp integrations/codex-prompts/local-implementer.md "$HOME/.codex/prompts/"
     cp integrations/codex-prompts/local-drive.md "$HOME/.codex/prompts/"
     echo
     echo "installed for:"
-    echo "  claude  /local-implement  — write the plan   (glm too: it is claude with z.ai's endpoint)"
+    echo "  claude  /local-implementer  — write the plan   (glm too: it is claude with z.ai's endpoint)"
     echo "  codex   /local-drive      — run the plan"
     echo
     echo "Both skills are installed for both CLIs. The split that matters is the seat, not the CLI:"

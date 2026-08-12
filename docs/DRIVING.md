@@ -5,7 +5,7 @@ different kinds of work, and because a model that does two of them is checking i
 
 | Seat | Runs as | The job | Why not one of the others |
 | --- | --- | --- | --- |
-| **Planner** | Claude Code, `/local-implement` | Turn a request into a specification whose every claim is mechanically checkable | This is the measured bottleneck. 48 of 48 plans written for human review were unrunnable, and every defect that shipped in ~30 real rounds came from a specification |
+| **Planner** | Claude Code, `/local-implementer` | Turn a request into a specification whose every claim is mechanically checkable | This is the measured bottleneck. 48 of 48 plans written for human review were unrunnable, and every defect that shipped in ~30 real rounds came from a specification |
 | **Operator** | Codex, `/local-drive` | Get those plans through the gates; repair, narrow, commit accepted steps, report | Cheap per hour, patient across a long loop, and it did not write the plan — so it has no stake in defending it |
 | **Implementer** | the local model, `HANDOFF_PROVIDER=local` | Write the code | Free at inference. Reliable when the specification is mechanical, unreliable at deciding anything |
 
@@ -17,7 +17,7 @@ The gates decide. Not the planner, not the operator, and never the implementer's
 
 ```bash
 # 1. Plan — in Claude Code, in the project you are changing
-/local-implement add a rankings page that shows position changes over 30 days
+/local-implementer add a rankings page that shows position changes over 30 days
 
 # 2. Hand over — Claude writes .handoff/plans/*.md and checks them, then stops
 

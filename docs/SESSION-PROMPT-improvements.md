@@ -31,7 +31,7 @@ failed for a second reason and so could not isolate what it claimed to test.
 - `docs/START-HERE.md` — the user-facing guide, including the calibration table
 - `docs/BENCHMARK-QUEUE.md` — what is queued and, more usefully, what was considered and rejected
 - `bench/COMPARISON.md` — nine rounds, the scoreboard, and the findings that were wrong
-- `~/.claude/skills/local-implement/SKILL.md` — the procedure a driver follows
+- `~/.claude/skills/local-implementer/SKILL.md` — the procedure a driver follows
 
 ## Where things stand
 
