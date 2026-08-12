@@ -167,6 +167,24 @@ done < <(cd "$WORKTREE" && find .handoff -name evidence.jsonl -maxdepth 4 2>/dev
     git -c core.quotePath=false ls-files --others --exclude-standard -- . "${EXCLUDES[@]}"
 } 2>/dev/null | sort -u >"$CHANGED"
 
+# Files that were already untracked when the run started are not the model's work.
+#
+# `git ls-files --others` above lists every untracked path in the tree with no idea who created
+# it, so anything a person left lying about was reported as invented and counted toward
+# patch-damaged. Six unrelated files in one real round did exactly that. bin/handoff records the
+# baseline before the provider runs; without it this is a no-op, which is correct for bench/run,
+# whose worktrees are cut fresh from a commit and have nothing untracked to begin with.
+if [[ -n "${HANDOFF_UNTRACKED_BEFORE:-}" && -s "${HANDOFF_UNTRACKED_BEFORE:-}" ]]; then
+    PREEXISTING="$(mktemp)"
+    sort -u "$HANDOFF_UNTRACKED_BEFORE" >"$PREEXISTING"
+    KEPT="$(mktemp)"
+    comm -23 "$CHANGED" "$PREEXISTING" >"$KEPT"
+    IGNORED=$(( $(wc -l <"$CHANGED") - $(wc -l <"$KEPT") ))
+    mv "$KEPT" "$CHANGED"
+    rm -f "$PREEXISTING"
+    (( IGNORED == 0 )) || echo "note: $IGNORED file(s) were already untracked before this run and are not counted against it" >&2
+fi
+
 if [[ ! -s "$CHANGED" ]]; then
     record "tree-changed" "fail" "the working tree is unchanged; nothing was implemented"
 else
@@ -354,7 +372,18 @@ else
     record "style" "skipped" "vendor/bin/pint not present in this tree"
 fi
 
-if [[ -x vendor/bin/phpstan ]]; then
+# phpstan needs to be told what to analyse. Without a phpstan.neon (or a `paths:` section in one)
+# it exits non-zero saying "At least one path must be specified to analyse" — on every round, in
+# every project that has the binary through a dependency but has never configured it.
+#
+# That is not a finding about the model's work. Reported from real use: three rounds in a row all
+# carried the same advisory failure for a configuration reason, and an advisory that always fails
+# is worse than one that does not run, because it teaches you to skip the whole section — which is
+# where the real findings are.
+if [[ -x vendor/bin/phpstan ]] && ! ls phpstan.neon phpstan.neon.dist phpstan.dist.neon >/dev/null 2>&1; then
+    record "static-analysis" "skipped" \
+        "vendor/bin/phpstan is present but this project has no phpstan.neon — nothing to analyse"
+elif [[ -x vendor/bin/phpstan ]]; then
     STAN_OUT="$OUT_DIR/phpstan.log"
     vendor/bin/phpstan analyse --no-progress >"$STAN_OUT" 2>&1 &&
         record "static-analysis" "pass" "phpstan clean" "vendor/bin/phpstan analyse" "$STAN_OUT" ||

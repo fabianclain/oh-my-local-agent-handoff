@@ -90,7 +90,22 @@ def load_records(repo: Path) -> list[dict]:
 # which tools were called, what the adapter complained about, and the token totals.
 
 
-WRITE_TOOLS = {"apply_patch", "write_file", "write_to_file", "create_file", "edit_file"}
+# Every tool that can change a file, across every client this harness drives.
+#
+# `replace_in_file` was missing, and it is the native loop's PRIMARY edit tool — so native rounds
+# that edited six files reported write_calls=0. The count is used for one thing, the infra-failure
+# heuristic ("writes: 0 means the model never attempted the work, re-run rather than re-specify"),
+# and a false zero sends you to re-run a round that actually did the work.
+WRITE_TOOLS = {"apply_patch", "write_file", "write_to_file", "create_file", "edit_file",
+               "replace_in_file", "str_replace_editor", "insert_edit_into_file"}
+
+# Tools that run arbitrary shell, and can therefore edit a file without naming it.
+#
+# `sed -i`, a heredoc, `php -r` writing a file — none of it is distinguishable from `ls` by tool
+# name, so no name-based count can be complete. Reported from real use: a round that changed four
+# files reported writes: 0 because it edited through the shell. The count below is therefore a
+# LOWER BOUND whenever one of these was called, and says so rather than implying certainty.
+SHELL_TOOLS = {"run_commands", "execute_command", "run_command", "bash", "shell", "terminal"}
 
 
 def mine_events(log: Path) -> dict:
@@ -133,6 +148,7 @@ def mine_events(log: Path) -> dict:
         "tool_calls": dict(tools),
         "total_tool_calls": sum(tools.values()),
         "write_calls": sum(n for t, n in tools.items() if t in WRITE_TOOLS),
+        "shell_calls": sum(n for t, n in tools.items() if t in SHELL_TOOLS),
         "errors": dict(errors),
         "tokens": tokens,
     }
@@ -317,7 +333,8 @@ def classify(tree: dict, gates: dict, report: dict, activity: dict) -> tuple[str
     infra_errors = {"tool-call-format", "context-overflow", "connection", "timeout"}
     hit_infra = bool(infra_errors & set((activity.get("errors") or {}).keys()))
 
-    if activity.get("parsed") and activity.get("write_calls") == 0 and changed == 0:
+    if (activity.get("parsed") and activity.get("write_calls") == 0
+            and not activity.get("shell_calls") and changed == 0):
         if hit_infra:
             notes.append("no write was ever attempted and the adapter reported an error — "
                          "re-run this plan once before changing it")
@@ -453,7 +470,9 @@ def fmt_row(r: dict) -> str:
     return (f"{r.get('recorded_at', ''):<21}{r.get('slug', '')[:28]:<29}"
             f"{r.get('outcome', ''):<20}{score:>7}"
             f"{(str(r.get('seconds')) + 's' if r.get('seconds') is not None else '-'):>8}"
-            f"{(str(act.get('write_calls')) if act.get('parsed') else '-'):>7}"
+            # `0?` where the round also ran shell commands: the count cannot see an edit made
+            # with `sed -i` or a heredoc, so a bare 0 there is an assertion the data cannot carry.
+            f"{(('-' if not act.get('parsed') else (f"{act.get('write_calls')}?" if act.get('write_calls') == 0 and act.get('shell_calls') else str(act.get('write_calls'))))):>7}"
             f"  {','.join(sorted((act.get('errors') or {}).keys()))}")
 
 
@@ -504,7 +523,10 @@ def cmd_stats(args: argparse.Namespace) -> int:
         if g.get("acceptance_total"):
             criteria_rates.append(g["acceptance_passed"] / g["acceptance_total"])
         act = r.get("activity") or {}
-        if act.get("parsed") and act.get("write_calls") == 0:
+        # Only count a genuine zero. A round that ran shell commands may have edited through them,
+        # so its write_calls=0 is unknown rather than zero, and folding it in here inflates the
+        # "never attempted" statistic with rounds that attempted plenty.
+        if act.get("parsed") and act.get("write_calls") == 0 and not act.get("shell_calls"):
             writes_zero += 1
 
     total = len(rows)

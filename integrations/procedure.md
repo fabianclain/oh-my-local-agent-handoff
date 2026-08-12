@@ -347,6 +347,20 @@ service-and-view step becomes a service step and a view step.
 loop does not yet. Treat it as the best available reasoning, and be ready to find it wrong — two
 other plausible improvements to the retry path already were.
 
+## Two things the gates cannot see
+
+**Whitespace scarring.** A deletion leaves the blank line that surrounded it, and an edit inside a
+nested block can come back re-indented. No acceptance command catches either — `grep -c` counts
+occurrences, not blank lines, and a re-indented span still satisfies every functional test. In a
+project with a formatter this is invisible because the formatter fixes it; in one without, it lands
+in the commit. **Budget for reading the diff for whitespace by hand, and say so in the round-up
+rather than pretending the gates covered it.**
+
+**A file the model did not create can still be charged to it.** Anything already untracked in the
+tree used to be reported as invented; that is fixed, and `handoff do` now records the untracked set
+before the run. It is still worth having a clean tree, because a verdict over a dirty one is a
+verdict about more than this round — which is what `doctor`'s warning is for.
+
 ## Setup
 
 `tools/install-local` from the agent-handoff checkout — it links `handoff` into `~/.local/bin` and

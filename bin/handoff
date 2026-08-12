@@ -289,6 +289,8 @@ run_verification() {
     # — kept working, so nothing here noticed. Found by running the actual first-use journey in a
     # scratch project rather than by testing the verifier directly.
     local verifier="$HANDOFF_HOME/tools/verify-round"
+    # Handed to the verifier so it can tell the model's new files from the repository's own.
+    export HANDOFF_UNTRACKED_BEFORE="$RUN_DIR/untracked-before"
 
     [[ -x "$verifier" ]] || {
         echo "==> no verifier at tools/verify-round — skipping (nothing checked this tree)" >&2
@@ -338,6 +340,18 @@ do)
     }
     mkdir -p "$RUN_DIR"
     snapshot_tree >"$RUN_DIR/tree-before"
+    # Which files were ALREADY untracked, before the model ran.
+    #
+    # The scope gate lists untracked files as ones the model invented, and had no way to tell a
+    # file the model created from one that was sitting in the repository beforehand. Reported from
+    # real use: six pre-existing untracked files in an unrelated directory were reported as
+    # "6 file(s) outside the plan, 6 of them invented" and turned an otherwise good round into
+    # patch-damaged.
+    #
+    # The benchmark could never have caught this. bench/run works in a worktree cut fresh from a
+    # commit, where nothing untracked exists — so the harness was correct in the only environment
+    # it was ever tested in, and wrong in every real repository.
+    git -c core.quotePath=false ls-files --others --exclude-standard >"$RUN_DIR/untracked-before" 2>/dev/null || : >"$RUN_DIR/untracked-before"
     PROMPT="Implement the plan in the file ${PLAN_FILE#"$REPO_ROOT"/} relative to the repository root.
 
 Read that file first, in full. It is the complete specification: implement every step and satisfy every acceptance criterion, and do not do anything it does not ask for.

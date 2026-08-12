@@ -988,6 +988,48 @@ else
     fail "sync-bench-clone would delete the archives bench/run --force creates"
 fi
 
+# --- pre-existing untracked files were reported as the model's inventions -----------------------
+# Reported from real use: an unrelated directory of six untracked files, present before the run,
+# came back as "6 file(s) outside the plan, 6 of them invented" and pushed an otherwise good round
+# to patch-damaged. `git ls-files --others` lists every untracked path with no idea who made it.
+#
+# bench/run could never have caught this: its worktrees are cut fresh from a commit, so nothing
+# untracked exists there. The harness was right in the only environment it was tested in.
+UNTRACKED_REPO="$SANDBOX/untracked-baseline"
+mkdir -p "$UNTRACKED_REPO"
+( cd "$UNTRACKED_REPO" && git init -q && mkdir -p src && echo "original" >src/kept.txt &&
+  git add -A && git -c user.email=t@t.invalid -c user.name=t commit -qm init ) >/dev/null 2>&1
+mkdir -p "$UNTRACKED_REPO/assets-unrelated"
+for n in 1 2 3; do echo "pre-existing" >"$UNTRACKED_REPO/assets-unrelated/f$n.bin"; done
+UNTRACKED_BASE="$( cd "$UNTRACKED_REPO" && git rev-parse HEAD )"
+( cd "$UNTRACKED_REPO" && git ls-files --others --exclude-standard >"$SANDBOX/untracked-before.txt" )
+cat >"$SANDBOX/untracked-plan.md" <<'PLAN'
+# Touch one file
+
+## Files to touch
+
+| Path | Action |
+| --- | --- |
+| `src/kept.txt` | modify |
+
+## Acceptance criteria
+
+- [ ] The file says changed
+
+## Verification
+
+```bash
+grep -q changed src/kept.txt
+```
+PLAN
+echo "changed" >"$UNTRACKED_REPO/src/kept.txt"
+UNTRACKED_OUT="$( HANDOFF_UNTRACKED_BEFORE="$SANDBOX/untracked-before.txt"     "$REPO/tools/verify-round" "$UNTRACKED_REPO" "$SANDBOX/untracked-plan.md" "$UNTRACKED_BASE"     "$SANDBOX/untracked-evidence" 2>&1 )"
+if grep -qE "invented" <<<"$UNTRACKED_OUT"; then
+    fail "pre-existing untracked files are still reported as the model's inventions"
+else
+    pass "files already untracked before the run are not charged to the model"
+fi
+
 # --- installed via symlink, every path pointed at the wrong place -------------------------------
 # tools/install-local links ~/.local/bin/handoff at the checkout, and HANDOFF_HOME was computed
 # from `dirname "${BASH_SOURCE[0]}"` — the directory it was INVOKED through. Installed, that is
