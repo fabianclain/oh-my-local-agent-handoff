@@ -30,7 +30,20 @@
 set -uo pipefail
 
 MODEL="${1:-qw3c-32k}"
-PORT="${SHIM_SELFTEST_PORT:-11511}"
+# A free port, chosen now, rather than a fixed one.
+#
+# 11511 was hardcoded, so two runs of this suite could not coexist: the second failed to bind and
+# reported `OSError: [Errno 98] Address already in use` as a traceback, which reads like a defect
+# in the shim. That happened tonight — tools/selftest-all was running in the background and again
+# in the foreground — and `BROKEN: shim-selftest` was very nearly chased as a regression.
+#
+# A suite that fails when a copy of itself is running is worse than flaky. It teaches whoever sees
+# it that selftest-all's failures are noise, which is the state in which a real one goes unread.
+PORT="${SHIM_SELFTEST_PORT:-$(python3 -c 'import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()')}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK="$(mktemp -d)"
 FAILURES=0
@@ -52,6 +65,10 @@ for _ in $(seq 1 20); do
 done
 curl -fsS --max-time 2 "http://127.0.0.1:$PORT/api/tags" >/dev/null 2>&1 || {
     echo "shim did not come up on port $PORT" >&2
+    if grep -q "Address already in use" "$WORK/shim.log" 2>/dev/null; then
+        echo "port $PORT is already bound. Another copy of this suite, or something else." >&2
+        echo "The port is normally chosen free at startup; SHIM_SELFTEST_PORT overrides it." >&2
+    fi
     sed -n '1,20p' "$WORK/shim.log" >&2
     exit 1
 }

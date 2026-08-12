@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+#
+# overnight-selftest — the queue runner, against queues built to break it.
+#
+#   tools/overnight-selftest
+#
+# tools/overnight sequences every unattended round: the deadline, the resume, the per-job timeout,
+# the state file and the summary someone reads in the morning. A defect in it costs a NIGHT rather
+# than a run, and until this file existed it was the one part of the harness with no automated
+# guard at all.
+#
+# It needs no model. Every job here is /bin/true, /bin/false or /bin/sleep, so the whole suite runs
+# in about half a minute and touches neither the GPU nor the benchmark lock.
+#
+# What each case is for, and where it came from:
+#
+#   1. order and state   — the queue runs in order and records what happened. The floor.
+#   2. resume skips ok   — a crash at 02:00 must skip forward, not start again. Checked by hand on
+#                          2026-08-13 and correct; this is what keeps it correct.
+#   3. resume retries    — a job that failed is NOT skipped, or a crash would silently drop work.
+#   4. one row per job   — after a resume the state file holds a line per attempt, and the summary
+#                          rendered all of them: `delta | skipped` above `delta | ok`, and one job
+#                          shown as both failed and timeout. That file is read precisely when a
+#                          night was interrupted, which is when it must not need interpreting.
+#   5. the deadline      — a job that cannot finish before --until is skipped WITH THAT REASON and
+#                          never started, rather than being cut off partway.
+#   6. timeout recorded  — a job that overruns is recorded as `timeout`, distinctly from `failed`,
+#                          because one means the machine is wedged and the other means the job is.
+#   7. no orphans        — when the runner exits, nothing it started is still alive. A killed
+#                          overnight left its bench/run child running for 23 minutes on
+#                          2026-08-13, and it was found by hand while the lock was being chased.
+
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OVERNIGHT="$HERE/overnight"
+SANDBOX="$(mktemp -d)"
+FAILURES=0
+
+trap 'rm -rf "$SANDBOX"' EXIT
+
+pass() { echo "    PASS: $1"; }
+fail() { echo "    FAIL: $1"; FAILURES=$(( FAILURES + 1 )); }
+
+[[ -x "$OVERNIGHT" ]] || { echo "tools/overnight not found" >&2; exit 2; }
+
+# Every job is --no-gpu so the preflight never reaches doctor or the server: this suite must not
+# depend on a model being up, or it becomes a test of the machine rather than of the runner.
+queue() { cat >"$SANDBOX/$1.sh"; }
+run_queue() {
+    local name="$1"; shift
+    ( cd "$SANDBOX" && OVERNIGHT_DIR="$SANDBOX/runs-$name" \
+        "$OVERNIGHT" "$SANDBOX/$name.sh" "$@" ) >"$SANDBOX/$name.out" 2>&1
+}
+run_dir() { ls -d "$SANDBOX/runs-$1"/*/ 2>/dev/null | head -1; }
+state_of() { cat "$(run_dir "$1")/state.tsv" 2>/dev/null; }
+
+echo "==> 1/7 the queue runs in order and records each outcome"
+queue basic <<'EOF'
+job alpha --no-gpu --timeout 60 -- /bin/true
+job bravo --no-gpu --timeout 60 -- /bin/false
+job charlie --no-gpu --timeout 60 -- /bin/true
+EOF
+run_queue basic
+GOT="$(state_of basic | awk -F'\t' '{print $1":"$2}' | paste -sd' ')"
+if [[ "$GOT" != "alpha:ok bravo:failed charlie:ok" ]]; then
+    fail "expected 'alpha:ok bravo:failed charlie:ok', got '$GOT'"
+else
+    pass "three jobs, in order, with the middle one recorded failed"
+fi
+
+echo "==> 2/7 a resumed run skips what already succeeded"
+RD="$(run_dir basic)"
+run_queue basic --resume "${RD%/}"
+if ! grep -q "skip  alpha" "$SANDBOX/basic.out"; then
+    fail "alpha was not skipped on resume"
+    tail -6 "$SANDBOX/basic.out" | sed 's/^/        /'
+elif ! grep -q "skip  charlie" "$SANDBOX/basic.out"; then
+    fail "charlie was not skipped on resume"
+else
+    pass "jobs recorded ok are skipped rather than repeated"
+fi
+
+echo "==> 3/7 a resumed run retries what failed"
+# The other half of case 2, and the dangerous half: skipping a FAILED job would drop work silently
+# and leave the night looking complete.
+if ! grep -q "start bravo" "$SANDBOX/basic.out"; then
+    fail "bravo failed before, and the resume did not retry it"
+else
+    pass "a failed job is retried, not skipped"
+fi
+
+echo "==> 4/7 the summary shows one row per job, not one per attempt"
+ROWS="$(grep -c '^| bravo |' "$(run_dir basic)/summary.md" 2>/dev/null || echo 0)"
+if [[ "$ROWS" != 1 ]]; then
+    fail "bravo appears in $ROWS summary rows after a resume, expected 1"
+    grep '^|' "$(run_dir basic)/summary.md" | sed 's/^/        /'
+elif ! grep -q '^| bravo |.*attempt 2' "$(run_dir basic)/summary.md"; then
+    fail "the retry is hidden — bravo ran twice and the summary does not say so"
+else
+    pass "one row per job, carrying its last outcome and the attempt count"
+fi
+
+echo "==> 5/7 a job that cannot finish before the deadline is skipped, not started"
+queue deadline <<'EOF'
+job quick --no-gpu --est 1 --timeout 60 -- /bin/true
+job toolong --no-gpu --est 36000 --timeout 60 -- /bin/true
+EOF
+# One minute from now: `quick` fits, `toolong` claims ten hours and cannot.
+run_queue deadline --until "$(date -d '+1 minute' +%H:%M)"
+if ! grep -qP '^toolong\tskipped' "$(run_dir deadline)/state.tsv" 2>/dev/null; then
+    fail "a job that could not finish before the deadline was not skipped"
+    state_of deadline | sed 's/^/        /'
+elif ! grep -q 'deadline' "$(run_dir deadline)/state.tsv"; then
+    fail "skipped, but the recorded reason does not mention the deadline"
+else
+    pass "the deadline skips a job it cannot fit, and says why"
+fi
+
+echo "==> 6/7 an overrunning job is recorded as timeout, distinctly from failed"
+queue slow <<'EOF'
+job wedged --no-gpu --timeout 2 -- /bin/sleep 60
+EOF
+run_queue slow
+if ! grep -qP '^wedged\ttimeout' "$(run_dir slow)/state.tsv" 2>/dev/null; then
+    fail "an overrunning job was not recorded as timeout"
+    state_of slow | sed 's/^/        /'
+else
+    pass "timeout is its own status — a wedged machine and a broken job read differently"
+fi
+
+echo "==> 7/7 nothing the runner started is still alive when it exits"
+# A killed overnight left its bench/run child running for 23 minutes, competing for the GPU and the
+# lock with whatever came next. The marker is unique to this run, so nothing else can match it.
+MARKER="overnight-selftest-$$-orphan"
+queue orphan <<EOF
+job spawner --no-gpu --timeout 4 -- /bin/sleep 120 $MARKER
+EOF
+run_queue orphan
+sleep 2
+if pgrep -f "sleep 120 $MARKER" >/dev/null 2>&1; then
+    fail "a job process outlived the runner: $(pgrep -af "sleep 120 $MARKER" | head -1)"
+    pkill -9 -f "sleep 120 $MARKER" 2>/dev/null
+else
+    pass "the job was killed at its timeout and left nothing behind"
+fi
+
+echo
+if [[ "$FAILURES" -eq 0 ]]; then
+    echo "all checks passed"
+else
+    echo "$FAILURES check(s) failed"
+fi
+exit $(( FAILURES > 0 ? 1 : 0 ))
