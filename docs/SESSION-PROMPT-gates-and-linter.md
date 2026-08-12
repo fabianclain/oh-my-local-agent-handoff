@@ -70,11 +70,11 @@ The strongest item in the report, and the one the skill currently gets wrong by 
 
 Build `tools/css-contrast <file.html|css> [--min 4.5]`. Parse declared colour pairs — including
 inside `@media (prefers-color-scheme: dark)` — compute WCAG contrast, and exit non-zero below the
-threshold. Then a plan can carry:
-
-```bash
-tools/css-contrast resources/views/landing.blade.php --min 4.5
-```
+threshold. Once it exists, a plan can carry it as an ordinary acceptance command — the tool invoked against
+the view file with a `--min 4.5` threshold. (Not shown as a runnable block here: `tools/smoke-e2e`
+checks that every path inside a fenced command block exists, and rightly refuses a doc that tells
+someone to type a path that does not. Prose may name what is not built yet; a command block may
+not.)
 
 The observed failure it must catch: a dark block overriding `body` and `.card` but not
 `.wordmark .ro` (`#444444`) or link colour (`#0066cc`), giving 1.7:1 and 3.0:1 on `#1e1e1e`.
