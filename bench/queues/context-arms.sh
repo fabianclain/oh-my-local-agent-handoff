@@ -47,7 +47,12 @@ job conformance --timeout 900 -- \
 job sync-clone --no-gpu --timeout 300 -- "$HANDOFF/tools/sync-bench-clone" "$CLONE"
 
 # Waves, so an interruption leaves the arms balanced. Last night proved the value of that twice.
-for wave in 1 2 3 4 5 6; do
+#
+# CONTEXT_ARM_WAVES bounds the run without editing this file: 6 gives n=18 per arm, which is what
+# it took last night for a twofold "speedup" at p = 0.02 to dissolve into nothing. Anything less is
+# a look, not an answer, and the readout should be read that way.
+WAVES="${CONTEXT_ARM_WAVES:-6}"
+for wave in $(seq 1 "$WAVES"); do
     flag="--append"
     [[ "$wave" == 1 ]] && flag="--force"
 
