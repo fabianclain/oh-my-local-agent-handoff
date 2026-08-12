@@ -205,6 +205,13 @@ def main() -> int:
         print("per-completion rate understates report loss by roughly that factor. To get the real")
         print("figure, join these against the runs that recorded no report:")
         print("  tools/final-turn-shape bench/results/<plan>")
+        print()
+        print("For the same reason this rate is NOT comparable between plans. The report is where")
+        print("this fault concentrates, so a plan whose rounds are short spends a large fraction of")
+        print("its completions on reports and reads high; a plan with long rounds dilutes the same")
+        print("behaviour. Measured on one night: 18.6% over `site`, whose rounds run about a dozen")
+        print("completions, against 1.3% over `wide` at thirty to fifty. Nothing about the stack")
+        print("changed between them. Compare plans by report loss per ROUND, never by this figure.")
 
     if counts.get("header-transposition"):
         print()
