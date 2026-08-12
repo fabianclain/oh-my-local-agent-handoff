@@ -88,8 +88,14 @@ for wave in 1 2 3 4 5; do
 
     # Acceptance is the weaker claim. A semantic run the gates accepted and the fuzzer rejects is
     # the finding worth waking up to, and it costs no GPU.
+    #
+    # Scoped to THIS night's arm. The fuzzer exits non-zero when it finds a wrong implementation,
+    # which the queue reports as a failed job — correct, and the loudest signal available. Pointed
+    # at the whole plan directory it also sees arms from previous nights, so wave 1 reported FAIL
+    # for a known failure recorded days earlier and every later wave would have repeated it. A
+    # warning that fires every time is one nobody reads, and it would have buried a real one.
     job "wave$wave-fuzz" --no-gpu --cwd "$CLONE" --timeout 900 -- \
-        ./bench/checks/fuzz-all-semantic bench/results/semantic
+        ./bench/checks/fuzz-all-semantic bench/results/semantic/native
 done
 
 # --- what the morning reads ---------------------------------------------------------------------
