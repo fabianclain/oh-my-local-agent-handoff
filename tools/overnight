@@ -261,10 +261,23 @@ done
     echo
     echo "| job | status | time |"
     echo "| --- | --- | ---: |"
-    while IFS=$'\t' read -r n s secs detail; do
-        printf '| %s | %s%s | %sm |\n' "$n" "$s" \
-            "${detail:+ — $detail}" "$(( secs / 60 ))"
-    done <"$STATE"
+    # One row per job, showing its LAST outcome.
+    #
+    # `record` appends, so after a --resume a job that failed and then succeeded has two lines in
+    # state.tsv. Rendered straight, the summary showed `delta | skipped — run was interrupted`
+    # above `delta | ok`, and `charlie` as both failed and timeout — a reader has to know the later
+    # row wins. A summary is read precisely when a night was interrupted, which is the one time it
+    # must not need interpreting.
+    #
+    # The earlier attempts are not lost: state.tsv keeps every line, and the per-job logs are
+    # beside this file. A retried job says so rather than hiding that it took two goes.
+    awk -F'\t' '{ last[$1] = $0; if (!($1 in seen)) { order[++n] = $1; seen[$1] = 0 }
+                  seen[$1]++ }
+         END { for (i = 1; i <= n; i++) { split(last[order[i]], f, "\t")
+                   detail = f[4]; if (seen[order[i]] > 1)
+                       detail = detail (detail ? ", " : "") "attempt " seen[order[i]]
+                   printf "| %s | %s%s | %dm |\n", f[1], f[2],
+                          (detail ? " — " detail : ""), f[3] / 60 } }' "$STATE"
     echo
     echo "$RAN ran, $FAILED failed, $SKIPPED skipped."
     echo
