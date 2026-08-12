@@ -244,12 +244,20 @@ The implementer never commits.
 ### 8b. Check whether the round happened at all before diagnosing it
 
 ```bash
-handoff log <slug>          # outcome, criteria score, writes, adapter errors — one line per round
+handoff log <slug>          # outcome, criteria score, files, adapter errors — one line per round
 ```
 
-If the **writes** column is 0, the model never attempted the task: an adapter fault or a context
-overflow ate the round. Re-run the same plan once; do not re-specify it. Backfilling three real
-runs found a context overflow in all three, which had been read as the model failing.
+If the **files** column is 0, the tree is untouched: the model never attempted the task, and an
+adapter fault or a context overflow ate the round. Re-run the same plan once; do not re-specify it.
+Backfilling three real runs found a context overflow in all three, which had been read as the model
+failing.
+
+**This column used to count tool calls and was not trustworthy.** It counted calls to a fixed list
+of tool names, so it missed `replace_in_file` and every edit made through the shell — a reported
+round that deleted eleven files showed 0, and following this section literally would have sent you
+to re-run a round that had done the work. It now counts what the diff says changed, created or
+deleted, so a 0 means the tree really did not move. That is the only version of this signal worth
+acting on: if you are reading an older run, check the diff before trusting a 0.
 
 **A missing report is not a diagnosis, and it is not yours to fix.** Roughly a quarter of real
 rounds end this way. One mechanism is confirmed — the model emits the report, llama.cpp's harmony
@@ -375,9 +383,36 @@ service-and-view step becomes a service step and a view step.
 loop does not yet. Treat it as the best available reasoning, and be ready to find it wrong — two
 other plausible improvements to the retry path already were.
 
+## Acceptance commands that read tool output must not grep for colour
+
+The harness runs every acceptance command with `NO_COLOR=1` and `TERM=dumb`, so this is handled by
+default. It is worth knowing anyway, because it produced the most confusing failure yet reported:
+
+```
+php artisan test | grep -qE 'Tests:[^0-9]*77 passed'
+```
+
+That criterion could not pass over **any** tree. artisan colours its output, and the escape
+sequences between `Tests:` and the number contain digits:
+
+```
+^[[90mTests:^[[39m    ^[[32;1m77 passed^[[39;22m
+```
+
+so `[^0-9]*` can never span them. The tree was perfect, the suite really was at 77, and the round
+was rejected. **A broken criterion and a broken implementation are indistinguishable from the
+verdict alone** — which is why the first move on a failure is to read the command's own log, not
+the diff.
+
+Prefer counting to pattern-matching where you can: `test "$(… | grep -c …)" -eq 0` survives
+formatting changes that a shape-matching regex does not.
+
 ## Two things the gates cannot see
 
-**Whitespace scarring.** A deletion leaves the blank line that surrounded it, and an edit inside a
+**Whitespace scarring — a risk of EDIT steps, not delete steps.** This tells you which rounds need
+the manual read: a step that only deletes whole files has no surviving edited file to scar, and a
+pure-deletion round can be reviewed from the file list alone. A step that edits inside an existing
+file is where it happens. A deletion leaves the blank line that surrounded it, and an edit inside a
 nested block can come back re-indented. No acceptance command catches either — `grep -c` counts
 occurrences, not blank lines, and a re-indented span still satisfies every functional test. In a
 project with a formatter this is invisible because the formatter fixes it; in one without, it lands

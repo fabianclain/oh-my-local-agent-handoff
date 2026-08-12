@@ -130,8 +130,7 @@ def mine_events(log: Path) -> dict:
         elif kind == "content_end" and event.get("contentType") == "tool":
             tools[event.get("toolName") or "?"] += 1
         elif kind == "error":
-            message = (event.get("error") or {}).get("message") or str(event.get("error"))
-            errors[classify_error(message)] += 1
+            errors[classify_error(error_message(event.get("error")))] += 1
         elif kind == "usage":
             tokens = {
                 "input": event.get("totalInputTokens"),
@@ -165,6 +164,10 @@ ERROR_CLASSES = [
     #
     # Ordered above the generic patterns deliberately: "tool-io fault: ... timed out" must classify
     # as ours rather than matching the timeout rule below.
+    # `tool-scope fault` was missing while the other three were present, so a scope refusal — the
+    # most common one, since it fires whenever the model reaches outside the plan's file list —
+    # fell through to the raw message and showed up as its own unique "class" every time.
+    (r"tool-scope fault", "harness-scope"),
     (r"tool-encoding fault", "harness-encoding"),
     (r"tool-postcondition fault", "harness-postcondition"),
     (r"tool-io fault", "harness-io"),
@@ -178,11 +181,37 @@ ERROR_CLASSES = [
 ]
 
 
+def error_message(error) -> str:
+    """The human-readable text of an error event, whatever shape it arrived in.
+
+    `(event.get("error") or {}).get("message")` was here, and it broke on all three shapes that
+    are not a dict carrying `message`:
+
+      * a bare string — `"boom"` — raised AttributeError and took the whole entry's activity with
+        it, so the round showed no tool counts and no errors at all
+      * absent — classified as the literal string "None"
+      * a dict with an empty message — classified as "{'message': ''}"
+
+    Each produced a nonsense row in the errors column rather than a class anyone could act on.
+    """
+    if isinstance(error, str):
+        return error
+    if isinstance(error, dict):
+        for key in ("message", "error", "detail", "name"):
+            value = error.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+        return "unknown-error"
+    return "unknown-error" if error is None else str(error)
+
+
 def classify_error(message: str) -> str:
     for pattern, name in ERROR_CLASSES:
         if re.search(pattern, message, re.I):
             return name
-    return message.strip()[:80]
+    # Never return an empty label: it renders as a bare separator in the errors column and reads
+    # as a formatting fault rather than as an error nobody has classified yet.
+    return message.strip()[:80] or "unknown-error"
 
 
 def trim_log(src: Path, dest: Path) -> None:
@@ -462,6 +491,15 @@ def cmd_record(args: argparse.Namespace) -> int:
 # read
 
 
+def _files_touched(r: dict) -> str:
+    """How many files the round changed, created or deleted, from the diff rather than the log."""
+    tree = r.get("tree") or {}
+    if not tree.get("known"):
+        return "-"
+    return str(len(tree.get("changed") or []) + len(tree.get("created") or [])
+               + len(tree.get("deleted") or []))
+
+
 def fmt_row(r: dict) -> str:
     g = r.get("gates") or {}
     score = (f"{g.get('acceptance_passed')}/{g.get('acceptance_total')}"
@@ -470,9 +508,20 @@ def fmt_row(r: dict) -> str:
     return (f"{r.get('recorded_at', ''):<21}{r.get('slug', '')[:28]:<29}"
             f"{r.get('outcome', ''):<20}{score:>7}"
             f"{(str(r.get('seconds')) + 's' if r.get('seconds') is not None else '-'):>8}"
-            # `0?` where the round also ran shell commands: the count cannot see an edit made
-            # with `sed -i` or a heredoc, so a bare 0 there is an assertion the data cannot carry.
-            f"{(('-' if not act.get('parsed') else (f"{act.get('write_calls')}?" if act.get('write_calls') == 0 and act.get('shell_calls') else str(act.get('write_calls'))))):>7}"
+            # FILES THE TREE ACTUALLY GAINED, LOST OR CHANGED — not tool calls.
+            #
+            # This column counted calls to a fixed list of tool names, and was wrong in every
+            # direction that mattered. It missed `replace_in_file`. It missed every edit made
+            # through the shell, so a round that deleted eleven files reported 0. And the whole
+            # point of the column is the infra-failure heuristic — "0 means the model never
+            # attempted the task, re-run rather than re-specify" — which a false 0 sends you to
+            # apply to a round that did the work.
+            #
+            # A name-based count can never be complete, because `rm`, `sed -i` and a heredoc are
+            # indistinguishable from `ls` by tool name. The tree cannot lie in the same way: it is
+            # the same source every verdict here already comes from. 0 now means the tree is
+            # untouched, which is exactly what the heuristic needs it to mean.
+            f"{_files_touched(r):>7}"
             f"  {','.join(sorted((act.get('errors') or {}).keys()))}")
 
 
@@ -483,7 +532,7 @@ def cmd_list(args: argparse.Namespace) -> int:
     if not rows:
         print("no runs recorded yet")
         return 0
-    print(f"{'when':<21}{'slug':<29}{'outcome':<20}{'score':>7}{'time':>8}{'writes':>7}  errors")
+    print(f"{'when':<21}{'slug':<29}{'outcome':<20}{'score':>7}{'time':>8}{'files':>7}  errors")
     for r in rows[-args.limit:]:
         print(fmt_row(r))
     return 0

@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""journal-selftest — the two columns a person actually reads.
+
+    tools/journal-selftest
+
+Both were wrong in real use, and both were wrong in the direction that costs time: they described
+a round as something it was not, confidently.
+
+    files    counted calls to a fixed list of TOOL NAMES. It missed `replace_in_file`, and it
+             missed every edit made through the shell — so a round that deleted eleven files
+             reported 0. The column exists for one heuristic, "0 means the model never attempted
+             the task, re-run rather than re-specify", and a false 0 sends you to apply that to a
+             round that did the work. Twice, in one reported session.
+
+    errors   `(event.get("error") or {}).get("message")` handled exactly one of the four shapes an
+             error event arrives in. A bare string raised AttributeError and silently took the
+             whole round's activity with it; a missing error became the class "None"; an empty
+             message became "{'message': ''}".
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import pathlib
+import sys
+import tempfile
+from importlib.machinery import SourceFileLoader
+
+HERE = pathlib.Path(__file__).resolve().parent
+JOURNAL = HERE / "journal"
+
+
+def load():
+    spec = importlib.util.spec_from_file_location(
+        "journal", JOURNAL, loader=SourceFileLoader("journal", str(JOURNAL)))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def tool_event(name: str) -> dict:
+    return {"type": "agent_event", "event": {
+        "type": "content_end", "contentType": "tool", "toolName": name,
+        "output": {"query": "{}", "result": "ok", "success": True}}}
+
+
+def error_event(payload) -> dict:
+    event = {"type": "error"}
+    if payload is not _MISSING:
+        event["error"] = payload
+    return {"type": "agent_event", "event": event}
+
+
+_MISSING = object()
+
+
+def check_errors(journal) -> tuple[int, int]:
+    """Every shape an error event has actually arrived in."""
+    cases = [
+        ("a native tool fault is a harness class",
+         {"message": "tool-scope fault in write_file: outside the plan"}, "harness-scope"),
+        ("the other harness classes still map",
+         {"message": "tool-encoding fault in read_files: not UTF-8"}, "harness-encoding"),
+        ("cline's Error object maps to the parse fault",
+         {"name": "Error", "message": "does not match the expected peg-native format"},
+         "tool-call-format"),
+        # The three that were broken.
+        ("a bare string does not crash the whole entry", "boom", "boom"),
+        ("a missing error is labelled, not stringified", _MISSING, "unknown-error"),
+        ("an empty message is labelled, not repr'd", {"message": ""}, "unknown-error"),
+    ]
+    failures = 0
+    with tempfile.TemporaryDirectory() as tmp:
+        log = pathlib.Path(tmp) / "stdout.log"
+        for name, payload, expected in cases:
+            log.write_text(json.dumps(error_event(payload)) + "\n"
+                           + json.dumps(tool_event("run_commands")) + "\n")
+            try:
+                got = list((journal.mine_events(log).get("errors") or {}).keys())
+            except Exception as error:  # noqa: BLE001
+                print(f"FAIL  errors: {name}\n        raised {type(error).__name__}: {error}")
+                failures += 1
+                continue
+            if got != [expected]:
+                print(f"FAIL  errors: {name}\n        got {got}, expected [{expected!r}]")
+                failures += 1
+            else:
+                print(f"pass  errors: {name}")
+    return len(cases), failures
+
+
+def check_files_column(journal) -> tuple[int, int]:
+    """The column must count the TREE, because no tool-name list can be complete."""
+    cases = [
+        ("a round that deleted files through the shell is not 0",
+         {"known": True, "changed": [], "created": [], "deleted": [f"f{i}.php" for i in range(11)]},
+         "11"),
+        ("edits and creations are counted too",
+         {"known": True, "changed": ["a.php", "b.php"], "created": ["c.php"], "deleted": []}, "3"),
+        # The only honest 0: nothing in the tree moved. This is what the infra-failure heuristic
+        # keys on, and it is only trustworthy because it no longer depends on tool names.
+        ("an untouched tree really is 0",
+         {"known": True, "changed": [], "created": [], "deleted": []}, "0"),
+        ("an unknown tree is not reported as 0", {"known": False}, "-"),
+    ]
+    failures = 0
+    for name, tree, expected in cases:
+        got = journal._files_touched({"tree": tree})
+        if got != expected:
+            print(f"FAIL  files: {name}\n        got {got!r}, expected {expected!r}")
+            failures += 1
+        else:
+            print(f"pass  files: {name}")
+    return len(cases), failures
+
+
+def main() -> int:
+    if not JOURNAL.exists():
+        print("journal not found", file=sys.stderr)
+        return 2
+    journal = load()
+    total = 0
+    failures = 0
+    for check in (check_errors, check_files_column):
+        n, f = check(journal)
+        total += n
+        failures += f
+    print()
+    if failures:
+        print(f"{failures} check(s) failed")
+        return 1
+    print(f"{total} check(s) passed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

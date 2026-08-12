@@ -220,7 +220,24 @@ if [[ -s "$VERIFY_CMDS" ]]; then
     while IFS= read -r command; do
         IDX=$(( IDX + 1 )); TOTAL=$(( TOTAL + 1 ))
         OUT="$OUT_DIR/acceptance-$IDX.log"
-        timeout 120 bash -o pipefail -c "$command" >"$OUT" 2>&1
+        # Colour OFF for everything an acceptance command runs.
+        #
+        # A criterion of the shape `artisan test | grep -qE 'Tests:[^0-9]*77 passed'` could never
+        # pass over ANY tree, because artisan colours its output and the escape sequences between
+        # `Tests:` and the number CONTAIN DIGITS:
+        #
+        #     ^[[90mTests:^[[39m    ^[[32;1m77 passed^[[39;22m
+        #
+        # so `[^0-9]*` cannot span them. The tree was perfect and the criterion was unsatisfiable,
+        # which is indistinguishable from a broken implementation until someone reads the raw log.
+        # Reported from real use, and it cost a round.
+        #
+        # NO_COLOR is the cross-tool convention and Symfony Console — so every artisan command —
+        # honours it, as do ripgrep, pytest, cargo, npm and most modern CLIs. TERM=dumb catches
+        # the ones that probe the terminal instead. This cannot fix a plan that greps for escape
+        # codes deliberately, but it removes the trap from the default case.
+        NO_COLOR=1 TERM=dumb CLICOLOR=0 CLICOLOR_FORCE=0 \
+            timeout 120 bash -o pipefail -c "$command" >"$OUT" 2>&1
         if [[ $? -eq 0 ]]; then
             PASSED=$(( PASSED + 1 ))
             record "acceptance-$IDX" "pass" "exit 0" "$command" "$OUT"
@@ -380,7 +397,15 @@ fi
 # carried the same advisory failure for a configuration reason, and an advisory that always fails
 # is worse than one that does not run, because it teaches you to skip the whole section — which is
 # where the real findings are.
-if [[ -x vendor/bin/phpstan ]] && ! ls phpstan.neon phpstan.neon.dist phpstan.dist.neon >/dev/null 2>&1; then
+# Each candidate tested on its own. `ls a b c` returns non-zero when ANY operand is missing, so
+# `! ls phpstan.neon phpstan.neon.dist phpstan.dist.neon` was true even when one of them existed —
+# which skipped the gate in exactly the projects that had configured it. A guard that silently
+# disables the check it guards is worse than the noise it was written to remove.
+STAN_CONFIGURED=0
+for candidate in phpstan.neon phpstan.neon.dist phpstan.dist.neon; do
+    [[ -f "$candidate" ]] && STAN_CONFIGURED=1
+done
+if [[ -x vendor/bin/phpstan ]] && (( ! STAN_CONFIGURED )); then
     record "static-analysis" "skipped" \
         "vendor/bin/phpstan is present but this project has no phpstan.neon — nothing to analyse"
 elif [[ -x vendor/bin/phpstan ]]; then

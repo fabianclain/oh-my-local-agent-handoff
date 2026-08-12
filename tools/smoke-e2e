@@ -988,6 +988,54 @@ else
     fail "sync-bench-clone would delete the archives bench/run --force creates"
 fi
 
+# --- an acceptance command that greps coloured tool output ---------------------------------------
+# Reported from real use, and it cost a round. The criterion was
+#   php artisan test | grep -qE 'Tests:[^0-9]*77 passed'
+# and it could not pass over ANY tree, because artisan colours its output and the escape sequences
+# between `Tests:` and the number contain digits — ^[[90m, ^[[39m, ^[[32;1m — so `[^0-9]*` cannot
+# span them. A perfect tree and an unsatisfiable criterion look identical from the verdict alone.
+COLOUR_REPO="$SANDBOX/ansi-criterion"
+mkdir -p "$COLOUR_REPO"
+( cd "$COLOUR_REPO" && git init -q && printf 'ok\n' >marker.txt && git add -A &&
+  git -c user.email=t@t.invalid -c user.name=t commit -qm init ) >/dev/null 2>&1
+COLOUR_BASE="$( cd "$COLOUR_REPO" && git rev-parse HEAD )"
+# Stands in for artisan: colours unless told not to.
+cat >"$COLOUR_REPO/fake-artisan" <<'ARTISAN'
+#!/bin/bash
+if [ -n "$NO_COLOR" ] || [ "$TERM" = "dumb" ]; then printf 'Tests:    77 passed
+'
+else printf '[90mTests:[39m    [32;1m77 passed[39;22m
+'; fi
+ARTISAN
+chmod +x "$COLOUR_REPO/fake-artisan"
+cat >"$SANDBOX/ansi-plan.md" <<'PLAN'
+# Colour trap
+
+## Files to touch
+
+| Path | Action |
+| --- | --- |
+| `marker.txt` | modify |
+
+## Acceptance criteria
+
+- [ ] The suite reports 77 passing
+
+## Verification
+
+```bash
+./fake-artisan | grep -qE 'Tests:[^0-9]*77 passed'
+```
+PLAN
+printf 'changed\n' >"$COLOUR_REPO/marker.txt"
+COLOUR_OUT="$( "$REPO/tools/verify-round" "$COLOUR_REPO" "$SANDBOX/ansi-plan.md" "$COLOUR_BASE" \
+    "$SANDBOX/ansi-evidence" 2>&1 )"
+if grep -qE "1 of 1 acceptance commands passed" <<<"$COLOUR_OUT"; then
+    pass "acceptance commands run with colour disabled, so a grep over tool output is not a trap"
+else
+    fail "a criterion grepping coloured output still cannot pass: $(grep -c 'acceptance' <<<"$COLOUR_OUT") lines"
+fi
+
 # --- pre-existing untracked files were reported as the model's inventions -----------------------
 # Reported from real use: an unrelated directory of six untracked files, present before the run,
 # came back as "6 file(s) outside the plan, 6 of them invented" and pushed an otherwise good round
