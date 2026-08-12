@@ -511,3 +511,63 @@ majority; a minority are context-locked and no retry count reaches them.
 
 One wrong implementation in sixteen, and it passed all nine criteria. See the tenth criterion added
 above.
+
+## The night of 2026-08-12/13: a plan shape the gates had never seen
+
+The goal was harness reliability rather than a number about the model. `wide` is saturated —
+17/18 accepted, 20/20 criteria, so it can no longer discriminate — and every gate in this harness
+was built against PHP fixtures. `site` and `site-dark` are the first plans that create a file
+rather than edit one, verify with something other than `php -r`, and gate on markup and colour.
+
+**Six defects, four of them in the harness itself.** Every one was found before a model result
+depended on it, and three were found at zero GPU cost.
+
+| Found by | Defect |
+| --- | --- |
+| `plan-lint`, on the first run of a new plan | Criterion 12 counted files with `git status --porcelain`, which collapses an untracked DIRECTORY to one line. A scope guard written that way has silently stopped guarding |
+| reading the classifier | `patch-damaged` was the else branch, so "scattered files across the repo" and "did not finish" shared a label. **Five of eleven recorded damaged runs had damaged nothing** |
+| running the new selftest | `tools/selftest-all` resolved suites only under `tools/`, so a suite beside its fixture printed `SKIP (missing)` — the failure its own next comment names |
+| adding a gate | `site-audit-selftest` kept its own gate list, so a new gate got no coverage and said nothing |
+| fuzzing the gates | `darkscheme` passed a page whose light sheet coloured nothing: the set difference was empty and it compared nothing |
+| designing the fixture | The live site's hover red is 4.41:1 and fails AA, and pseudo-classes are the contrast gate's blind spot, so the plan would have instructed a colour it then could not check |
+
+### What `patch-damaged` cost, and why it matters beyond bookkeeping
+
+`damaged` is read in the scoreboard as a **discipline** measure. Re-scored, the comparison that
+column was carrying reads:
+
+| | nativemsg | nativewhole |
+| --- | ---: | ---: |
+| damaged, as recorded | 1/18 | 3/18 |
+| damaged, re-derived | **0/18** | **0/18** |
+| incomplete | 1/18 | 3/18 |
+
+Neither arm ever damaged a tree. `bench/summary` and `bench/compare` re-derive the label from each
+run's own scope, rewrite and litter counts rather than trusting it, so the history corrects itself
+without a re-run.
+
+### `site` is a happy path, and that is a finding about greenfield
+
+Ten runs, all accepted, 12/12, every one green on the first attempt, median ~119s, and the page
+written in **one edit and four tool calls**.
+
+That contradicts the recorded "0 accepted in 7 rounds" for greenfield — but the earlier task was
+greenfield *with design decisions* (a new service, a new view, aggregate SQL). Given a complete
+dictated specification the model simply writes the page. It is the skill's own thesis measured on a
+new axis: **the model executes a complete specification well and invents a poor one.**
+
+It also makes `site` useless as an instrument, for a reason worth stating plainly: **a plan that
+always passes exercises only the paths that work.** The repair loop, the feedback renderer and
+every failure branch of the outcome taxonomy never execute, so no amount of repetition can find a
+bug in them. `site` is kept as a regression control — nothing about it can drift — and `site-dark`
+carries the measurement.
+
+### `site-dark`, and the trap that is arithmetic rather than opinion
+
+The same page in both colour schemes. The palette makes the requirement real: `#d9232d` is 3.36:1
+on `#1e1e1e`, so the brand colour cannot carry over, and white on the dark brand is 2.78:1, so a
+button's text must invert with the scheme.
+
+The `darkscheme` gate exists because contrast alone would have been toothless here: it can only
+judge pairs that exist, so a page with **no** dark block has no dark pairs and passes without
+checking anything. Absence of the work would have read as the work being correct.
