@@ -988,6 +988,19 @@ else
     fail "sync-bench-clone would delete the archives bench/run --force creates"
 fi
 
+# --- setup --check claimed the skills were fine when none were installed ------------------------
+# It asked `build-integrations --check`, which compares the repository's GENERATED files against
+# their sources — a question about the checkout, not about what is installed. So it passed happily
+# on a machine with nothing installed at all, which is the one machine the check exists for.
+SETUP_HOME="$SANDBOX/fresh-home"
+mkdir -p "$SETUP_HOME"
+SETUP_OUT="$( HOME="$SETUP_HOME" "$REPO/tools/setup" --check 2>&1 )"
+if grep -q "MISSING  /local-implementer" <<<"$SETUP_OUT"; then
+    pass "setup --check reports skills missing on a machine that has none"
+else
+    fail "setup --check did not notice that no skills are installed"
+fi
+
 # --- an acceptance command that greps coloured tool output ---------------------------------------
 # Reported from real use, and it cost a round. The criterion was
 #   php artisan test | grep -qE 'Tests:[^0-9]*77 passed'

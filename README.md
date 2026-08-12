@@ -78,13 +78,17 @@ specification bugs before anyone writes code — which is the failure mode that 
 ```bash
 git clone https://github.com/fabianclain/oh-my-local-agent-handoff
 cd oh-my-local-agent-handoff
-tools/install-local              # links `handoff` onto PATH, picks the local implementer
-tools/llamacpp-serve start gpt-oss-20b 98304   # your model server
+tools/setup                      # PATH, config, skills, model stack — then verifies all of it
 
 cd ~/any-project
 handoff init                     # .handoff/plans + a config template
 handoff do <slug>                # implement the plan, verify it, print the diff
 ```
+
+`tools/setup` is idempotent and says what it writes outside the repository before it writes it. It
+will **not** download model weights — if they are missing it prints the command and stops, because
+12 GB is not a setup script's decision. `tools/setup --check` reports the state without changing
+anything; `--no-model` skips the stack for a machine that only plans and reviews.
 
 `handoff do` exits non-zero if the gates reject the round. Nothing is committed — the reviewer owns
 the commit, always.
@@ -190,12 +194,15 @@ person clicking a link.
 ```bash
 git clone https://github.com/fabianclain/oh-my-local-agent-handoff
 cd oh-my-local-agent-handoff
-tools/install-local          # symlinks `handoff` into ~/.local/bin, writes your defaults
-tools/install-local --check  # confirms it the way a non-interactive shell sees it
+tools/setup                  # everything; --check to inspect, --no-model / --no-skills to narrow
 
 cd your-project
 handoff init                 # .handoff/plans, a config template, and the right .gitignore lines
 ```
+
+`tools/setup` composes four tools that each refuse rather than half-succeed: `install-local` for
+PATH and the user config, `build-integrations` for the skills, `setup-local-implementer` for the
+model stack, and `doctor` to state what is actually true at the end.
 
 `tools/install-local` writes `~/.config/agent-handoff/config.sh`, which sets the implementer for
 every project at once. A project with its own opinions can override it in `.handoff/config.sh`, and

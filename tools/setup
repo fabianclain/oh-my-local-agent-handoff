@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+#
+# setup — from a fresh clone to a working install, in one command.
+#
+#   tools/setup                  everything: PATH, config, skills, model stack, then verify
+#   tools/setup --check          report what is and is not set up; change nothing
+#   tools/setup --no-skills      skip installing into ~/.claude and ~/.codex
+#   tools/setup --no-model       skip the model stack (a machine that only drives, or CI)
+#
+# This composes four tools that already exist and are tested individually. It adds no logic of its
+# own, because the pieces are the parts that can go wrong and each already refuses rather than
+# half-succeeding:
+#
+#   tools/install-local             `handoff` on PATH, and the user-level provider config
+#   tools/build-integrations        /local-implementer and /local-drive, for Claude and Codex
+#   tools/setup-local-implementer   the model stack, ending in a real tool-call probe
+#   tools/doctor                    the state of all of it, asserted rather than assumed
+#
+# It exists because those were four things a new user had to find, in an order nothing stated. The
+# first launch of a benchmark night failed because `handoff` was not on PATH in a non-interactive
+# shell, which is precisely the kind of thing a setup command should have made impossible.
+#
+# WHAT IT WRITES OUTSIDE THIS REPOSITORY, and nothing else:
+#
+#   ~/.local/bin/handoff                     symlink to bin/handoff in this checkout
+#   ~/.config/agent-handoff/config.sh        provider defaults; never overwritten if it exists
+#   ~/.claude/skills/local-{implementer,drive}/
+#   ~/.codex/prompts/local-{implementer,drive}.md
+#
+# It does NOT download model weights. If they are missing, the model step prints the exact command
+# and stops — 12 GB is not something a setup script should decide to fetch.
+
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$HERE/.." && pwd)"
+cd "$REPO"
+
+WITH_SKILLS=1
+WITH_MODEL=1
+CHECK=0
+
+while (( $# > 0 )); do
+    case "$1" in
+    --check) CHECK=1; shift ;;
+    --no-skills) WITH_SKILLS=0; shift ;;
+    --no-model) WITH_MODEL=0; shift ;;
+    -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown argument: $1" >&2; exit 64 ;;
+    esac
+done
+
+step()  { printf '\n\033[1m==> %s\033[0m\n' "$1"; }
+note()  { printf '    %s\n' "$1"; }
+FAILED=0
+
+if (( CHECK )); then
+    step "handoff on PATH, and the user config"
+    "$HERE/install-local" --check || FAILED=1
+
+    step "skills"
+    # Compare each INSTALLED copy against this checkout's generated one.
+    #
+    # `build-integrations --check` is the wrong tool for this question and using it here was a bug:
+    # it compares the repository's generated files against their sources, so it passes happily on a
+    # machine where nothing is installed at all. Drift between the checkout and the copy actually
+    # in use is silent — the source gets edited and the skill goes on saying the old thing — so it
+    # has to be checked against the installed path, not the repository.
+    while IFS='|' read -r label installed source; do
+        [[ -n "$label" ]] || continue
+        if [[ ! -f "$installed" ]]; then
+            note "MISSING  $label — run tools/setup"
+            FAILED=1
+        elif ! cmp -s "$installed" "$source"; then
+            note "STALE    $label differs from this checkout — run tools/setup"
+            FAILED=1
+        else
+            note "ok       $label"
+        fi
+    done <<INSTALLED
+/local-implementer (claude)|$HOME/.claude/skills/local-implementer/SKILL.md|$REPO/integrations/claude-skills/local-implementer/SKILL.md
+/local-drive (claude)|$HOME/.claude/skills/local-drive/SKILL.md|$REPO/integrations/claude-skills/local-drive/SKILL.md
+/local-implementer (codex)|$HOME/.codex/prompts/local-implementer.md|$REPO/integrations/codex-prompts/local-implementer.md
+/local-drive (codex)|$HOME/.codex/prompts/local-drive.md|$REPO/integrations/codex-prompts/local-drive.md
+INSTALLED
+
+    step "model stack"
+    "$HERE/doctor" || FAILED=1
+    exit "$FAILED"
+fi
+
+step "1/4  handoff on PATH, and the user-level config"
+"$HERE/install-local" || FAILED=1
+
+if (( WITH_SKILLS )); then
+    step "2/4  /local-implementer and /local-drive"
+    # Build first: installing a stale generated file is how the skill in use drifts from the
+    # source that is supposed to define it.
+    "$HERE/build-integrations" >/dev/null && "$HERE/build-integrations" --install || FAILED=1
+else
+    step "2/4  skills — skipped (--no-skills)"
+fi
+
+if (( WITH_MODEL )); then
+    step "3/4  the model stack"
+    # Not fatal on its own. A machine with no GPU, or no weights yet, is a perfectly good planner
+    # and reviewer; failing the whole setup over it would be wrong.
+    if ! "$HERE/setup-local-implementer"; then
+        note ""
+        note "The model stack is not ready. Everything else above is installed, and this machine"
+        note "can still write and check plans — it just cannot implement them locally yet."
+    fi
+else
+    step "3/4  model stack — skipped (--no-model)"
+fi
+
+step "4/4  what is actually true now"
+"$HERE/doctor" || FAILED=1
+
+cat <<'EOF'
+
+Next, in any repository:
+
+  handoff init                 create .handoff/plans and a config template
+  handoff check <slug>         is the plan machine-verifiable
+  handoff do <slug>            implement it, verify it, print the diff
+
+  /local-implementer           the same loop, driven from Claude Code
+
+Re-run `tools/setup --check` any time to see the state without changing it.
+EOF
+exit "$FAILED"
