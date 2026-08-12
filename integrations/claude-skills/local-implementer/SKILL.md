@@ -294,6 +294,17 @@ written. Judge the tree.
 `tools/peg-audit` reads the server's own log and will tell you how many were discarded, and at what
 conversation depth. If the depths cluster high, that is your step-size signal.
 
+**At the end of a session, run `handoff roundup <slug>`.** It assembles the rounds table, the
+failing gates with their commands and output, and the mechanically-derivable causes, then files it
+centrally at `~/.local/share/agent-handoff/roundups/` so patterns across repositories are visible
+in one place. `handoff roundup --index` lists what has been filed.
+
+It states infrastructure and refuses to state anything else. A failed acceptance command can be a
+model defect, a criterion that could never have passed, or an ambiguous plan, and the harness
+cannot tell those apart — so it prints the evidence and leaves the cause blank. **Those blanks are
+the part worth filling in while it is fresh**, and they are the only record of the distinction that
+matters most: whose fault the round was.
+
 `handoff stats` aggregates this across every run in the project, and `handoff retro <slug>` asks
 the model — read-only, after it has been shown the verdict — what it would change about the plan.
 Treat its answers as leads to check, not findings.

@@ -491,6 +491,14 @@ verify)
     exit $?
     ;;
 
+roundup)
+    # Read-only, and additive: it reads the journal and the archived evidence bundles, and writes
+    # only to the central round-up store. Nothing a run depends on is touched.
+    ROUNDUP="$HANDOFF_HOME/tools/roundup"
+    [[ -x "$ROUNDUP" ]] || { echo "no roundup at tools/roundup" >&2; exit 1; }
+    exec "$ROUNDUP" ${SLUG:+"$SLUG"} --repo "$REPO_ROOT" "${@:3}"
+    ;;
+
 retro)
     # Ask the model what it thinks went wrong, after it has been told what actually did.
     #

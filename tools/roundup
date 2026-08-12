@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+"""roundup — the report you would otherwise write by hand, assembled from what the harness recorded.
+
+    tools/roundup <slug>            this plan's rounds, as markdown, and filed centrally
+    tools/roundup <slug> --stdout   print only; write nothing
+    tools/roundup --all             every plan in this project
+    tools/roundup --index           what has been filed, across every project
+
+WHY
+
+Every round already records its outcome, which gate failed and with what output, the tree diff, the
+tool activity, the errors, the timings and the prompt actually sent. None of that was ever
+assembled into the thing a person actually wants at the end of a session: what happened, what
+caused each failure, and what is worth changing.
+
+Writing that by hand is what the reviewer has been doing, and it is the part that gets skipped
+when the session runs long — which is exactly when it is most worth having.
+
+WHAT IT WILL AND WILL NOT CLAIM
+
+Infrastructure failures are stated, because they are derivable: an adapter error, a turn limit, a
+context budget, an untouched tree. Everything else is presented as EVIDENCE with the failing
+command and its output inline, and the cause is left open.
+
+That restraint is deliberate. A round where the acceptance command failed can be a model defect, a
+criterion that could never pass, or a plan that was ambiguous — and the harness cannot tell those
+apart. Guessing would produce a confident wrong classification, which is worse than a blank, and
+this project has spent a great deal of effort learning that. The blanks are for you.
+
+WHERE IT FILES
+
+  ${XDG_DATA_HOME:-~/.local/share}/agent-handoff/roundups/<project>-<slug>-<stamp>.md
+
+Central rather than per-project, so patterns across repositories are visible in one place. The
+per-project journal stays where it is and is not touched.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import pathlib
+import subprocess
+import sys
+
+INFRA_ERRORS = {"tool-call-format", "context-overflow", "connection", "timeout",
+                "context-budget", "harness-io", "harness-encoding", "harness-postcondition",
+                "harness-scope"}
+
+
+def journal_records(repo: pathlib.Path) -> list[dict]:
+    path = repo / ".handoff" / "journal" / "runs.jsonl"
+    if not path.exists():
+        return []
+    out = []
+    for line in path.read_text(errors="replace").splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                out.append(json.loads(line))
+            except ValueError:
+                continue
+    return out
+
+
+def store_dir() -> pathlib.Path:
+    base = os.environ.get("XDG_DATA_HOME") or (pathlib.Path.home() / ".local" / "share")
+    return pathlib.Path(base) / "agent-handoff" / "roundups"
+
+
+def files_touched(record: dict) -> str:
+    tree = record.get("tree") or {}
+    if not tree.get("known"):
+        return "-"
+    return str(len(tree.get("changed") or []) + len(tree.get("created") or [])
+               + len(tree.get("deleted") or []))
+
+
+def infrastructure_reason(record: dict) -> str | None:
+    """Only what is genuinely derivable. Returns None when the cause is a judgement call."""
+    activity = record.get("activity") or {}
+    errors = set((activity.get("errors") or {}).keys())
+    outcome = record.get("outcome") or ""
+
+    hit = sorted(errors & INFRA_ERRORS)
+    if outcome == "infra-failed":
+        return f"the adapter failed{' (' + ', '.join(hit) + ')' if hit else ''}"
+    if files_touched(record) == "0" and hit:
+        return f"nothing was written and the adapter reported {', '.join(hit)}"
+    if files_touched(record) == "0" and outcome in ("no-op", "fabricated"):
+        return "the tree was never touched"
+    if hit and outcome not in ("accepted", "patch-ok-no-report"):
+        return f"the adapter reported {', '.join(hit)} during the round"
+    return None
+
+
+def failing_gates(record: dict, repo: pathlib.Path) -> list[dict]:
+    """The failing gates, with their command and output.
+
+    The journal record itself keeps only the failed gate NAMES — enough for a count, useless for
+    working out why. The full bundle is archived beside it under
+    `.handoff/journal/runs/<run_id>/evidence.json`, and that is where the command and its captured
+    output live. Reading it is the difference between "acceptance-3 failed" and seeing the escape
+    codes that made the command unsatisfiable.
+    """
+    run_id = record.get("run_id")
+    if not run_id:
+        return []
+    evidence = repo / ".handoff" / "journal" / "runs" / run_id / "evidence.json"
+    if not evidence.exists():
+        # The record's own `failed` list is the authoritative set of failing gate names and is
+        # always present; the archived bundle only adds the command and its output. A round that
+        # died before verification wrote a bundle therefore still has a correct, complete list of
+        # what failed — just without the detail. Reporting the names is the same fact at lower
+        # resolution, not a guess.
+        return [{"gate": name} for name in ((record.get("gates") or {}).get("failed") or [])]
+    try:
+        rows = json.loads(evidence.read_text(errors="replace")).get("gates") or []
+    except ValueError:
+        return []
+    return [r for r in rows if r.get("status") == "fail"]
+
+
+def render(records: list[dict], slug: str, repo: pathlib.Path) -> str:
+    stamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+    lines = [f"# Round-up — `{slug}`", "",
+             f"{repo.name}, {stamp}. {len(records)} round(s).", ""]
+
+    lines += ["| Round | Outcome | Score | Time | Files |",
+              "| ---: | --- | ---: | ---: | ---: |"]
+    for n, r in enumerate(records, 1):
+        g = r.get("gates") or {}
+        score = (f"{g.get('acceptance_passed')}/{g.get('acceptance_total')}"
+                 if g.get("acceptance_total") else "-")
+        secs = r.get("seconds")
+        lines.append(f"| {n} | {r.get('outcome', '?')} | {score} | "
+                     f"{str(secs) + 's' if secs is not None else '-'} | {files_touched(r)} |")
+    lines.append("")
+
+    accepted = sum(1 for r in records if r.get("outcome") == "accepted")
+    usable = sum(1 for r in records
+                 if r.get("outcome") in ("accepted", "patch-ok-no-report"))
+    lines += [f"**{accepted} accepted, {usable} usable tree(s) of {len(records)}.**", ""]
+
+    lines += ["## What the harness can say", ""]
+    said_something = False
+    for n, r in enumerate(records, 1):
+        reason = infrastructure_reason(r)
+        notes = r.get("notes") or []
+        fails = failing_gates(r, repo)
+        if not (reason or notes or fails):
+            continue
+        said_something = True
+        lines.append(f"### Round {n} — {r.get('outcome', '?')}")
+        if reason:
+            lines.append(f"- **Infrastructure:** {reason}. "
+                         f"Re-run this plan once before changing it.")
+        for note in notes:
+            lines.append(f"- {note}")
+        for gate in fails:
+            name = gate.get("gate", "?")
+            command = (gate.get("command") or "").strip()
+            lines.append(f"- **{name} failed**"
+                         + (f"\n  ```\n  {command}\n  ```" if command else ""))
+            detail = (gate.get("detail") or "").strip()
+            if detail:
+                lines.append(f"  {detail}")
+        lines.append("")
+    if not said_something:
+        lines += ["Nothing mechanical to report — every round passed its gates.", ""]
+
+    # The blanks. Deliberately not guessed at: see the module docstring.
+    lines += [
+        "## What the harness cannot say — your call", "",
+        "Fill these in while it is fresh. The harness can tell an adapter fault from a clean run;",
+        "it cannot tell a model defect from a criterion that could never have passed.", "",
+        "**What worked**", "", "- ", "",
+        "**What did not, and whose fault it was** — model / my criteria / the harness / infra",
+        "", "- ", "",
+        "**What to change next time**", "", "- ", "",
+    ]
+
+    if any((r.get("tree") or {}).get("changed") for r in records):
+        lines += ["> An edit step touched existing files, so read the diff for whitespace: a "
+                  "deletion\n> leaves the blank line around it and an edit can come back "
+                  "re-indented. No gate sees\n> either.", ""]
+
+    env = records[-1] if records else {}
+    stack = env.get("stack") or {}
+    harness = env.get("harness") or {}
+    lines += ["## Stack", "",
+              f"- provider `{stack.get('provider', '?')}`, model `{stack.get('model', '?')}`, "
+              f"context `{stack.get('context', '?')}`",
+              f"- harness `{harness.get('commit', '?')}`"
+              f"{' (dirty)' if harness.get('dirty') else ''}",
+              f"- repo `{env.get('repo_head', '?')}`", ""]
+    return "\n".join(lines)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("slug", nargs="?")
+    parser.add_argument("--repo", default=".")
+    parser.add_argument("--stdout", action="store_true", help="print only; file nothing")
+    parser.add_argument("--all", action="store_true", help="every plan in this project")
+    parser.add_argument("--index", action="store_true", help="what has been filed, everywhere")
+    args = parser.parse_args()
+
+    if args.index:
+        store = store_dir()
+        found = sorted(store.glob("*.md")) if store.exists() else []
+        if not found:
+            print(f"nothing filed yet in {store}")
+            return 0
+        print(f"{len(found)} round-up(s) in {store}\n")
+        for path in found:
+            head = path.read_text(errors="replace").splitlines()
+            summary = next((l for l in head if l.startswith("**")), "")
+            print(f"  {path.stem}\n      {summary}")
+        return 0
+
+    try:
+        repo = pathlib.Path(subprocess.run(
+            ["git", "-C", args.repo, "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, check=True).stdout.strip())
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("not a git repository", file=sys.stderr)
+        return 1
+
+    records = journal_records(repo)
+    if not records:
+        print(f"no rounds recorded in {repo}/.handoff/journal/runs.jsonl", file=sys.stderr)
+        return 1
+
+    slugs = sorted({r.get("slug") for r in records if r.get("slug")}) if args.all \
+        else [args.slug]
+    if not slugs or slugs == [None]:
+        print("which plan? pass a slug, or --all", file=sys.stderr)
+        return 64
+
+    status = 0
+    for slug in slugs:
+        mine = [r for r in records if r.get("slug") == slug]
+        if not mine:
+            print(f"no rounds recorded for '{slug}'", file=sys.stderr)
+            status = 1
+            continue
+        text = render(mine, slug, repo)
+        print(text)
+        if not args.stdout:
+            store = store_dir()
+            store.mkdir(parents=True, exist_ok=True)
+            stamp = dt.datetime.now().strftime("%Y%m%dT%H%M%S")
+            dest = store / f"{repo.name}-{slug}-{stamp}.md"
+            dest.write_text(text)
+            print(f"\nfiled: {dest}", file=sys.stderr)
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main())

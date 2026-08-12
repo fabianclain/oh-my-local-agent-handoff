@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""roundup-selftest — what the round-up claims, and more importantly what it refuses to claim.
+
+    tools/roundup-selftest
+
+The restraint is the feature. A round whose acceptance command failed can be a model defect, a
+criterion that could never have passed, or an ambiguous plan — and the harness cannot tell those
+apart. Every one of those was a real, separate failure in reported use, and two of them turned out
+to be the reviewer's own doing. A tool that guessed would produce a confident wrong attribution,
+which is worse than a blank.
+
+So these checks are in two halves: it states infrastructure, because that is derivable, and it must
+NOT state a cause for anything else.
+"""
+
+from __future__ import annotations
+
+import json
+import pathlib
+import subprocess
+import sys
+import tempfile
+
+HERE = pathlib.Path(__file__).resolve().parent
+ROUNDUP = HERE / "roundup"
+
+
+def record(**kw) -> dict:
+    base = {
+        "run_id": kw.get("run_id", "r"), "slug": "demo", "outcome": "accepted", "seconds": 10,
+        "tree": {"known": True, "changed": [], "created": [], "deleted": []},
+        "gates": {"known": True, "acceptance_passed": 1, "acceptance_total": 1, "failed": []},
+        "activity": {"parsed": True, "write_calls": 1, "shell_calls": 0, "errors": {}},
+        "notes": [], "stack": {"provider": "native", "model": "gpt-oss-20b", "context": 98304},
+        "harness": {"commit": "abc1234", "dirty": False}, "repo_head": "deadbee",
+    }
+    base.update(kw)
+    return base
+
+
+def run(records: list[dict]) -> str:
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = pathlib.Path(tmp) / "repo"
+        (repo / ".handoff" / "journal").mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        (repo / "a.txt").write_text("x\n")
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t.invalid",
+                        "-c", "user.name=t", "commit", "-qm", "i"], check=True)
+        (repo / ".handoff" / "journal" / "runs.jsonl").write_text(
+            "\n".join(json.dumps(r) for r in records) + "\n")
+        proc = subprocess.run([sys.executable, str(ROUNDUP), "demo", "--repo", str(repo),
+                               "--stdout"], capture_output=True, text=True)
+        return proc.stdout
+
+
+CASES = [
+    # Derivable, so it is stated — including the one instruction that is right here and nowhere
+    # else: re-run rather than re-specify.
+    ("an adapter fault is named as infrastructure",
+     [record(outcome="infra-failed",
+             activity={"parsed": True, "write_calls": 0, "shell_calls": 0,
+                       "errors": {"tool-call-format": 1}})],
+     ["Infrastructure", "Re-run this plan once"], [], "all"),
+
+    ("a turn limit with an untouched tree is named",
+     [record(outcome="no-op",
+             activity={"parsed": True, "write_calls": 0, "shell_calls": 0, "errors": {}})],
+     ["Infrastructure", "never touched"], [], "all"),
+
+    # The restraint. A failed criterion over a changed tree must NOT be attributed.
+    ("a failed criterion over a changed tree is reported without a cause",
+     [record(outcome="patch-damaged",
+             tree={"known": True, "changed": ["src/a.php"], "created": [], "deleted": []},
+             gates={"known": True, "acceptance_passed": 6, "acceptance_total": 7,
+                    "failed": ["acceptance-4"]})],
+     ["acceptance-4 failed"],
+     ["Infrastructure", "model defect", "your criteria were", "the model was wrong"],
+     "findings"),
+
+    ("the blanks for judgement are always present",
+     [record()],
+     ["What the harness cannot say", "What worked", "What to change next time"], [], "all"),
+
+    # An edit step is the only kind whose whitespace can scar; a pure-deletion round has no
+    # surviving edited file, and saying otherwise would be noise on every round.
+    ("an edit step is told to read the diff for whitespace",
+     [record(tree={"known": True, "changed": ["src/a.php"], "created": [], "deleted": []})],
+     ["whitespace"], [], "all"),
+
+    ("a pure-deletion round is not",
+     [record(tree={"known": True, "changed": [], "created": [], "deleted": ["src/a.php"]})],
+     [], ["whitespace"], "all"),
+
+    ("the files column counts the tree, not tool calls",
+     [record(tree={"known": True, "changed": [], "created": [],
+                   "deleted": [f"f{i}.php" for i in range(11)]},
+             activity={"parsed": True, "write_calls": 0, "shell_calls": 2, "errors": {}})],
+     ["| 11 |"], [], "all"),
+]
+
+
+def main() -> int:
+    if not ROUNDUP.exists():
+        print("roundup not found", file=sys.stderr)
+        return 2
+    failures = 0
+    for name, records, must, must_not, scope in CASES:
+        out = run(records)
+        # Scope is per case, and getting it wrong makes a check vacuous in either direction.
+        #
+        # "findings" narrows to the per-round section, because the standing explanation of what
+        # the harness cannot tell apart necessarily contains the words "model defect" — matching
+        # that would fail a tool doing exactly the right thing.
+        #
+        # "all" is the whole document, and is required for anything emitted outside that section.
+        # The first version scoped EVERY negative check to the findings, which silently made the
+        # pure-deletion whitespace check unfalsifiable: the note it forbids is printed after the
+        # judgement blanks, so it was never in the text being searched. Caught by mutation.
+        if scope == "findings":
+            haystack = out.split("## What the harness can say", 1)[-1]
+            haystack = haystack.split("## What the harness cannot say", 1)[0]
+        else:
+            haystack = out
+        problems = [f"missing {m!r}" for m in must if m not in out]
+        problems += [f"must not contain {m!r} in the {scope}" for m in must_not if m in haystack]
+        if problems:
+            print(f"FAIL  {name}")
+            for problem in problems:
+                print(f"        {problem}")
+            failures += 1
+        else:
+            print(f"pass  {name}")
+    print()
+    if failures:
+        print(f"{failures} check(s) failed")
+        return 1
+    print(f"{len(CASES)} check(s) passed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
