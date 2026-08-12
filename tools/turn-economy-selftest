@@ -46,7 +46,73 @@ def call(name: str, args: dict, ok: bool = True, query: str | None = None) -> st
     return json.dumps({"type": "agent_event", "event": event})
 
 
+def cline_call(name: str, args: dict, results: list[dict] | None = None,
+               ok: bool = True) -> list[str]:
+    """One tool call in Cline's shape: two events, and a LIST-shaped output.
+
+    Every case above this point models tools/native-agent, which is why the list shape went
+    unnoticed until it was run over the archive: `output.get("success")` raised AttributeError on
+    all 60 Cline runs, so the tool had never measured a single one of them.
+
+    Returns two log lines -- the content_start carrying untruncated `input`, and the content_end
+    carrying the result -- because counting those as two calls is the other half of the defect.
+    """
+    if results is None:
+        results = [{"query": name, "result": "ok" if ok else "error", "success": ok}]
+    start = {"type": "content_start", "contentType": "tool", "toolName": name,
+             "toolCallId": f"id-{name}-{json.dumps(args, sort_keys=True)}", "input": args}
+    end = {"type": "content_end", "contentType": "tool", "toolName": name,
+           "toolCallId": start["toolCallId"], "output": results, "durationMs": 3}
+    return [json.dumps({"type": "agent_event", "event": start}),
+            json.dumps({"type": "agent_event", "event": end})]
+
+
+WORKTREE = "/home/f/bench/.work/wide-lcgptossl-1/"
+
 CASES = [
+    # --- Cline's event shape. Each of these crashed the tool outright before the pairing layer.
+    ("a Cline call is one call, not two events", [
+        *cline_call("read_files", {"files": [{"path": "a.php"}]}),
+    ], {"calls": 1, "readable_read": 1}),
+
+    ("a Cline re-read is caught through files[].path", [
+        *cline_call("read_files", {"files": [{"path": "a.php"}]}),
+        *cline_call("read_files", {"files": [{"path": "a.php"}]}),
+    ], {"calls": 2, "re_reads": 1, "readable_read": 2}),
+
+    # Absolute in one call, repo-relative in the other. Without normalisation these are two files
+    # and the re-read is missed -- an undercount, which is the direction that flatters the model.
+    ("the same file under both spellings is one file", [
+        *cline_call("read_files", {"files": [{"path": WORKTREE + "a.php"}]}),
+        *cline_call("read_files", {"files": [{"path": "a.php"}]}),
+    ], {"re_reads": 1, "readable_read": 2}),
+
+    ("two different Cline searches are not repeats", [
+        *cline_call("search_codebase", {"queries": ["Money.php"]}),
+        *cline_call("search_codebase", {"queries": ["Order.php"]}),
+    ], {"re_searches": 0, "readable_search": 2}),
+
+    ("the same Cline search twice is a repeat", [
+        *cline_call("search_codebase", {"queries": ["Money.php"]}),
+        *cline_call("search_codebase", {"queries": ["Money.php"]}),
+    ], {"re_searches": 1, "readable_search": 2}),
+
+    # run_commands returns one entry per command. A call whose second command exited 255 has not
+    # succeeded, and for an edit that is what decides whether the work phase has begun.
+    ("a Cline call fails when any entry failed", [
+        *cline_call("apply_patch", {"input": "..."}, results=[
+            {"query": "apply_patch", "result": "ok", "success": True}]),
+        *cline_call("apply_patch", {"input": "other"}, results=[
+            {"query": "apply_patch", "result": "no", "success": False}]),
+    ], {"calls": 2, "failed_edits": 1}),
+
+    ("a partly failing run_commands is not a success", [
+        *cline_call("run_commands", {"commands": ["php -l a.php", "php -r 'x'"]}, results=[
+            {"query": "php -l a.php", "result": "", "success": True},
+            {"query": "php -r 'x'", "result": "exit 255", "success": False}]),
+    ], {"calls": 1, "readable_verify": 1}),
+
+    # --- tools/native-agent's shape.
     ("a file read twice with no edit between is a re-read", [
         call("read_files", {"paths": ["a.php"]}),
         call("read_files", {"paths": ["a.php"]}),

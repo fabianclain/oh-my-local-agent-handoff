@@ -53,6 +53,22 @@ VERIFY = {"run_commands", "execute_command", "run_command"}
 REPORT = {"submit_report", "attempt_completion"}
 
 
+def normalise_path(path: str) -> str:
+    """Strip the throwaway worktree prefix so one file has one name.
+
+    The native loop logs `bench/fixtures/orders/Money.php`; Cline logs the same file as
+    `/home/.../bench/.work/wide-lcgptossl-1/bench/fixtures/orders/Money.php`. Left alone, a file
+    read once under each spelling counts as two distinct files and the re-read is missed -- an
+    undercount, which is the direction that reads as good news.
+    """
+    marker = "/.work/"
+    if marker in path:
+        tail = path.split(marker, 1)[1]
+        # .work/<run-name>/<repo-relative path>
+        return tail.split("/", 1)[1] if "/" in tail else tail
+    return path
+
+
 def paths_in(call: dict) -> list[str]:
     """Paths a call touched. Raises on a payload truncated past readability."""
     if isinstance(call.get("args"), dict):
@@ -61,7 +77,14 @@ def paths_in(call: dict) -> list[str]:
         if isinstance(args.get("path"), str):
             found.append(args["path"])
         found.extend(p for p in (args.get("paths") or []) if isinstance(p, str))
-        return found
+        # Cline's read_files takes `files: [{path: ...}]`. Without this branch its reads parse to
+        # zero paths, every read looks novel, and the re-read rate for every Cline arm is 0.
+        for item in (args.get("files") or []):
+            if isinstance(item, dict) and isinstance(item.get("path"), str):
+                found.append(item["path"])
+            elif isinstance(item, str):
+                found.append(item)
+        return [normalise_path(p) for p in found]
     parsed = json.loads(call["query"])
     if not isinstance(parsed, dict):
         raise ValueError("not an object")
@@ -75,7 +98,7 @@ def paths_in(call: dict) -> list[str]:
                 found.append(item["path"])
             elif isinstance(item, str):
                 found.append(item)
-    return found
+    return [normalise_path(p) for p in found]
 
 
 def command_of(call: dict) -> str | None:
@@ -94,8 +117,23 @@ def command_of(call: dict) -> str | None:
     return None
 
 
+def entries_of(output) -> list[dict]:
+    """A tool result as a list of per-item records, whichever client wrote it.
+
+    The native loop writes one dict. Cline writes a LIST -- one entry per file read or per command
+    run -- and `output.get("success")` over that list raised AttributeError, so every Cline run in
+    the archive crashed this tool rather than being measured. Sixty of the 185 preserved runs.
+    """
+    if isinstance(output, dict):
+        return [output]
+    if isinstance(output, list):
+        return [item for item in output if isinstance(item, dict)]
+    return []
+
+
 def analyse(log: pathlib.Path) -> dict:
     calls = []
+    pending: dict[str, dict] = {}
     for line in log.read_text(errors="replace").splitlines():
         line = line.strip()
         if not line.startswith("{"):
@@ -105,18 +143,35 @@ def analyse(log: pathlib.Path) -> dict:
         except ValueError:
             continue
         event = record.get("event") or {}
-        if event.get("type") != "content_end" or event.get("contentType") != "tool":
+        if event.get("contentType") != "tool":
             continue
-        output = event.get("output") or {}
+        # Cline emits TWO events per call: a content_start carrying the untruncated `input`, and a
+        # content_end carrying the result. Stash the first against its id and let the second emit
+        # the call, so one invocation stays one call rather than becoming two turns. The native
+        # loop emits content_end only, with `args` already on it, and never enters this branch.
+        if event.get("type") == "content_start":
+            if isinstance(event.get("toolCallId"), str) and isinstance(event.get("input"), dict):
+                pending[event["toolCallId"]] = event["input"]
+            continue
+        if event.get("type") != "content_end":
+            continue
+        output = event.get("output")
+        entries = entries_of(output)
+        args = event.get("args")
+        if not isinstance(args, dict):
+            args = pending.pop(event.get("toolCallId"), None)
         calls.append({"name": event.get("toolName") or "?",
-                      "ok": bool(output.get("success")),
+                      # Every entry must have succeeded. A run_commands call whose second command
+                      # exited 255 is not a call that worked, and for an edit this is what decides
+                      # whether the work phase has started.
+                      "ok": bool(entries) and all(item.get("success") for item in entries),
                       "fault": event.get("fault"),
-                      # `args` is the untruncated, contents-free summary written by
-                      # tools/native-agent. Older logs and Cline logs have only `query`, which is
-                      # capped at 400 characters, so those calls may still be unreadable -- and
-                      # every rate below states the denominator it was computed over.
-                      "args": event.get("args"),
-                      "query": output.get("query") or ""})
+                      # `args` is the untruncated, contents-free summary: written on the event by
+                      # tools/native-agent, carried on the paired content_start by Cline. Older
+                      # logs have only `query`, which is capped at 400 characters, so those calls
+                      # may still be unreadable -- and every rate below states its denominator.
+                      "args": args,
+                      "query": (entries[0].get("query") if entries else "") or ""})
 
     kinds = Counter()
     faults = Counter()
@@ -173,8 +228,13 @@ def analyse(log: pathlib.Path) -> dict:
                 unparseable += 1
                 readable["search"] -= 1
                 continue
-            # The repeated thing for a search is the question, not the directory.
-            key = (str(parsed.get("query")), str(parsed.get("path") or ""))
+            # The repeated thing for a search is the question, not the directory. Cline sends
+            # `queries` as a list; the native loop sends one `query`. Keying on the singular alone
+            # made every Cline search key on "None" and every search after the first a repeat.
+            question = parsed.get("query")
+            if question is None and isinstance(parsed.get("queries"), list):
+                question = "\n".join(str(q) for q in parsed["queries"])
+            key = (str(question), str(parsed.get("path") or ""))
             if key in seen_searches:
                 re_searches += 1
             seen_searches.add(key)
