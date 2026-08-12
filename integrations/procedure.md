@@ -19,23 +19,45 @@ rendering tests.
 
 - Ambiguous requirements, or work needing design decisions. The implementer executes; it does not
   design. Difficulty must mean *more work*, not *more decisions*.
-- Anything where a plausible wrong answer is indistinguishable from a right one: money, dates,
-  aggregate SQL, permissions, concurrency. Never measured here, and where a local model is most
-  dangerous.
+- Anything where a plausible wrong answer is indistinguishable from a right one: dates, aggregate
+  SQL, permissions, concurrency. Money is measurable and mostly fine — see below — but only with
+  criteria that discriminate.
+- **Anything you could just do in five minutes.** Specification takes longer than a small change,
+  and on a single small step it will lose on wall clock every time. Reported from real use: two
+  steps that would each have taken about five minutes by hand cost considerably more to specify.
+  The value there was not speed — it was being forced to say exactly what "removed" means, which
+  caught a commented-out import that bold prose in the same plan had failed to prevent. Spend the
+  specification when the change is repetitive, spans many files, or is one you would have to
+  explain carefully anyway; skip it when you would type it faster than you can describe it.
 
 ## What to expect
 
 On mechanical change to code that exists: **90–100% of rounds produce a tree a reviewer can take**,
-measured over 48 runs, roughly five minutes each. About one round in four produces a correct patch
-with **no report at all**, and that is not a defect in your plan. One mechanism is confirmed — the
-report is generated in full and llama.cpp's harmony parser discards it — but it has not been shown
-to account for all of them. Judge the tree; never read anything into a missing report.
+roughly five minutes each. Over one night on a six-file refactor, `native` produced a usable tree
+in 18 of 18 rounds and a report in 18 of 18. A missing report is now a provider signal rather than
+a fact of life — see step 8b — so if you are seeing a quarter of rounds without one, check what you
+are driving. Judge the tree either way; never read anything into a missing report.
 
-**Hard arithmetic is a good fit, if you specify it completely.** Six runs on a plan requiring
-integer proration with largest-remainder allocation and half-up rounding produced five
-implementations, and all five were correct under 4000 randomised trials each — including the
-tie-break rule and an odd-divisor rounding edge the plan did not spell out. Money, rounding and
-allocation are not the danger zone. *Underspecified* money is.
+**Hard arithmetic is a good fit, if you specify it completely — and "completely" is stricter than
+it sounds.** A plan requiring integer proration with largest-remainder allocation and half-up
+rounding has now been run sixteen times and every implementation fuzzed against the specification,
+4000 randomised trials each. Fourteen were correct, including tie-break rules and an odd-divisor
+rounding edge the plan never spelled out.
+
+**Two were wrong, and both passed every acceptance criterion.** One returned the right amounts in
+the wrong order and disagreed on 2,283 of 4,000 trials; the other gave every leftover cent to the
+same line and disagreed on 1,107. Neither was caught by the gates, because in both cases the
+worked example in the criteria could not discriminate:
+
+- the ordering example used three *identical* lines, so every remainder tied and every order was
+  the same order
+- the ordering-fix example had exactly one cent left over, so a loop that mis-distributes several
+  behaves correctly on it
+
+The rule that follows is worth more than the reassurance it replaces: **a worked example that is
+symmetric in the thing it tests cannot test it.** Vary the thing you are checking — unequal
+remainders, more than one leftover cent, different lengths — and take the case from an observed
+failure where you can, because an invented one usually fails to discriminate.
 
 **On greenfield work, expect much worse.** One real feature — new service, new Livewire view,
 aggregate SQL — went **0 accepted in 7 rounds**, best round 9 of 12 criteria. The reviewer then
@@ -231,15 +253,29 @@ to re-run a round that had done the work. It now counts what the diff says chang
 deleted, so a 0 means the tree really did not move. That is the only version of this signal worth
 acting on: if you are reading an older run, check the diff before trusting a 0.
 
-**A missing report is not a diagnosis, and it is not yours to fix.** Roughly a quarter of real
-rounds end this way. One mechanism is confirmed — the model emits the report, llama.cpp's harmony
-parser cannot map it, and the turn arrives as an error with no text — but it is **not confirmed to
-be the whole story**: replaying real conversations back at the model returns clean reports every
-time, so whatever costs the other rounds their report has not been reproduced yet.
+**A missing report is not a diagnosis, and it is not yours to fix.** The mechanism is now settled,
+and the rate depends entirely on which implementer you are driving.
 
-What follows holds either way. Do not re-specify a plan over a missing report, and do not add
-instructions telling the model to remember to report — that has been tried and cannot work, because
-the report is already being written. Judge the tree.
+The model writes the report in full. llama.cpp's harmony parser cannot map it, the server answers
+HTTP 500, and **the provider call ends there** — that last part was the missing half for months.
+Across 71 archived runs a parse fault ended the call in 13 of 13 cases and no client re-asked;
+22 of 29 runs that hit one lost their report, against 1 of 42 that did not (Fisher p = 2.5e-11).
+
+`native` retries the completion, which recovers about 89% of them. Measured over one night, one
+harness commit, one stack:
+
+| implementer | usable tree | report survived |
+| --- | ---: | ---: |
+| `native` (default) | 18/18 | **18/18** |
+| a rented CLI | 15/15 | 9/15 |
+
+Both produced a usable tree in **every** round. If you are seeing a quarter of rounds lose their
+report, check which provider you are on before anything else — that is the signature of driving
+something other than `native`.
+
+Do not re-specify a plan over a missing report, and do not add instructions telling the model to
+remember to report: that has been tried and cannot work, because the report is already being
+written. Judge the tree.
 
 `tools/peg-audit` reads the server's own log and will tell you how many were discarded, and at what
 conversation depth. If the depths cluster high, that is your step-size signal.
@@ -318,7 +354,8 @@ judgement. Keep it on your side.
 | The command tests something the plan never asked for | Your acceptance command is wrong | Fix the command, not the code |
 | The code is a stub that satisfies weaker criteria | The criteria were too coarse | Sharpen the assertions — the commonest case in view work |
 | The code attempts the right thing and gets it wrong | A genuine model error | Narrow the step until the mistake has nowhere to hide |
-| Empty diff, no writes attempted, often a report claiming success | Infrastructure failed; the plan was never exercised | **Re-run the same plan once**, then fix the adapter. Do not re-specify |
+| A criterion that could not pass over any tree — greps coloured output, asserts a path that moved | Your acceptance command is unsatisfiable | Read the command's own log first. A broken criterion and a broken implementation look identical from the verdict |
+| Empty diff, `files` 0, often a report claiming success | Infrastructure failed; the plan was never exercised | **Re-run the same plan once**, then fix the adapter. Do not re-specify |
 
 That last row is the exception to "never re-run the same plan", and it matters because the default
 is exactly wrong when the plan was never asked. Recognise it by the tool calls, not the report: one
