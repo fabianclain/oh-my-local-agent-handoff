@@ -363,3 +363,43 @@ service that motivated the patch-only gate — this plan cannot say, and that is
 least one of them had already met every criterion and had no turn left to report in. Raising
 `--max-turns` trades against depth, which is what correlates with discarded output, so it needs an
 arm rather than a guess.
+
+### The post-write syntax check: a good predictor, an unproven remedy
+
+Landed tonight, and measured over 36 native-family rounds on `wide`. It fires often — 17 of 36
+rounds wrote at least one file that did not parse — and the count separates cleanly:
+
+| post-write warnings in a round | accepted | not accepted |
+| --- | ---: | ---: |
+| 1 or 2 | 14 | 0 |
+| 3 or more | 1 | **2** |
+
+Both failures are `nativewhole`, at 4 and 6 warnings, and the worse one ended with a parse error
+still in the tree at 2 of 11 criteria. So writing an unparseable file once or twice is ordinary and
+recovered; doing it repeatedly is a round already lost, and the count is visible long before the
+verification runs.
+
+**What this does not show, and must not be read as showing.** There is no arm without the check.
+Fourteen rounds warned and then passed, and nothing here says the warning is why — the model may
+have re-read and fixed those files anyway, as it did before this existed. The honest comparison is
+the damage rate, and it has not obviously moved: 2 of 73 archived runs reached final verification
+with a PHP parse error; tonight it is 1 of 36. Same order, no separation at this n.
+
+The check earns its place as a *signal* on that evidence, not as a fix. What it argues for is the
+arm that would settle it, and an escalation: three warnings in one round is a better abort
+condition than the turn limit, because it identifies a round that is going to fail while there is
+still budget to do something about it.
+
+### Round 15 at n=12: whole-file writes do damage, at a rate this n cannot separate
+
+| | `native` | `nativewhole` |
+| --- | ---: | ---: |
+| accepted | 12/12 | 9/12 |
+| `patch-damaged` | 0/12 | **2/12** |
+| lost report | 0/12 | 1/12 |
+
+Fisher on the damage counts is p = 0.48 — chance. The direction matches the reason the patch-only
+gate exists, and the mechanism is visible in both failures (repeated unparseable writes), but 12
+rounds cannot separate 0 from 2. The earlier reading in this file, that whole-file writes cost
+turns rather than correctness, is now wrong in both halves: the turn limit binds both arms equally,
+and the damage does not.
