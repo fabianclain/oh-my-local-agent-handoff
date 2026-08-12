@@ -329,6 +329,23 @@ have one implementation the three views share, at a round boundary — not anoth
 
 ---
 
+## 1d. `tools/overnight` has no selftest
+
+It sequences every unattended round: the deadline, the resume, the per-job timeout, the state
+file, the summary. A defect in it costs a whole night rather than a run, and it is the one part of
+the harness with no automated guard at all.
+
+Testing it needs no model — the jobs can be `/bin/true` and `/bin/sleep`, which is how the resume
+path was checked by hand on 2026-08-13. What that check found: resume works, and the summary
+rendered every attempt of a resumed job as its own row, so a job read as both skipped and ok.
+
+Worth covering: a job recorded `ok` is skipped on resume; a failed one is re-run; a job that
+cannot finish before `--until` is skipped with that reason and not started; the summary shows one
+row per job; and a killed parent does not leave its child running — which it did tonight, for 23
+minutes, and which was found by hand rather than by a test.
+
+---
+
 ## 2. Converge `verify-round` and `bench/run` — lower priority than it looked
 
 Two implementations of "is this acceptable" exist. Scoring comes from `bench/run`; the evidence
