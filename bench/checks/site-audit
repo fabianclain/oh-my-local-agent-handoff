@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+"""site-audit — the structural gates for bench/plans/site.md.
+
+    bench/checks/site-audit <gate> <file>
+    bench/checks/site-audit anchors bench/fixtures/site/index.html
+
+Exit 0 when the gate passes, 1 when it fails, 2 when the file cannot be read or the gate is
+unknown. One gate per acceptance criterion, because bench/run maps criteria to commands one for
+one and a command that checks three things reports one bit for three questions.
+
+WHY A CHECKER RATHER THAN INLINE ONE-LINERS
+
+The other plans verify with `php -r '...'` because a value assertion fits on a line. A page does
+not: "every nav link resolves to a section that exists" is a join between two sets, and written
+inline it becomes unreadable and therefore untested. The gates here are each mutation-tested by
+bench/checks/site-audit-selftest.
+
+WHAT THIS DELIBERATELY DOES NOT DO
+
+It does not judge whether the page looks good. It checks the claims the plan actually makes, and
+where it cannot check something it says so rather than passing. The skill's warning about views is
+the reason every gate here counts structure instead of matching prose: a three-line template can
+satisfy a text assertion while containing nothing real, so the content gates assert length and
+distinctness, not mere presence.
+"""
+
+from __future__ import annotations
+
+import argparse
+import pathlib
+import re
+import sys
+from html.parser import HTMLParser
+
+VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param",
+        "source", "track", "wbr"}
+
+# The landmarks the plan dictates, in the order it dictates them.
+LANDMARKS = ["masthead", "hero", "features", "testimonials", "cta", "colophon"]
+
+HEADLINE = "Transformă-ți Protecția Muncii în Era Digitală"
+
+STATS = [("50+", "Clienți Mulțumiți"),
+         ("80,000+", "Documente SSM"),
+         ("24/7", "Suport Tehnic")]
+
+# Body text shorter than this is a placeholder, whatever it says. Set from the shortest line in
+# the plan's own copy deck, less a margin: the point is to reject a stub, not to police wording.
+MIN_CARD_CHARS = 40
+MIN_QUOTE_CHARS = 45
+
+
+class Doc(HTMLParser):
+    """A tolerant DOM good enough for these gates: tags, attributes, text, and parentage."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.nodes: list[dict] = []
+        self.stack: list[dict] = []
+        self.root: list[dict] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        node = {"tag": tag, "attrs": {k: (v or "") for k, v in attrs}, "text": "",
+                "children": [], "parent": self.stack[-1] if self.stack else None}
+        self.nodes.append(node)
+        (self.stack[-1]["children"] if self.stack else self.root).append(node)
+        if tag not in VOID:
+            self.stack.append(node)
+
+    def handle_endtag(self, tag: str) -> None:
+        for index in range(len(self.stack) - 1, -1, -1):
+            if self.stack[index]["tag"] == tag:
+                del self.stack[index:]
+                return
+
+    def handle_data(self, data: str) -> None:
+        if self.stack:
+            self.stack[-1]["text"] += data
+
+    def find(self, tag: str | None = None, **attrs) -> list[dict]:
+        out = []
+        for node in self.nodes:
+            if tag and node["tag"] != tag:
+                continue
+            if all(node["attrs"].get(k) == v for k, v in attrs.items()):
+                out.append(node)
+        return out
+
+
+def deep_text(node: dict) -> str:
+    """All text under a node, whitespace-collapsed. Script and style content never counts."""
+    if node["tag"] in {"script", "style"}:
+        return ""
+    parts = [node["text"]] + [deep_text(child) for child in node["children"]]
+    return re.sub(r"\s+", " ", " ".join(parts)).strip()
+
+
+def load(path: pathlib.Path) -> Doc:
+    doc = Doc()
+    doc.feed(path.read_text(errors="replace"))
+    return doc
+
+
+def ok(message: str) -> int:
+    print(f"pass  {message}")
+    return 0
+
+
+def bad(message: str, *detail: str) -> int:
+    print(f"FAIL  {message}")
+    for line in detail:
+        print(f"        {line}")
+    return 1
+
+
+# --- gates ---------------------------------------------------------------------------------------
+
+def gate_headline(doc: Doc) -> int:
+    h1s = doc.find("h1")
+    if len(h1s) != 1:
+        return bad(f"expected exactly one <h1>, found {len(h1s)}",
+                   *[f"<h1>{deep_text(h)[:60]}" for h in h1s[:4]])
+    got = deep_text(h1s[0])
+    if got != HEADLINE:
+        return bad("the <h1> is not the dictated headline",
+                   f"expected: {HEADLINE}", f"got:      {got}")
+    return ok("one <h1>, carrying the dictated headline")
+
+
+def gate_sections(doc: Doc) -> int:
+    """The six landmarks, present, in order, and not nested inside one another."""
+    found = [n for n in doc.nodes if n["attrs"].get("id") in LANDMARKS]
+    ids = [n["attrs"]["id"] for n in found]
+    missing = [name for name in LANDMARKS if name not in ids]
+    if missing:
+        return bad(f"{len(missing)} landmark(s) missing", f"missing: {', '.join(missing)}",
+                   f"present: {', '.join(ids) or 'none'}")
+    duplicates = [name for name in LANDMARKS if ids.count(name) > 1]
+    if duplicates:
+        return bad(f"landmark id used more than once: {', '.join(duplicates)}",
+                   "an id must be unique or an anchor cannot resolve to it")
+    if ids != LANDMARKS:
+        return bad("the landmarks are out of order", f"expected: {' '.join(LANDMARKS)}",
+                   f"got:      {' '.join(ids)}")
+    for node in found:
+        parent = node["parent"]
+        while parent:
+            if parent["attrs"].get("id") in LANDMARKS:
+                return bad(f"#{node['attrs']['id']} is nested inside #{parent['attrs']['id']}",
+                           "the landmarks are siblings, not a hierarchy")
+            parent = parent["parent"]
+    return ok("six landmarks, in the dictated order, none nested")
+
+
+def gate_anchors(doc: Doc) -> int:
+    """Every in-page href resolves to an id that exists. THE TRAP.
+
+    `href="#features"` against `id="feature"` renders correctly, reads correctly, and satisfies
+    every text assertion. Only a join between the two sets sees it.
+    """
+    ids = {n["attrs"]["id"] for n in doc.nodes if n["attrs"].get("id")}
+    anchors = [a for a in doc.find("a") if a["attrs"].get("href", "").startswith("#")]
+    if not anchors:
+        return bad("no in-page anchors at all", "the nav is specified to link to the landmarks")
+    broken = [a["attrs"]["href"] for a in anchors if a["attrs"]["href"][1:] not in ids]
+    if broken:
+        return bad(f"{len(broken)} anchor(s) point at an id that does not exist",
+                   f"broken: {', '.join(sorted(set(broken)))}",
+                   f"ids present: {', '.join(sorted(ids))}")
+    return ok(f"all {len(anchors)} in-page anchor(s) resolve to an existing id")
+
+
+def gate_stats(doc: Doc) -> int:
+    """Three stat tiles, each carrying its dictated figure AND its dictated label."""
+    hero = doc.find(id="hero")
+    if not hero:
+        return bad("no #hero section, so the stat tiles cannot be located")
+    text = deep_text(hero[0])
+    missing = []
+    for figure, label in STATS:
+        if figure not in text or label not in text:
+            missing.append(f"{figure} / {label}")
+    if missing:
+        return bad(f"{len(missing)} stat(s) missing from #hero", *missing,
+                   f"hero text: {text[:160]}")
+    # The figure must sit near its own label rather than all six strings being present somewhere.
+    for figure, label in STATS:
+        gap = abs(text.index(figure) - text.index(label))
+        if gap > 80:
+            return bad(f"'{figure}' and '{label}' are {gap} characters apart",
+                       "each figure belongs in a tile with its own label")
+    return ok("three stat tiles, each figure paired with its own label")
+
+
+def gate_features(doc: Doc) -> int:
+    """Six feature cards, each with a heading and body text long enough not to be a stub."""
+    section = doc.find(id="features")
+    if not section:
+        return bad("no #features section")
+    headings = [n for n in section[0]["children"] for n in walk(n)
+                if n["tag"] in {"h3", "h4"}]
+    if len(headings) != 6:
+        return bad(f"expected 6 feature headings (h3 or h4), found {len(headings)}",
+                   *[deep_text(h)[:50] for h in headings[:8]])
+    titles = [deep_text(h) for h in headings]
+    if len(set(titles)) != 6:
+        return bad("two feature cards share a heading", f"headings: {titles}")
+    thin = []
+    for heading in headings:
+        card = heading["parent"]
+        body = deep_text(card).replace(deep_text(heading), "", 1).strip()
+        if len(body) < MIN_CARD_CHARS:
+            thin.append(f"{deep_text(heading)[:40]!r} -> {len(body)} chars: {body[:50]!r}")
+    if thin:
+        return bad(f"{len(thin)} feature card(s) have no real body text "
+                   f"(under {MIN_CARD_CHARS} chars)", *thin)
+    return ok("six feature cards, each with a distinct heading and real body text")
+
+
+def gate_testimonials(doc: Doc) -> int:
+    """Three quotes, each with an attribution that is not part of the quote."""
+    section = doc.find(id="testimonials")
+    if not section:
+        return bad("no #testimonials section")
+    quotes = [n for n in walk(section[0]) if n["tag"] in {"blockquote", "figure"}]
+    if len(quotes) != 3:
+        return bad(f"expected 3 <blockquote> or <figure> testimonials, found {len(quotes)}")
+    problems = []
+    for quote in quotes:
+        text = deep_text(quote)
+        if len(text) < MIN_QUOTE_CHARS:
+            problems.append(f"quote of {len(text)} chars: {text[:50]!r}")
+            continue
+        attribution = [n for n in walk(quote) if n["tag"] in {"cite", "figcaption", "footer"}]
+        if not attribution:
+            problems.append(f"no <cite>, <figcaption> or <footer>: {text[:50]!r}")
+    if problems:
+        return bad(f"{len(problems)} testimonial(s) incomplete", *problems)
+    return ok("three testimonials, each with a quote and an attribution")
+
+
+def gate_alt(doc: Doc) -> int:
+    images = doc.find("img")
+    bare = [i["attrs"].get("src", "?") for i in images if not i["attrs"].get("alt", "").strip()]
+    if bare:
+        return bad(f"{len(bare)} image(s) have no alt text", *bare[:6])
+    svgs = [n for n in doc.find("svg")
+            if not n["attrs"].get("aria-label") and n["attrs"].get("aria-hidden") != "true"]
+    if svgs:
+        return bad(f"{len(svgs)} inline <svg> is neither labelled nor hidden",
+                   "give it aria-label, or aria-hidden=\"true\" if it is decorative")
+    return ok(f"{len(images)} image(s) and every inline svg are labelled or hidden")
+
+
+def gate_meta(doc: Doc) -> int:
+    html = doc.find("html")
+    lang = html[0]["attrs"].get("lang", "") if html else ""
+    if lang != "ro":
+        return bad(f'<html lang> is {lang!r}, expected "ro"')
+    titles = doc.find("title")
+    if len(titles) != 1:
+        return bad(f"expected exactly one <title>, found {len(titles)}")
+    title = deep_text(titles[0])
+    if not 30 <= len(title) <= 65:
+        return bad(f"<title> is {len(title)} characters, expected 30-65", title)
+    described = [m for m in doc.find("meta") if m["attrs"].get("name") == "description"]
+    if len(described) != 1:
+        return bad(f"expected exactly one meta description, found {len(described)}")
+    content = described[0]["attrs"].get("content", "")
+    if not 70 <= len(content) <= 160:
+        return bad(f"meta description is {len(content)} characters, expected 70-160", content)
+    return ok(f'lang="ro", title {len(title)} chars, description {len(content)} chars')
+
+
+def gate_selfcontained(doc: Doc) -> int:
+    """Nothing loads off-host.
+
+    Two reasons, and the second is why this is a gate rather than a preference. A page that
+    <link>s a CDN stylesheet makes tools/css-contrast check NOTHING -- it does not follow external
+    sheets -- so the contrast criterion would report "not checked" and be read as passing.
+    """
+    offenders = []
+    for node in doc.nodes:
+        for attribute in ("src", "href"):
+            value = node["attrs"].get(attribute, "")
+            if re.match(r"(?i)^(https?:)?//", value):
+                if node["tag"] == "a" and attribute == "href":
+                    continue          # an outbound link is content, not a request the page makes
+                offenders.append(f"<{node['tag']} {attribute}=\"{value[:70]}\">")
+    if offenders:
+        return bad(f"{len(offenders)} off-host request(s)", *offenders[:8],
+                   "the page must be self-contained: inline the CSS, drop the CDNs")
+    if not doc.find("style"):
+        return bad("no inline <style> block", "the styling must live in the page")
+    return ok("no off-host requests; styling is inline")
+
+
+def walk(node: dict):
+    yield node
+    for child in node["children"]:
+        yield from walk(child)
+
+
+GATES = {"headline": gate_headline, "sections": gate_sections, "anchors": gate_anchors,
+         "stats": gate_stats, "features": gate_features, "testimonials": gate_testimonials,
+         "alt": gate_alt, "meta": gate_meta, "selfcontained": gate_selfcontained}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("gate", choices=sorted(GATES) + ["all"])
+    parser.add_argument("file", type=pathlib.Path)
+    args = parser.parse_args()
+
+    if not args.file.is_file():
+        print(f"cannot read {args.file}", file=sys.stderr)
+        return 2
+
+    doc = load(args.file)
+    if args.gate == "all":
+        return 1 if sum(run(doc) for run in GATES.values()) else 0
+    return GATES[args.gate](doc)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
