@@ -105,7 +105,7 @@ if [[ "$MODE" == "init" ]]; then
     # hard-coded `HANDOFF_PROVIDER=local`; providers/local.sh does exist, but with a user config in
     # place the variable is unnecessary, and naming the wrong provider in the first instruction a
     # new project sees is worse than naming none.
-    echo "  handoff check <slug>   &&  handoff do <slug>"
+    echo "  handoff prepare <slug>   &&  handoff do <slug>"
     echo
     echo "provider:  ${HANDOFF_PROVIDER:-codex}$([[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/agent-handoff/config.sh" ]] && echo " (from your user config)" || echo " (default — see tools/install-local)")"
     exit 0
