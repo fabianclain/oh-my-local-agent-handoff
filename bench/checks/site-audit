@@ -295,6 +295,62 @@ def gate_selfcontained(doc: Doc) -> int:
     return ok("no off-host requests; styling is inline")
 
 
+def gate_darkscheme(doc: Doc) -> int:
+    """A dark block must cover every selector the light sheet gave a colour to.
+
+    This encodes the defect tools/css-contrast was written from: a dark-scheme block overrode
+    `body` and `.card` but not `.wordmark .ro` or the link colour, leaving 1.7:1 and 3.0:1. Every
+    criterion passed and the page scored 6/6.
+
+    It also closes the gap that makes the contrast gate toothless here. Contrast can only judge
+    pairs that exist, so a page with NO dark block has no dark pairs and passes trivially — the
+    absence of the work reads as the work being correct.
+    """
+    css = "\n".join(node["text"] for node in doc.find("style"))
+    if not css.strip():
+        return bad("no inline <style> block, so there is no dark scheme to check")
+
+    opening = re.search(r"@media[^{]*prefers-color-scheme\s*:\s*dark[^{]*\{", css)
+    if not opening:
+        return bad("no @media (prefers-color-scheme: dark) block",
+                   "a page with no dark block has no dark colour pairs, so the contrast gate "
+                   "passes it without checking anything")
+
+    # Take the block by brace balance -- a nested rule means a simple regex to `}` stops early.
+    depth, start = 0, opening.end() - 1
+    end = len(css)
+    for index in range(start, len(css)):
+        if css[index] == "{":
+            depth += 1
+        elif css[index] == "}":
+            depth -= 1
+            if depth == 0:
+                end = index
+                break
+    dark_css, light_css = css[start + 1:end], css[:opening.start()] + css[end + 1:]
+
+    def coloured(block: str) -> set[str]:
+        found = set()
+        for match in re.finditer(r"([^{}]+)\{([^{}]*)\}", block):
+            selector, body = match.group(1).strip(), match.group(2)
+            if re.search(r"(^|;)\s*(color|background|background-color)\s*:", body):
+                for part in selector.split(","):
+                    part = re.sub(r"\s+", " ", part).strip()
+                    if part and not part.startswith("@"):
+                        found.add(part)
+        return found
+
+    light, dark = coloured(light_css), coloured(dark_css)
+    # Pseudo-class rules are the contrast gate's blind spot; requiring them here would demand an
+    # override nothing can then verify, so they are out of scope for this gate too.
+    uncovered = sorted(s for s in light - dark if ":" not in s)
+    if uncovered:
+        return bad(f"{len(uncovered)} selector(s) get a colour in light and none in dark",
+                   *uncovered[:8],
+                   "each keeps its light colour against the dark background")
+    return ok(f"the dark block covers all {len(light)} coloured selector(s)")
+
+
 def walk(node: dict):
     yield node
     for child in node["children"]:
@@ -303,7 +359,8 @@ def walk(node: dict):
 
 GATES = {"headline": gate_headline, "sections": gate_sections, "anchors": gate_anchors,
          "stats": gate_stats, "features": gate_features, "testimonials": gate_testimonials,
-         "alt": gate_alt, "meta": gate_meta, "selfcontained": gate_selfcontained}
+         "alt": gate_alt, "meta": gate_meta, "selfcontained": gate_selfcontained,
+         "darkscheme": gate_darkscheme}
 
 
 def main() -> int:

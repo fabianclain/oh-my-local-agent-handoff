@@ -22,8 +22,29 @@ import tempfile
 HERE = pathlib.Path(__file__).resolve().parent
 AUDIT = HERE / "site-audit"
 REFERENCE = HERE / "site-cases" / "reference" / "index.html"
+DARK_REFERENCE = HERE / "site-cases" / "dark-reference" / "index.html"
+
+# Gates that apply to the light page. `darkscheme` is deliberately not here: the light reference
+# has no dark block, so scoring it there would assert a failure as though it were the design.
 GATES = ["headline", "sections", "anchors", "stats", "features", "testimonials",
          "alt", "meta", "selfcontained"]
+DARK_GATES = ["darkscheme"]
+
+
+def registered_gates() -> list[str]:
+    """The gate names site-audit actually offers.
+
+    Read from the tool rather than restated here. The first version of this file kept its own
+    list, so adding a gate to site-audit gave it no coverage and said nothing -- the same shape as
+    tools/selftest-all resolving only one directory and printing SKIP over a suite that existed.
+    """
+    import importlib.machinery
+    import importlib.util
+    spec = importlib.util.spec_from_loader("site_audit",
+                                           importlib.machinery.SourceFileLoader("site_audit", str(AUDIT)))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return sorted(module.GATES)
 
 # (name, gate that must fail, mutation as a (find, replace) pair)
 CASES = [
@@ -80,9 +101,9 @@ CASES = [
 ]
 
 
-def score(path: pathlib.Path) -> dict[str, bool]:
+def score(path: pathlib.Path, gates: list[str] | None = None) -> dict[str, bool]:
     out = {}
-    for gate in GATES:
+    for gate in (gates or GATES):
         proc = subprocess.run([sys.executable, str(AUDIT), gate, str(path)],
                               capture_output=True, text=True)
         out[gate] = proc.returncode == 0
@@ -96,6 +117,15 @@ def main() -> int:
     source = REFERENCE.read_text()
 
     failures = 0
+    # Every registered gate must be exercised somewhere. A gate with no case is an assumption
+    # wearing a test's clothes, and the failure is silent -- which is the whole reason this check
+    # reads the registry instead of trusting the list above.
+    covered = set(GATES) | set(DARK_GATES)
+    missing = [g for g in registered_gates() if g not in covered]
+    if missing:
+        print(f"FAIL  {len(missing)} registered gate(s) have no case here: {', '.join(missing)}")
+        failures += 1
+
     with tempfile.TemporaryDirectory() as tmp:
         page = pathlib.Path(tmp) / "index.html"
 
@@ -127,6 +157,36 @@ def main() -> int:
                 print(f"pass  {name}  (also tripped {', '.join(extra)})")
             else:
                 print(f"pass  {name}")
+
+        # --- the dark scheme, against the page that has one -----------------------------------
+        if not DARK_REFERENCE.is_file():
+            print(f"FAIL  dark reference missing: {DARK_REFERENCE}")
+            failures += 1
+        else:
+            dark_source = DARK_REFERENCE.read_text()
+            page.write_text(dark_source)
+            if not all(score(page, DARK_GATES).values()):
+                print("FAIL  the dark reference does not pass the dark gates")
+                failures += 1
+            else:
+                print("pass  the dark reference passes the dark gates")
+
+            for name, find, replace in [
+                ("a dark block that forgets one text colour",
+                 "    .stat .label { color: #c9d1d9; }\n", ""),
+                ("no dark block at all",
+                 "@media (prefers-color-scheme: dark) {", "@media (min-width: 1px) {"),
+            ]:
+                if find not in dark_source:
+                    print(f"FAIL  {name}\n        anchor text absent, so this case tests nothing")
+                    failures += 1
+                    continue
+                page.write_text(dark_source.replace(find, replace, 1))
+                if score(page, DARK_GATES)["darkscheme"]:
+                    print(f"FAIL  {name}\n        darkscheme passed a page it should reject")
+                    failures += 1
+                else:
+                    print(f"pass  {name}")
 
     print()
     if failures:
