@@ -59,6 +59,15 @@ SERVING="$STATE_DIR/llamacpp.model"
 model_path() {
     case "$1" in
     gpt-oss-20b) echo "${GPTOSS_GGUF:-$HOME/.cache/agent-handoff/models/gpt-oss-20b-MXFP4.gguf}" ;;
+    # ornith 9B, `ollama pull ornith:9b`. Pointed straight at ollama's blob, which is
+    # world-readable and carries the GGUF magic, so no copy is needed.
+    #
+    # ollama reports family `qwen35`, 9.0B, Q4_K_M, capabilities completion/tools/thinking. The
+    # family is the thing to check before anything else: every Qwen tried here emits correct tool
+    # calls AS TEXT rather than as tool_calls, which took a shim and three bug fixes to drive at
+    # all. tools/engine-conformance answers that in about a minute and is the gate this must pass
+    # before a single benchmark round is spent on it.
+    ornith-9b) echo "${ORNITH_GGUF:-/usr/share/ollama/.ollama/models/blobs/sha256-af63361d2ac3ba2cb454f440842e345b926a50fe89cbdbe6a55160f32fc28e93}" ;;
     # Muse Glimmer 30B, pulled with `ollama pull hf.co/bartowski/Muse-Glimmer-30B-GGUF:IQ3_M`.
     #
     # Pointed straight at ollama's blob because that is where the file is; ollama is not running
