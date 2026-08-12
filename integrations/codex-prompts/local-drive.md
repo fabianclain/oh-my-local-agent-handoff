@@ -59,13 +59,21 @@ port, the model server is down, **or** your sandbox is blocking localhost.
 
 ```bash
 ls .handoff/plans/
-handoff check <slug>          # would the harness accept this plan at all?
+handoff prepare <slug>        # accept? lint? and every criterion against the tree as it is now
 ```
 
-`check` rejects a plan whose acceptance criteria and verification commands differ in number — that
-plan can never score full marks, and running it wastes a round. If it rejects a plan you were
+`prepare` refuses a plan whose acceptance criteria and verification commands differ in number —
+that plan can never score full marks, and running it wastes a round. If it refuses a plan you were
 given, fix the *counts* (one command per criterion, same order) and say you did. That is narrowing,
 not redesigning.
+
+It also prints advisories and a dry run. **Report those to whoever wrote the plan; do not act on
+them yourself.** A `WARN` is a criterion likely to cost the round — an unanchored zero-assertion, a
+grep against coloured output, a state named and never gated — and each is a judgement about what
+the plan should require, which is the planner's call, not the operator's. The exception is the
+counts, above, which are mechanical.
+
+`handoff check <slug>` is the same thing without the dry run, if you want it quicker.
 
 Read every plan in the sequence before running the first. Later steps usually assume earlier ones
 landed, and knowing where you are going changes how you read a failure.

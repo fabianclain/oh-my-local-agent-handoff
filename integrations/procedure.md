@@ -183,7 +183,12 @@ Plans go where `.handoff/config.sh` says. Shape from `templates/plan.md`.
    is indistinguishable from a real page. Assert what a stub cannot fake: the component type,
    several independent strings, a computed value, and the *absence* of placeholder markers.
 4. **Name every file**, and assert the count:
-   `test "$(git status --porcelain -- . ':(exclude).handoff' | wc -l)" -eq N`
+   `test "$(git status --porcelain --untracked-files=all -- . ':(exclude).handoff' | wc -l)" -eq N`
+
+   `--untracked-files=all` is not optional. Without it, `porcelain` collapses an untracked
+   **directory** to a single line, so a plan that creates `src/newthing/` and asserts `-eq 2`
+   passes with five files inside it. The guard is still there and has silently stopped guarding —
+   and new-directory work is exactly when you most want it.
 5. **Any named API that must be used deserves a grep criterion.** "Use `deduplicatedQueries()`"
    was prose; the model injected the dependency, never called it, and queried the table directly —
    which against real data would have inflated every count, because that method exists precisely to
@@ -200,9 +205,41 @@ Plans go where `.handoff/config.sh` says. Shape from `templates/plan.md`.
    indistinguishable, and 38% slower.** Two prompt-layer variants have now been tested and neither
    moved anything. Instructions are not a mechanism. Criteria, gates and smaller steps are.
 
+7. **Every state you name under `## States to handle` needs a criterion, or an admission.** A score
+   is a fraction of the criteria and gets read as a fraction of the work. Those are the same number
+   only when the states are gated. A page listing four viewport and theme states, none of them
+   gated, scored 6/6 while shipping two contrast failures and an unscrollable overflow.
+
+   If a state genuinely cannot be checked from the command line, write it as
+   `- [unverifiable] dark theme contrast`. `handoff roundup` then prints it next to the score, so
+   the round-up never implies coverage the gates did not provide. Saying so out loud is worth more
+   than a 6/6 that quietly means 6 of 10.
+
 ### 6. Check it
 
-`handoff check <slug>`. Fix what it rejects; read the advisories. Acceptance is not quality.
+```bash
+handoff prepare <slug>
+```
+
+One command: it runs `check-plan` (which refuses a plan the harness cannot score), then the plan
+linter, then every acceptance criterion against the current tree. Fix what it rejects; read the
+advisories. Acceptance is not quality.
+
+The linter's findings are not style notes — each one is a round it cost someone:
+
+| It says | What happened |
+| --- | --- |
+| `porcelain-collapse` | `-eq 2` passed with five files in a new directory |
+| `ungated-states` | four states named, none gated, 6/6 over a page with two contrast failures |
+| `coloured-output` | a grep that could not span the escape sequence in the middle of it |
+| `one-sided-whitespace` | added blank lines counted; the damage was a removed one |
+| `uncounted-zero-assertion` | see the next section — this is the one that produces malformed code |
+| `symmetric-example` | two wrong proration implementations passed every criterion |
+
+The dry run is the half that catches an unsatisfiable criterion before it costs a round. Anything
+reported as **ALREADY PASSES** does not test the change; anything reported as failing should fail
+for the reason you expect, and if you cannot say why, read the output it prints rather than
+assuming.
 
 ### 7. Run it
 
@@ -253,6 +290,16 @@ to re-run a round that had done the work. It now counts what the diff says chang
 deleted, so a 0 means the tree really did not move. That is the only version of this signal worth
 acting on: if you are reading an older run, check the diff before trusting a 0.
 
+**The evidence file's `tree-changed` gate had the same failure, from the other direction, and it
+is also fixed.** The subtraction that stops stray untracked files being blamed on the model used to
+excuse them by NAME, so a file that was untracked before the run and untracked after read as
+unchanged however much it had been rewritten. That is the ordinary state mid-sequence: the plan
+creates a view in one round, the next round edits it, and nothing has been committed in between
+because this procedure tells you to review before committing. A reported round came back as *"the
+working tree is unchanged; nothing was implemented"* over a tree that had in fact changed — the one
+signature whose remedy above is to re-run rather than re-specify. It is now compared by content
+against the run-start snapshot. **If you are reading a run from before that fix, read the diff.**
+
 **A missing report is not a diagnosis, and it is not yours to fix.** The mechanism is now settled,
 and the rate depends entirely on which implementer you are driving.
 
@@ -273,6 +320,14 @@ Both produced a usable tree in **every** round. If you are seeing a quarter of r
 report, check which provider you are on before anything else — that is the signature of driving
 something other than `native`.
 
+**That 18/18 is one night, one stack, and it is not the whole story.** Two rounds of real work have
+since lost the report on `native` to a *different* failure: the completion came back with no JSON
+in it at all — once at 4,346 characters, once at 0 — and the retry, which exists for parse faults,
+does not help when the model simply answered without an object. Under investigation. Until it is
+settled, treat the report as a convenience and the tree as the evidence, which is the standing rule
+anyway: a round whose report is missing but whose gates pass is `patch-ok-no-report` and the work
+is good.
+
 Do not re-specify a plan over a missing report, and do not add instructions telling the model to
 remember to report: that has been tried and cannot work, because the report is already being
 written. Judge the tree.
@@ -290,6 +345,10 @@ model defect, a criterion that could never have passed, or an ambiguous plan, an
 cannot tell those apart — so it prints the evidence and leaves the cause blank. **Those blanks are
 the part worth filling in while it is fresh**, and they are the only record of the distinction that
 matters most: whose fault the round was.
+
+It also prints **what the score does not cover**: every state the plan named that no criterion
+mentions, and every one it declared `[unverifiable]`. Read that section before writing "accepted,
+6/6" anywhere — the two numbers are the same only when the list is empty.
 
 `handoff stats` aggregates this across every run in the project, and `handoff retro <slug>` asks
 the model — read-only, after it has been shown the verdict — what it would change about the plan.
@@ -438,6 +497,34 @@ the diff.
 Prefer counting to pattern-matching where you can: `test "$(… | grep -c …)" -eq 0` survives
 formatting changes that a shape-matching regex does not.
 
+## A criterion stricter than your prose is an instruction, and it will be followed
+
+This is not the familiar "your acceptance command is wrong" case, where a broken criterion rejects
+good work. It is worse: **the model reads the criterion as the specification and obeys it past the
+point where your prose stops.**
+
+The reported round described renaming two `div`s and asserted:
+
+```bash
+test "$(grep -c 'div' page.blade.php)" -eq 0
+```
+
+The file had a third `div` — the tagline — that the prose had never counted, and `div` matches
+`</div>` as readily as `<div`. The model did what the criterion said: it changed an opening tag and
+left the closing one. The result was malformed HTML, and the project's own 85 tests passed over it.
+The plan caused the defect.
+
+**A zero-assertion is a claim about every occurrence in the file, and you almost always mean the
+ones you had in mind.** So, for any pattern you assert to zero:
+
+- Count it first. `handoff prepare` does this for you and prints what the pattern matches today.
+- Anchor it to what you mean — `'<div class="wrapper"'`, not `'div'`.
+- If the count and your prose disagree, one of them is wrong, and it is usually the prose.
+
+The general rule: your prose and your criteria are two statements of the same requirement, and
+where they differ, the criteria win — because the criteria are what the model is graded on and
+what it can check itself against. Read them together and make sure they say the same thing.
+
 ## A follow-up plan must name the files it is KEEPING
 
 When a round half-works and you keep the good part, the next plan covers only what is left — and
@@ -460,6 +547,40 @@ while looking for two things in it.
 Bundling a surgical edit with trivial deletions is the specific trap: **the deletions make the step
 look small and the surgical part sets the real depth.** Split the reading-heavy edit into its own
 round.
+
+## Views: the two gates that CAN see, and the one thing that cannot
+
+The old wording here warned that a stub can fake a text assertion. That is true and it is the
+smaller half. The observed failure was the opposite shape — substantial, correct-looking output
+where every property that mattered sat outside what any command reached. The page was good. It
+scored 6/6. It had a 1.7:1 wordmark, a 3.0:1 link, an unscrollable overflow and no heading element.
+
+Two of those three are arithmetic, so they are commands now. Put them in the plan:
+
+```bash
+tools/css-contrast resources/views/pages/thing.blade.php --min 4.5
+tools/view-lint resources/views/pages/thing.blade.php
+```
+
+**`css-contrast`** resolves the cascade — selectors, specificity, inheritance, the nearest ancestor
+background, alpha, and `prefers-color-scheme` layered on top of the base sheet — and computes the
+WCAG ratio for every text/background pair it can reach. It catches the specific defect that a dark
+block overrode `body` and `.card` and forgot the two colours declared elsewhere. It reports what it
+could **not** resolve on every run; read that part.
+
+**`view-lint`** checks tag balance. Unbalanced HTML renders and passes everything, which is why the
+malformed page above survived 85 tests. It also reports the `align-items: center` +
+`min-height: 100vh` trap, which clips the top of an over-tall card with nothing to scroll to.
+
+**A view plan must ask for a heading element.** The missing `<h1>` was a spec gap, not a model
+error — the plan said "a centred card" and never said "heading", and the model was right to build
+what was asked. That is the kind of gap a checklist prevents and blame does not.
+
+**What is still ungated: whether it looks right.** Spacing, rhythm, whether the palette is pleasant,
+whether the layout holds at 320px. Declare those under `## States to handle` as
+`- [unverifiable] …` so the round-up says so, and budget for looking at the page yourself. The
+value in specifying a palette is not that the gates check it; it is that writing down the exact
+hex pairs forces the arithmetic that finds a 1.7:1 wordmark before it ships.
 
 ## Two things the gates cannot see
 
