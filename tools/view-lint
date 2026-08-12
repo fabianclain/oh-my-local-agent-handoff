@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""view-lint — damage to a view that renders anyway.
+
+    tools/view-lint page.html
+    tools/view-lint resources/views/pages/thing.blade.php
+    tools/view-lint page.html --strict      treat the advisories as failures too
+
+Exit 0 when the markup is well-formed, 1 when it is not (or, with --strict, when any advisory
+fires), 2 when the file cannot be read.
+
+WHY
+
+The skill says views are the worst case because text assertions are fakeable. The sharper point,
+from the round that prompted this:
+
+    HTML with unbalanced tags renders and passes everything. A parse check is three lines and
+    catches a class of damage nothing else does.
+
+That round's plan described renaming two `div`s. A criterion asserted `grep -c 'div' -eq 0`; the
+file had a third occurrence the prose had not counted, and the model — obeying the criterion over
+the prose — changed an opening tag and left the closing one. The result was malformed HTML that 85
+tests passed over. The gate that caught it was one the reviewer had added by hand.
+
+ON libxml, WHICH IS THE OBVIOUS WAY TO DO THIS AND DOES NOT WORK
+
+`libxml` parses HTML4. Every HTML5 element — `<main>`, `<section>`, `<nav>` — comes back as error
+code 801, "Tag X invalid", so an unfiltered check reports dozens of errors on a perfectly good page
+and gets switched off. Filtering 801 works but is easy to forget, and the failure mode is a check
+that either cries wolf or is disabled. This uses Python's own parser and its own stack instead, so
+there is no code to filter.
+
+OPTIONAL END TAGS
+
+`</p>`, `</li>`, `</tr>` and friends may legally be omitted, so leaving them out is not damage and
+is not reported. Everything else must be closed by the tag that opened it.
+
+BLADE
+
+`{{ }}`, `{!! !!}` and `@directive(...)` are stripped before parsing. If the file contains
+conditional directives the tag balance is reported with a caveat, because a `<div>` opened in one
+branch and closed in another is legitimate and unparseable here.
+"""
+
+from __future__ import annotations
+
+import argparse
+import pathlib
+import re
+import sys
+from html.parser import HTMLParser
+
+VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param",
+        "source", "track", "wbr"}
+# End tags HTML5 permits omitting. Reporting these would flag ordinary correct markup, and a lint
+# that flags correct markup is one nobody runs twice.
+OPTIONAL_END = {"p", "li", "dt", "dd", "option", "optgroup", "thead", "tbody", "tfoot", "tr",
+                "td", "th", "rt", "rp", "colgroup", "caption", "head", "body", "html"}
+HEADINGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
+
+# PHP first, and this is not optional.
+#
+# Livewire's inline-class syntax puts the whole component class at the top of the blade file, and
+# a PHPDoc generic — `@return array<string, mixed>` — reads as an unclosed `<string,` tag. Running
+# this over 117 real blade files reported 16 as malformed, and every one of those was a docblock.
+# A lint whose first contact with a real codebase is 16 false accusations is worse than none: the
+# next real finding is read as more of the same.
+PHP_BLOCK = re.compile(r"<\?php.*?(\?>|\Z)", re.DOTALL)
+BLADE_PHP = re.compile(r"@php\b.*?@endphp", re.DOTALL)
+BLADE_EXPR = re.compile(r"\{\{--.*?--\}\}|\{\{.*?\}\}|\{!!.*?!!\}", re.DOTALL)
+BLADE_DIRECTIVE = re.compile(r"@[a-zA-Z]+(\s*\((?:[^()]|\([^()]*\))*\))?")
+BLADE_CONDITIONAL = re.compile(r"@(if|unless|foreach|forelse|for|while|auth|guest|switch|"
+                               r"empty|isset|can|cannot|env|production|hasSection|else)\b")
+
+
+def is_component(tag: str) -> bool:
+    """A Blade or Flux component tag rather than an HTML element.
+
+    `<flux:icon.check>` closed by `</flux:icon>` is a mismatch, but it is the TEMPLATE COMPILER's
+    mismatch: Blade resolves these tags itself and errors at compile time, so the test suite
+    already catches it. Raw HTML is the case nothing catches — it renders, and 85 tests passed
+    over the malformed page that prompted this tool. Keeping the hard failure for the silent case
+    is the whole point; lumping them together would mean the one real HTML finding in a repository
+    arrives alongside a pile of component-syntax noise.
+    """
+    return ":" in tag or tag.startswith("x-")
+
+
+class Balance(HTMLParser):
+    """A tag stack, and what does not match it."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.stack: list[tuple[str, int]] = []
+        self.errors: list[str] = []
+        self.component_errors: list[str] = []
+        self.tags: set[str] = set()
+        self.ids: list[str] = []
+
+    def report(self, tag: str, message: str) -> None:
+        (self.component_errors if is_component(tag) else self.errors).append(message)
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        self.tags.add(tag)
+        for key, value in attrs:
+            if key.lower() == "id" and value:
+                self.ids.append(value)
+        if tag not in VOID:
+            self.stack.append((tag, self.getpos()[0]))
+
+    def handle_startendtag(self, tag, attrs):
+        self.tags.add(tag.lower())
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag in VOID:
+            return
+        for depth in range(len(self.stack) - 1, -1, -1):
+            if self.stack[depth][0] != tag:
+                continue
+            # Everything above it was left open. Optional end tags are legitimately omitted;
+            # anything else is the damage this exists for.
+            for orphan, line in self.stack[depth + 1:]:
+                if orphan not in OPTIONAL_END:
+                    self.report(orphan,
+                                f"line {line}: <{orphan}> is still open where </{tag}> closes")
+            del self.stack[depth:]
+            return
+        self.report(tag, f"line {self.getpos()[0]}: </{tag}> closes nothing that is open")
+
+    def finish(self) -> None:
+        for tag, line in self.stack:
+            if tag not in OPTIONAL_END:
+                self.report(tag, f"line {line}: <{tag}> is never closed")
+
+
+# --- the overflow trap --------------------------------------------------------------------------
+#
+# `align-items: center` on a `min-height: 100vh` flex container centres the child on the viewport.
+# When the child is taller than the viewport it overflows in BOTH directions, and the top is
+# clipped away with nothing to scroll to. Reported from real use on a page whose criteria all
+# passed.
+
+RULE = re.compile(r"([^{}]+)\{([^{}]*)\}")
+COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+
+
+def declarations(body: str) -> dict[str, str]:
+    out = {}
+    for piece in body.split(";"):
+        if ":" in piece:
+            name, _, value = piece.partition(":")
+            out[name.strip().lower()] = value.strip().lower()
+    return out
+
+
+def check_overflow(css: str) -> list[str]:
+    findings = []
+    for match in RULE.finditer(COMMENT.sub("", css)):
+        selector = match.group(1).strip().splitlines()[-1].strip()
+        if selector.startswith("@"):
+            continue
+        decls = declarations(match.group(2))
+        display = decls.get("display", "")
+        centred = (decls.get("align-items") == "center"
+                   or decls.get("place-items", "").startswith("center"))
+        tall = any(decls.get(prop, "").endswith("100vh") for prop in ("min-height", "height"))
+        scrolls = any(decls.get(prop, "") in ("auto", "scroll")
+                      for prop in ("overflow", "overflow-y"))
+        if display in ("flex", "grid", "inline-flex") and centred and tall and not scrolls:
+            findings.append(
+                f"`{selector}` centres on a {decls.get('min-height') or decls.get('height')} "
+                f"box with no overflow-y")
+    return findings
+
+
+# --- what a view is for ---------------------------------------------------------------------
+
+def check_structure(balance: Balance, text: str) -> list[str]:
+    findings = []
+    if balance.tags and not (balance.tags & HEADINGS):
+        # A spec gap, not a model error, and named as one: a plan said "a centred card" and never
+        # said "heading", so the model produced a card with no heading element and was right to.
+        # A checklist prevents that; blame does not.
+        findings.append("no heading element (h1-h6) — if the plan asked for one, this is a defect; "
+                        "if it did not, the plan should have")
+    duplicates = {i for i in balance.ids if balance.ids.count(i) > 1}
+    if duplicates:
+        findings.append("duplicate id(s): " + ", ".join(sorted(duplicates)))
+    return findings
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("file")
+    parser.add_argument("--strict", action="store_true",
+                        help="advisories fail the run too, for use as an acceptance command")
+    args = parser.parse_args()
+
+    path = pathlib.Path(args.file)
+    if not path.is_file():
+        print(f"no such file: {args.file}", file=sys.stderr)
+        return 2
+    raw = path.read_text(errors="replace")
+
+    conditional = bool(BLADE_CONDITIONAL.search(raw))
+    text = raw
+    for pattern in (PHP_BLOCK, BLADE_PHP, BLADE_EXPR, BLADE_DIRECTIVE):
+        # Blank each match but KEEP its newlines. Collapsing a 60-line component class to one
+        # space shifts every line number after it, and a lint that names the wrong line sends the
+        # reader to correct markup and teaches them the tool is broken.
+        text = pattern.sub(lambda m: "\n" * m.group(0).count("\n"), text)
+
+    balance = Balance()
+    balance.feed(text)
+    balance.close()
+    balance.finish()
+
+    css = "\n".join(re.findall(r"<style[^>]*>(.*?)</style>", raw, re.DOTALL | re.IGNORECASE))
+    advisories = check_overflow(css) + check_structure(balance, raw)
+    advisories += [f"{e}  (a component tag — the template compiler catches this one)"
+                   for e in balance.component_errors]
+
+    print(f"{path}")
+    if balance.errors:
+        print(f"\n  MALFORMED — {len(balance.errors)} problem(s):")
+        for error in balance.errors:
+            print(f"    {error}")
+        if conditional:
+            print("\n  This file has Blade conditionals. A tag opened in one branch and closed in")
+            print("  another is legitimate and cannot be checked here — read the lines above")
+            print("  before believing them.")
+    else:
+        print("\n  well-formed: every element that requires an end tag has one, in order")
+
+    if advisories:
+        print("\n  advisory:")
+        for finding in advisories:
+            print(f"    {finding}")
+
+    print("\n  not checked: whether it looks right, whether the text is correct, and any")
+    print("  markup produced at runtime rather than written in this file.")
+
+    if balance.errors:
+        return 1
+    if args.strict and advisories:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

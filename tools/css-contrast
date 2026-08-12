@@ -1,0 +1,578 @@
+#!/usr/bin/env python3
+"""css-contrast — WCAG contrast, computed, because contrast is arithmetic.
+
+    tools/css-contrast page.html
+    tools/css-contrast page.html --min 4.5        the default: WCAG AA body text
+    tools/css-contrast page.html --media dark     only the dark colour scheme
+    tools/css-contrast page.html --json
+
+Exit 0 when every pair it could compute meets the threshold, 1 when any fails, 2 when it could not
+read the file at all.
+
+WHY THIS EXISTS
+
+The harness's own principle is to prefer counting to pattern-matching, and the view guidance
+treated appearance as unverifiable. Contrast is not: it is a defined function of two sRGB colours,
+and the reviewer who found it put it best —
+
+    Contrast ratios are arithmetic. A small script parsing declared colour pairs would have caught
+    defect 1 mechanically.
+
+The defect it was written from: a dark-scheme block overrode `body` and `.card` but not
+`.wordmark .ro` (#444444) or the link colour (#0066cc), leaving 1.7:1 and 3.0:1 against #1e1e1e.
+Every criterion passed. Nothing in the plan could have seen it, and the page scored 6/6.
+
+WHAT IT ACTUALLY DOES
+
+It resolves the cascade the way a browser would, for the subset a self-contained page uses:
+tag/class/id selectors and descendant chains, specificity, source order, inline `style` attributes,
+inheritance of `color`, and the background of the nearest ancestor that declares one. Colours
+in a `@media (prefers-color-scheme: ...)` block are applied on top of the base sheet, which is what
+makes the reported defect visible — the failing colour is the one the dark block DID NOT override.
+
+WHAT IT DOES NOT DO, and says so on every run
+
+No pseudo-classes or pseudo-elements, no attribute or sibling selectors, no CSS variables, no
+`@import`, no external stylesheets, no JavaScript. Anything it cannot parse is listed under "not
+checked" rather than passed over, because a gate that silently skips converts absence of evidence
+into apparent evidence — which is the failure this whole project is built around avoiding.
+
+The large-text exemption (3:1 at >=24px, or >=18.66px bold) is applied only where the font size is
+declared on the element itself or an ancestor. Where it is not, the stricter threshold is used and
+the pair is marked, because guessing in the permissive direction is how a gate becomes decoration.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import re
+import sys
+from html.parser import HTMLParser
+
+# --- colour ------------------------------------------------------------------------------------
+
+NAMED = {
+    "black": (0, 0, 0), "white": (255, 255, 255), "red": (255, 0, 0), "lime": (0, 255, 0),
+    "blue": (0, 0, 255), "yellow": (255, 255, 0), "cyan": (0, 255, 255), "aqua": (0, 255, 255),
+    "magenta": (255, 0, 255), "fuchsia": (255, 0, 255), "silver": (192, 192, 192),
+    "gray": (128, 128, 128), "grey": (128, 128, 128), "maroon": (128, 0, 0),
+    "olive": (128, 128, 0), "green": (0, 128, 0), "purple": (128, 0, 128), "teal": (0, 128, 128),
+    "navy": (0, 0, 128), "orange": (255, 165, 0), "gold": (255, 215, 0), "pink": (255, 192, 203),
+    "brown": (165, 42, 42), "beige": (245, 245, 220), "ivory": (255, 255, 240),
+    "khaki": (240, 230, 140), "salmon": (250, 128, 114), "coral": (255, 127, 80),
+    "crimson": (220, 20, 60), "indigo": (75, 0, 130), "violet": (238, 130, 238),
+    "tan": (210, 180, 140), "plum": (221, 160, 221), "orchid": (218, 112, 214),
+    "whitesmoke": (245, 245, 245), "gainsboro": (220, 220, 220), "lightgray": (211, 211, 211),
+    "lightgrey": (211, 211, 211), "darkgray": (169, 169, 169), "darkgrey": (169, 169, 169),
+    "dimgray": (105, 105, 105), "dimgrey": (105, 105, 105), "slategray": (112, 128, 144),
+    "slategrey": (112, 128, 144), "lightblue": (173, 216, 230), "steelblue": (70, 130, 180),
+    "royalblue": (65, 105, 225), "dodgerblue": (30, 144, 255), "skyblue": (135, 206, 235),
+    "midnightblue": (25, 25, 112), "darkblue": (0, 0, 139), "darkgreen": (0, 100, 0),
+    "seagreen": (46, 139, 87), "forestgreen": (34, 139, 34), "limegreen": (50, 205, 50),
+    "darkred": (139, 0, 0), "firebrick": (178, 34, 34), "tomato": (255, 99, 71),
+    "goldenrod": (218, 165, 32), "chocolate": (210, 105, 30), "sienna": (160, 82, 45),
+}
+
+RGB_FUNC = re.compile(r"rgba?\(\s*([^)]*)\)", re.IGNORECASE)
+
+
+class Colour:
+    __slots__ = ("r", "g", "b", "a", "text")
+
+    def __init__(self, r: float, g: float, b: float, a: float, text: str) -> None:
+        self.r, self.g, self.b, self.a, self.text = r, g, b, a, text
+
+    def over(self, backdrop: "Colour") -> "Colour":
+        """Composite onto an opaque backdrop.
+
+        A translucent colour is a real colour only against something, and reporting the declared
+        value would overstate the contrast."""
+        if self.a >= 1:
+            return self
+        return Colour(self.r * self.a + backdrop.r * (1 - self.a),
+                      self.g * self.a + backdrop.g * (1 - self.a),
+                      self.b * self.a + backdrop.b * (1 - self.a), 1.0, self.text)
+
+    @property
+    def hexform(self) -> str:
+        return "#%02x%02x%02x" % (round(self.r), round(self.g), round(self.b))
+
+    def luminance(self) -> float:
+        def channel(value: float) -> float:
+            srgb = value / 255
+            return srgb / 12.92 if srgb <= 0.04045 else ((srgb + 0.055) / 1.055) ** 2.4
+        return 0.2126 * channel(self.r) + 0.7152 * channel(self.g) + 0.0722 * channel(self.b)
+
+
+def parse_colour(raw: str) -> Colour | None:
+    value = raw.strip().rstrip(";").strip().lower()
+    if not value or value in ("inherit", "initial", "unset", "currentcolor", "revert"):
+        return None
+    if value == "transparent":
+        return Colour(0, 0, 0, 0.0, "transparent")
+    if value.startswith("#"):
+        digits = value[1:]
+        if len(digits) in (3, 4):
+            digits = "".join(c * 2 for c in digits)
+        if len(digits) not in (6, 8) or not re.fullmatch(r"[0-9a-f]+", digits):
+            return None
+        r, g, b = (int(digits[i:i + 2], 16) for i in (0, 2, 4))
+        alpha = int(digits[6:8], 16) / 255 if len(digits) == 8 else 1.0
+        return Colour(r, g, b, alpha, raw.strip())
+    match = RGB_FUNC.fullmatch(value)
+    if match:
+        parts = [p.strip() for p in re.split(r"[,/\s]+", match.group(1)) if p.strip()]
+        if len(parts) < 3:
+            return None
+        try:
+            channels = []
+            for part in parts[:3]:
+                channels.append(float(part[:-1]) * 255 / 100 if part.endswith("%")
+                                else float(part))
+            alpha = 1.0
+            if len(parts) > 3:
+                alpha = float(parts[3][:-1]) / 100 if parts[3].endswith("%") else float(parts[3])
+        except ValueError:
+            return None
+        return Colour(*channels, min(max(alpha, 0.0), 1.0), raw.strip())
+    if value in NAMED:
+        return Colour(*NAMED[value], 1.0, raw.strip())
+    return None
+
+
+def contrast(a: Colour, b: Colour) -> float:
+    la, lb = a.luminance(), b.luminance()
+    lighter, darker = max(la, lb), min(la, lb)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+# --- CSS ---------------------------------------------------------------------------------------
+
+COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+# Only the schemes a page actually branches on. Any other at-rule's body is still parsed, but its
+# rules are attributed to the media context named by the query so nothing is silently merged.
+SCHEME = re.compile(r"prefers-color-scheme\s*:\s*(dark|light)", re.IGNORECASE)
+SIMPLE = re.compile(r"^(?:([a-zA-Z][\w-]*)|(?=[.#]))((?:[.#][\w-]+)*)$")
+
+
+class Rule:
+    __slots__ = ("media", "selector", "chain", "specificity", "order", "decls")
+
+    def __init__(self, media, selector, chain, specificity, order, decls):
+        self.media = media
+        self.selector = selector
+        self.chain = chain
+        self.specificity = specificity
+        self.order = order
+        self.decls = decls
+
+
+def parse_declarations(body: str) -> dict[str, str]:
+    out = {}
+    for piece in body.split(";"):
+        if ":" not in piece:
+            continue
+        name, _, value = piece.partition(":")
+        name = name.strip().lower()
+        value = value.strip()
+        if name and value:
+            out[name] = value
+    return out
+
+
+def parse_selector(selector: str):
+    """A descendant chain of simple selectors, or None if it is beyond this tool.
+
+    `>` is read as a descendant combinator. That is a widening — a child selector matches strictly
+    fewer elements — so it can only make this tool check MORE pairs than a browser would apply,
+    never fewer. Overreporting a contrast pair is a false alarm the reader can dismiss; missing one
+    is the failure this exists to prevent.
+    """
+    selector = selector.strip()
+    if not selector or re.search(r"[:\[\]+~*,()@]|::", selector):
+        return None, (0, 0, 0)
+    parts = [p for p in re.split(r"\s*>\s*|\s+", selector) if p]
+    chain, ids, classes, tags = [], 0, 0, 0
+    for part in parts:
+        match = SIMPLE.match(part)
+        if not match:
+            return None, (0, 0, 0)
+        tag = (match.group(1) or "").lower()
+        rest = match.group(2) or ""
+        names = re.findall(r"([.#])([\w-]+)", rest)
+        ids += sum(1 for kind, _ in names if kind == "#")
+        classes += sum(1 for kind, _ in names if kind == ".")
+        tags += 1 if tag else 0
+        chain.append((tag, {n for k, n in names if k == "."}, {n for k, n in names if k == "#"}))
+    return chain, (ids, classes, tags)
+
+
+def parse_css(text: str, media: str = "base", order_start: int = 0):
+    """Rules in source order, plus the selectors that were beyond this tool."""
+    text = COMMENT.sub("", text)
+    rules: list[Rule] = []
+    skipped: list[str] = []
+    order = order_start
+    index = 0
+    while index < len(text):
+        brace = text.find("{", index)
+        if brace < 0:
+            break
+        prelude = text[index:brace].strip()
+        # Find the matching close brace, counting nesting so an at-rule's body comes back whole.
+        depth, cursor = 1, brace + 1
+        while cursor < len(text) and depth:
+            if text[cursor] == "{":
+                depth += 1
+            elif text[cursor] == "}":
+                depth -= 1
+            cursor += 1
+        body = text[brace + 1:cursor - 1]
+        index = cursor
+        if prelude.startswith("@"):
+            scheme = SCHEME.search(prelude)
+            if prelude.lower().startswith("@media"):
+                inner, inner_skipped, order = parse_css(
+                    body, scheme.group(1).lower() if scheme else media, order)
+                rules += inner
+                skipped += inner_skipped
+            else:
+                # @font-face, @keyframes, @supports: no colour pair to compute, and pretending
+                # otherwise would attribute a keyframe's colour to a real element.
+                skipped.append(prelude.split("{")[0].strip())
+            continue
+        decls = parse_declarations(body)
+        for selector in prelude.split(","):
+            chain, specificity = parse_selector(selector)
+            order += 1
+            if chain is None:
+                if selector.strip():
+                    skipped.append(selector.strip())
+                continue
+            rules.append(Rule(media, selector.strip(), chain, specificity, order, decls))
+    return rules, skipped, order
+
+
+# --- the document ------------------------------------------------------------------------------
+
+VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param",
+        "source", "track", "wbr"}
+SKIP_TEXT = {"script", "style", "title", "head", "meta", "link"}
+
+
+class Element:
+    __slots__ = ("tag", "classes", "ids", "parent", "children", "style", "text")
+
+    def __init__(self, tag, attrs, parent):
+        self.tag = tag.lower()
+        attrmap = {k.lower(): (v or "") for k, v in attrs}
+        self.classes = set(attrmap.get("class", "").split())
+        self.ids = {attrmap["id"]} if attrmap.get("id") else set()
+        self.style = parse_declarations(attrmap.get("style", ""))
+        self.parent = parent
+        self.children: list[Element] = []
+        self.text = ""
+
+    def path(self) -> str:
+        bits = []
+        node = self
+        while node is not None:
+            piece = node.tag
+            if node.ids:
+                piece += "#" + sorted(node.ids)[0]
+            elif node.classes:
+                piece += "." + sorted(node.classes)[0]
+            bits.append(piece)
+            node = node.parent
+        return " ".join(reversed(bits[:4]))
+
+
+class Document(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.root = Element("html", [], None)
+        self.stack = [self.root]
+        self.styles: list[str] = []
+        self._in_style = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() == "style":
+            self._in_style = True
+            return
+        if tag.lower() == "html" and len(self.stack) == 1:
+            # The synthetic root IS <html>. Nesting a second one under it renders every path as
+            # "html html body …" and, worse, would let an `html { }` rule miss the root's own
+            # descendants by one level.
+            self.root.classes |= {v for k, v in attrs if k.lower() == "class" and v
+                                  for v in v.split()}
+            return
+        element = Element(tag, attrs, self.stack[-1])
+        self.stack[-1].children.append(element)
+        if tag.lower() not in VOID:
+            self.stack.append(element)
+
+    def handle_startendtag(self, tag, attrs):
+        element = Element(tag, attrs, self.stack[-1])
+        self.stack[-1].children.append(element)
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag == "style":
+            self._in_style = False
+            return
+        for depth in range(len(self.stack) - 1, 0, -1):
+            if self.stack[depth].tag == tag:
+                del self.stack[depth:]
+                return
+
+    def handle_data(self, data):
+        if self._in_style:
+            self.styles.append(data)
+        elif data.strip():
+            self.stack[-1].text += data.strip() + " "
+
+    def walk(self, node=None):
+        node = self.root if node is None else node
+        yield node
+        for child in node.children:
+            yield from self.walk(child)
+
+
+def matches(chain, element: Element) -> bool:
+    """Descendant chain, matched right to left."""
+    def simple(part, node):
+        tag, classes, ids = part
+        return ((not tag or tag == node.tag)
+                and classes <= node.classes and ids <= node.ids)
+
+    if not simple(chain[-1], element):
+        return False
+    remaining = list(chain[:-1])
+    node = element.parent
+    while remaining and node is not None:
+        if simple(remaining[-1], node):
+            remaining.pop()
+        node = node.parent
+    return not remaining
+
+
+def computed(element: Element, rules: list[Rule], media: str) -> dict[str, str]:
+    """Declarations in cascade order, base sheet first, then the media context on top."""
+    applicable = []
+    for rule in rules:
+        if rule.media not in ("base", media):
+            continue
+        if matches(rule.chain, element):
+            # The media block wins over the base sheet at equal specificity, because it comes
+            # later in the document. This is the whole mechanism of the reported defect: the dark
+            # block overrode `body` and `.card`, and the colours it did NOT restate kept their
+            # light values against a dark background.
+            applicable.append(((0 if rule.media == "base" else 1),
+                               rule.specificity, rule.order, rule.decls))
+    applicable.sort(key=lambda item: (item[0], item[1], item[2]))
+    out: dict[str, str] = {}
+    for *_, decls in applicable:
+        out.update(decls)
+    out.update(element.style)          # an inline style attribute beats any sheet rule
+    return out
+
+
+def inherited(element: Element, rules, media, prop: str):
+    node = element
+    while node is not None:
+        value = computed(node, rules, media).get(prop)
+        if value and value.strip().lower() not in ("inherit", "unset"):
+            return value, node
+        node = node.parent
+    return None, None
+
+
+def background_of(element: Element, rules, media) -> tuple[Colour, Element | None, bool]:
+    """The nearest ancestor background, composited if any layer is translucent.
+
+    Returns (colour, the element it came from, whether it was assumed). An element with no
+    background anywhere up the tree sits on the canvas, which is white unless something says
+    otherwise — that assumption is reported rather than hidden.
+    """
+    layers: list[Colour] = []
+    node = element
+    while node is not None:
+        decls = computed(node, rules, media)
+        raw = decls.get("background-color") or decls.get("background")
+        if raw:
+            # `background: #fff url(x) no-repeat` — take the first token that is a colour.
+            colour = parse_colour(raw)
+            if colour is None:
+                for token in re.split(r"\s+(?![^(]*\))", raw):
+                    colour = parse_colour(token)
+                    if colour is not None:
+                        break
+            if colour is not None and colour.a > 0:
+                layers.append(colour)
+                if colour.a >= 1:
+                    return _flatten(layers), node, False
+        node = node.parent
+    layers.append(Colour(255, 255, 255, 1.0, "canvas"))
+    return _flatten(layers), None, True
+
+
+def _flatten(layers: list[Colour]) -> Colour:
+    result = layers[-1]
+    for layer in reversed(layers[:-1]):
+        result = layer.over(result)
+    return result
+
+
+FONT_SIZE = re.compile(r"([\d.]+)\s*(px|pt|rem|em)")
+
+
+def font_size_px(element: Element, rules, media) -> float | None:
+    value, _ = inherited(element, rules, media, "font-size")
+    if not value:
+        return None
+    match = FONT_SIZE.search(value)
+    if not match:
+        return None
+    size, unit = float(match.group(1)), match.group(2)
+    return {"px": size, "pt": size * 4 / 3, "rem": size * 16, "em": size * 16}[unit]
+
+
+def is_bold(element: Element, rules, media) -> bool:
+    value, _ = inherited(element, rules, media, "font-weight")
+    if not value:
+        return False
+    value = value.strip().lower()
+    return value in ("bold", "bolder") or (value.isdigit() and int(value) >= 700)
+
+
+# --- the check ---------------------------------------------------------------------------------
+
+def check(path: pathlib.Path, minimum: float, only_media: str | None):
+    text = path.read_text(errors="replace")
+    if path.suffix.lower() in (".css", ".scss"):
+        rules, skipped, _ = parse_css(text)
+        document = None
+    else:
+        document = Document()
+        document.feed(text)
+        rules, skipped = [], []
+        order = 0
+        for sheet in document.styles:
+            more, more_skipped, order = parse_css(sheet, "base", order)
+            rules += more
+            skipped += more_skipped
+
+    media_contexts = sorted({rule.media for rule in rules} | {"base"})
+    if only_media:
+        media_contexts = [m for m in media_contexts if m == only_media]
+
+    results = []
+    notes = []
+    if document is None:
+        # No document: every pair would have to be guessed from selector names alone, and this
+        # tool refuses to guess. Say so rather than reporting a clean run over nothing.
+        notes.append("a bare stylesheet has no elements, so no pair can be resolved — "
+                     "point this at the HTML file that uses it")
+        return results, notes, sorted(set(skipped))
+
+    seen = set()
+    for media in media_contexts:
+        for element in document.walk():
+            if element.tag in SKIP_TEXT or not element.text.strip():
+                continue
+            raw, source = inherited(element, rules, media, "color")
+            if raw is None:
+                continue
+            foreground = parse_colour(raw)
+            if foreground is None:
+                notes.append(f"{element.path()}: colour `{raw}` could not be parsed")
+                continue
+            background, from_element, assumed = background_of(element, rules, media)
+            foreground = foreground.over(background)
+            size = font_size_px(element, rules, media)
+            large = size is not None and (size >= 24 or (size >= 18.66
+                                                         and is_bold(element, rules, media)))
+            threshold = 3.0 if large else minimum
+            ratio = contrast(foreground, background)
+            key = (media, foreground.hexform, background.hexform, threshold)
+            if key in seen:
+                continue
+            seen.add(key)
+            results.append({
+                "media": media, "where": element.path(),
+                "text": element.text.strip()[:40],
+                "foreground": foreground.hexform, "background": background.hexform,
+                "ratio": round(ratio, 2), "threshold": threshold,
+                "passed": ratio + 1e-9 >= threshold,
+                "large_text": large,
+                "font_size_known": size is not None,
+                "background_assumed": assumed,
+                "background_from": from_element.path() if from_element else "the canvas",
+                "colour_from": source.path() if source else "",
+            })
+    return results, notes, sorted(set(skipped))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("file")
+    parser.add_argument("--min", type=float, default=4.5,
+                        help="minimum ratio for normal text (default 4.5, WCAG AA)")
+    parser.add_argument("--media", help="only this colour scheme: base, dark or light")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+
+    path = pathlib.Path(args.file)
+    if not path.is_file():
+        print(f"no such file: {args.file}", file=sys.stderr)
+        return 2
+
+    results, notes, skipped = check(path, args.min, args.media)
+    failed = [r for r in results if not r["passed"]]
+
+    if args.json:
+        print(json.dumps({"file": str(path), "minimum": args.min, "results": results,
+                          "notes": notes, "unparsed_selectors": skipped}, indent=2))
+        return 1 if failed else 0
+
+    print(f"{path}: {len(results)} colour pair(s) resolved, minimum {args.min}:1\n")
+    for result in sorted(results, key=lambda r: (r["passed"], r["media"])):
+        mark = "pass" if result["passed"] else "FAIL"
+        scheme = "" if result["media"] == "base" else f"  [{result['media']}]"
+        print(f"  {mark}  {result['foreground']} on {result['background']}  "
+              f"{result['ratio']:5.2f}:1  (needs {result['threshold']}){scheme}")
+        print(f"          {result['where']}  —  \"{result['text']}\"")
+        if not result["passed"]:
+            print(f"          colour from {result['colour_from'] or 'itself'}, "
+                  f"background from {result['background_from']}")
+        if result["large_text"]:
+            print("          large text, so 3:1 applies")
+        elif not result["font_size_known"]:
+            print("          font size not declared, so the stricter threshold was used")
+
+    # Everything it could not do. A gate that quietly checks less than you think converts absence
+    # of evidence into apparent evidence, which is the failure this project exists around.
+    print("\nnot checked:")
+    if skipped:
+        shown = ", ".join(skipped[:6]) + (" …" if len(skipped) > 6 else "")
+        print(f"  - {len(skipped)} selector(s) beyond this tool: {shown}")
+    for note in notes:
+        print(f"  - {note}")
+    print("  - pseudo-classes and pseudo-elements, attribute and sibling selectors,")
+    print("    CSS variables, external stylesheets, and anything set from JavaScript")
+    if any(r["background_assumed"] for r in results):
+        print("  - some backgrounds came from no declaration at all and were taken as white")
+
+    if failed:
+        print(f"\n{len(failed)} pair(s) below the threshold.")
+        return 1
+    print(f"\nevery resolved pair meets {args.min}:1. That is not the same as the page being")
+    print("readable — see 'not checked' above.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

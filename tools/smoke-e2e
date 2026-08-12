@@ -104,7 +104,8 @@ echo "==> 1/9 surface: what the docs promise, and what the driver loads"
 
 # Files bin/handoff reads at runtime. A missing one degrades a prompt layer silently rather than
 # erroring, which is the worst failure mode available.
-for f in bin/handoff tools/check-plan tools/plan-lint tools/verify-round tools/setup-local-implementer \
+for f in bin/handoff tools/check-plan tools/plan-lint tools/css-contrast tools/view-lint \
+         tools/verify-round tools/setup-local-implementer \
          tools/journal tools/escalate tools/doctor tools/build-integrations \
          templates/plan.md templates/config.sh templates/agent-rules.md \
          schemas/handoff.schema.json providers/local.sh providers/stub.sh \

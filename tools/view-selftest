@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""view-selftest — the two gates that can see a view, from both sides.
+
+    tools/view-selftest
+
+`tools/css-contrast` and `tools/view-lint` exist because a round scored 6/6 over a page with two
+contrast failures, an unscrollable overflow and no heading, and a later round produced malformed
+HTML that 85 tests passed over. Both tools claim to catch things nothing else can, so both have to
+be wrong in the right direction: silent on a good page, loud on the exact defect reported.
+
+The contrast cases carry the REAL numbers from that page — 1.71:1 and 2.99:1 against #1e1e1e — so
+a change to the arithmetic shows up as a changed ratio rather than as a still-passing test. The
+reference pairs below (21:1 black on white, 4.54:1 at the AA boundary) are checkable by hand.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import pathlib
+import subprocess
+import sys
+import tempfile
+from importlib.machinery import SourceFileLoader
+
+HERE = pathlib.Path(__file__).resolve().parent
+CONTRAST = HERE / "css-contrast"
+VIEWLINT = HERE / "view-lint"
+
+# The page as reported: a dark block that overrides `body` and `.card` and forgets the wordmark
+# and the link colour.
+HOUSENIA = """<!doctype html>
+<html><head><style>
+  body { background: #ffffff; color: #222222; font-size: 16px; }
+  .card { background: #f7f7f7; }
+  .wordmark .ro { color: #444444; }
+  a { color: #0066cc; }
+  a:hover { color: #003366; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #121212; color: #eeeeee; }
+    .card { background: #1e1e1e; }
+  }
+</style></head>
+<body><div class="card">
+  <h1 class="wordmark">housenia<span class="ro">.ro</span></h1>
+  <a href="/x">a link</a>
+</div></body></html>
+"""
+
+# The same page with the dark block completing the job.
+FIXED = HOUSENIA.replace(
+    "    .card { background: #1e1e1e; }",
+    "    .card { background: #1e1e1e; }\n"
+    "    .wordmark .ro { color: #b0b0b0; }\n    a { color: #6cb6ff; }")
+
+
+def run(tool: pathlib.Path, *args: str) -> tuple[str, int]:
+    done = subprocess.run([sys.executable, str(tool), *args], capture_output=True, text=True)
+    return done.stdout + done.stderr, done.returncode
+
+
+def load(path: pathlib.Path):
+    spec = importlib.util.spec_from_file_location(
+        path.name.replace("-", "_"), path,
+        loader=SourceFileLoader(path.name.replace("-", "_"), str(path)))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def check_arithmetic() -> list[str]:
+    """Ratios anyone can verify by hand, against the published definition."""
+    module = load(CONTRAST)
+    problems = []
+    for foreground, background, expected in [
+        ("#000000", "#ffffff", 21.00),   # the maximum
+        ("#ffffff", "#ffffff", 1.00),    # the minimum
+        ("#767676", "#ffffff", 4.54),    # the AA boundary for body text
+        ("#595959", "#ffffff", 7.00),    # the AAA boundary
+        ("#444444", "#1e1e1e", 1.71),    # the wordmark, as reported
+        ("#0066cc", "#1e1e1e", 2.99),    # the link, as reported
+    ]:
+        got = module.contrast(module.parse_colour(foreground), module.parse_colour(background))
+        if abs(got - expected) > 0.01:
+            problems.append(f"{foreground} on {background}: got {got:.2f}, expected {expected}")
+
+    # A translucent colour is only a colour against something. Reporting the declared value would
+    # overstate the contrast of every semi-transparent overlay on the page.
+    composited = module.parse_colour("rgba(0,0,0,0.5)").over(module.parse_colour("#ffffff"))
+    if composited.hexform != "#808080":
+        problems.append(f"50% black over white composited to {composited.hexform}, not #808080")
+    if module.parse_colour("#f0a3").hexform != "#ff00aa":
+        problems.append("four-digit hex is not expanded correctly")
+    return problems
+
+
+CONTRAST_CASES = [
+    # (name, page, extra args, must appear, must not appear, expected exit)
+    ("the reported page fails on exactly the two colours the dark block forgot",
+     HOUSENIA, [], ["1.71:1", "2.99:1", "#1e1e1e", "[dark]"], [], 1),
+
+    # The pair that makes the check falsifiable. Same page, same structure, dark block completed.
+    ("the same page passes once the dark block covers them",
+     FIXED, [], ["every resolved pair meets"], ["FAIL"], 0),
+
+    # A gate that silently checks less than you think converts absence of evidence into evidence.
+    ("a selector it cannot parse is reported, not skipped over",
+     HOUSENIA, [], ["not checked", "a:hover"], [], 1),
+
+    # The defect was dark-only. The light scheme of the very same page is clean, which is why
+    # nobody saw it: every criterion the plan ran was effectively a light-scheme criterion.
+    ("the light scheme of that page, on its own, is clean",
+     HOUSENIA, ["--media", "base"], ["every resolved pair meets"], ["FAIL"], 0),
+]
+
+LARGE_TEXT = """<html><head><style>
+  body { background: #ffffff; }
+  .big { color: #949494; font-size: 30px; }
+</style></head><body><p class="big">heading sized</p></body></html>
+"""
+SMALL_TEXT = LARGE_TEXT.replace("font-size: 30px", "font-size: 14px")
+
+VIEW_CASES = [
+    # (name, file contents, suffix, must appear, must not appear, expected exit)
+    ("an opening tag renamed and the closing one left behind",
+     "<html><body><section class=\"card\"><h1>T</h1></div></body></html>",
+     ".html", ["MALFORMED", "</div> closes nothing"], [], 1),
+
+    ("omitted end tags HTML5 permits are not damage",
+     "<html><body><main><h1>T</h1><ul><li>one<li>two</ul><p>a<p>b<img src=x></main></body></html>",
+     ".html", ["well-formed"], ["MALFORMED"], 0),
+
+    # 16 of 117 real blade files were reported malformed by the first version, every one of them a
+    # PHPDoc generic in the Livewire component class at the top of the file.
+    # The arrow matters. html.parser reads `<?php` as a processing instruction and ends it at the
+    # first `>` it finds — which in any real component is the one in `$this->…`. Everything after
+    # that is parsed as markup, so `array<string, mixed>` becomes an unclosed `<string,` tag. A
+    # fixture without an early arrow does not reproduce it, and the first version of this case
+    # passed with PHP stripping disabled.
+    ("a PHPDoc generic in a Livewire component class is not a tag",
+     "<?php\nnew class extends Component {\n"
+     "    public function mount(): void { $this->load(); }\n"
+     "    /** @return array<string, mixed> */\n"
+     "    public function rules(): array { return []; }\n};\n?>\n"
+     "<div><h1>T</h1></div>\n",
+     ".blade.php", ["well-formed"], ["MALFORMED", "string,"], 0),
+
+    ("line numbers survive the PHP being stripped",
+     "<?php\n" + "// filler\n" * 20 + "?>\n<div><h1>T</h1></section>\n",
+     ".blade.php", ["line 23"], [], 1),
+
+    ("a centred full-height box with no overflow is reported",
+     "<html><head><style>body{display:flex;align-items:center;min-height:100vh;}</style>"
+     "</head><body><h1>t</h1></body></html>",
+     ".html", ["advisory", "no overflow-y"], ["MALFORMED"], 0),
+
+    ("the same box with overflow-y is not",
+     "<html><head><style>body{display:flex;align-items:center;min-height:100vh;"
+     "overflow-y:auto;}</style></head><body><h1>t</h1></body></html>",
+     ".html", [], ["no overflow-y"], 0),
+
+    # The compiler catches these; nothing catches raw HTML. Reporting them as the same thing means
+    # the one real finding in a repository arrives buried in component-syntax noise.
+    ("a component tag mismatch is advisory, not malformed",
+     "<div><flux:icon.check></flux:icon><h1>T</h1></div>",
+     ".blade.php", ["component tag"], ["MALFORMED"], 0),
+
+    # A spec gap, not a model error: the plan said "a centred card" and never said "heading".
+    ("a page with no heading element is named",
+     "<html><body><div class=\"card\"><p>only text</p></div></body></html>",
+     ".html", ["no heading element"], ["MALFORMED"], 0),
+
+    ("--strict makes the advisories fail the round",
+     "<html><body><div class=\"card\"><p>only text</p></div></body></html>",
+     ".html", ["no heading element"], [], 1),
+]
+
+
+def main() -> int:
+    if not CONTRAST.exists() or not VIEWLINT.exists():
+        print("css-contrast or view-lint not found", file=sys.stderr)
+        return 2
+
+    failures = 0
+    for problem in check_arithmetic():
+        print(f"FAIL  arithmetic: {problem}")
+        failures += 1
+    if not failures:
+        print("pass  contrast arithmetic matches the published definition")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp)
+        for name, page, extra, must, must_not, expected in CONTRAST_CASES:
+            path = root / "page.html"
+            path.write_text(page)
+            out, code = run(CONTRAST, str(path), *extra)
+            problems = [f"missing {m!r}" for m in must if m not in out]
+            problems += [f"must not contain {m!r}" for m in must_not if m in out]
+            if code != expected:
+                problems.append(f"exit {code}, expected {expected}")
+            if problems:
+                print(f"FAIL  contrast: {name}")
+                for problem in problems:
+                    print(f"        {problem}")
+                failures += 1
+            else:
+                print(f"pass  contrast: {name}")
+
+        # The large-text exemption, and the fact that it is not applied when the size is unknown.
+        for label, page, expected in [("large text gets the 3:1 threshold", LARGE_TEXT, 0),
+                                      ("the same colours at 14px do not", SMALL_TEXT, 1)]:
+            path = root / "size.html"
+            path.write_text(page)
+            _, code = run(CONTRAST, str(path))
+            if code != expected:
+                print(f"FAIL  contrast: {label} (exit {code}, expected {expected})")
+                failures += 1
+            else:
+                print(f"pass  contrast: {label}")
+
+        for name, body, suffix, must, must_not, expected in VIEW_CASES:
+            path = root / f"v{suffix}"
+            path.write_text(body)
+            args = [str(path)] + (["--strict"] if "--strict" in name else [])
+            out, code = run(VIEWLINT, *args)
+            problems = [f"missing {m!r}" for m in must if m not in out]
+            problems += [f"must not contain {m!r}" for m in must_not if m in out]
+            if code != expected:
+                problems.append(f"exit {code}, expected {expected}")
+            if problems:
+                print(f"FAIL  view-lint: {name}")
+                for problem in problems:
+                    print(f"        {problem}")
+                failures += 1
+            else:
+                print(f"pass  view-lint: {name}")
+
+    total = 1 + len(CONTRAST_CASES) + 2 + len(VIEW_CASES)
+    print()
+    if failures:
+        print(f"{failures} check(s) failed")
+        return 1
+    print(f"{total} check(s) passed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
