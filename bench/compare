@@ -132,6 +132,26 @@ def verdict(p: float) -> str:
     return "chance"
 
 
+def damage_of(row: dict) -> str:
+    """Damaged or merely incomplete, re-derived rather than trusted.
+
+    Runs recorded before the split carry `patch-damaged` from what was then the classifier's else
+    branch, so the label means "not accepted" and nothing more. Their own counts say which it was.
+    """
+    outcome = row.get("outcome")
+    if outcome not in {"patch-damaged", "patch-incomplete"}:
+        return outcome or ""
+
+    def count(key: str) -> int:
+        try:
+            return int(row.get(key, "0") or 0)
+        except ValueError:
+            return 0
+
+    touched = count("scope_violations") + count("rewrite_violations") + count("litter")
+    return "patch-damaged" if touched else "patch-incomplete"
+
+
 def counts(rows: list[dict]) -> collections.Counter:
     return collections.Counter(r.get("outcome", "unknown") for r in rows)
 
@@ -223,7 +243,11 @@ def main() -> int:
         ("usable tree", lambda r: r.get("outcome") in USABLE),
         ("accepted", lambda r: r.get("outcome") == "accepted"),
         ("no final report", lambda r: r.get("outcome") == "patch-ok-no-report"),
-        ("damaged", lambda r: r.get("outcome") == "patch-damaged"),
+        # Damaged and incomplete are separate rows because they are separate failures with
+        # opposite fixes: one needs a human to clean the tree, the other needs a narrower plan.
+        # Read as one row, an arm that merely failed criteria looks indisciplined.
+        ("damaged", lambda r: damage_of(r) == "patch-damaged"),
+        ("incomplete", lambda r: damage_of(r) == "patch-incomplete"),
         ("green on first attempt", lambda r: r.get("attempts") == "1" and r.get("outcome") in USABLE),
     ):
         k1 = sum(1 for r in control if predicate(r))

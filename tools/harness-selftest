@@ -140,7 +140,7 @@ run_bench() {
     ) >"$SANDBOX/bench-$label.log" 2>&1
 }
 
-mkdir -p "$SANDBOX/tmp-commands" "$SANDBOX/tmp-full" "$SANDBOX/tmp-noreport" "$SANDBOX/tmp-noop" "$SANDBOX/tmp-blocked" "$SANDBOX/tmp-usage" "$SANDBOX/tmp-rotated" "$SANDBOX/tmp-pinned" "$SANDBOX/tmp-truncated" "$SANDBOX/tmp-clean" "$SANDBOX/tmp-kept" "$SANDBOX/tmp-treehash"
+mkdir -p "$SANDBOX/tmp-commands" "$SANDBOX/tmp-full" "$SANDBOX/tmp-noreport" "$SANDBOX/tmp-noop" "$SANDBOX/tmp-blocked" "$SANDBOX/tmp-usage" "$SANDBOX/tmp-rotated" "$SANDBOX/tmp-pinned" "$SANDBOX/tmp-truncated" "$SANDBOX/tmp-clean" "$SANDBOX/tmp-kept" "$SANDBOX/tmp-treehash" "$SANDBOX/tmp-incomplete" "$SANDBOX/tmp-damaged"
 
 METRICS="$CLONE/bench/results/harness-selftest/stub/1/metrics"
 metric() { awk -F= -v k="$1" '$1 == k { print $2 }' "$METRICS" 2>/dev/null; }
@@ -151,7 +151,7 @@ GOOD_REPORT='{"status":"complete","summary":"Marker set to green as specified by
 # genuinely exercised rather than skipped by a first-attempt success.
 GREEN_ON_SECOND='n=$(( $(cat '"$ATTEMPT_COUNTER"' 2>/dev/null || echo 0) + 1 )); echo $n >'"$ATTEMPT_COUNTER"'; if [ "$n" -ge 2 ]; then sed -i "3s/.*/green/" bench/fixtures/harness/state.txt; else sed -i "3s/.*/maroon/" bench/fixtures/harness/state.txt; fi'
 
-echo "==> 1/14 a failed attempt is retried and told which command failed"
+echo "==> 1/16 a failed attempt is retried and told which command failed"
 STUB_PATCH="$GREEN_ON_SECOND" STUB_REPORT="$GOOD_REPORT" \
     BENCH_FEEDBACK_DETAIL=commands run_bench commands
 ATTEMPTS="$(metric attempts)"
@@ -166,7 +166,7 @@ else
     pass "retried once, and the failing command was named"
 fi
 
-echo "==> 2/14 the baseline hands back no output and no diff"
+echo "==> 2/16 the baseline hands back no output and no diff"
 if grep -q 'What your previous attempt actually changed' "$PROMPT_LOG"; then
     fail "the diff reached the model in the default mode"
 elif [[ "$(metric feedback_detail)" != commands ]]; then
@@ -175,7 +175,7 @@ else
     pass "commands only, and the level is recorded in metrics"
 fi
 
-echo "==> 3/14 full detail reaches the model through bench/run"
+echo "==> 3/16 full detail reaches the model through bench/run"
 STUB_PATCH="$GREEN_ON_SECOND" STUB_REPORT="$GOOD_REPORT" \
     BENCH_FEEDBACK_DETAIL=full run_bench full
 if [[ "$(metric attempts)" != 2 ]]; then
@@ -190,7 +190,7 @@ else
     pass "the diff of the failed attempt is in the retry prompt, and recorded"
 fi
 
-echo "==> 4/14 a correct tree with an unusable report is not scored as a failure"
+echo "==> 4/16 a correct tree with an unusable report is not scored as a failure"
 STUB_PATCH='sed -i "3s/.*/green/" bench/fixtures/harness/state.txt' \
     STUB_REPORT='I have finished the task successfully.' \
     BENCH_MAX_ATTEMPTS=1 run_bench noreport
@@ -202,7 +202,7 @@ else
     pass "patch-ok-no-report, distinct from a run that changed nothing"
 fi
 
-echo "==> 5/14 a confident report over an untouched tree is named as fabrication"
+echo "==> 5/16 a confident report over an untouched tree is named as fabrication"
 STUB_PATCH='true' STUB_REPORT="$GOOD_REPORT" BENCH_MAX_ATTEMPTS=1 run_bench noop
 if [[ "$(metric criteria_met)" != 0 ]]; then
     fail "an untouched tree scored $(metric criteria_met), not 0"
@@ -212,7 +212,7 @@ else
     pass "fabricated, scored zero despite a complete report"
 fi
 
-echo "==> 6/14 an untouched tree without a success claim is a plain no-op"
+echo "==> 6/16 an untouched tree without a success claim is a plain no-op"
 BLOCKED_REPORT='{"status":"blocked","summary":"The fixture could not be located, so nothing was changed.","files_changed":[],"tests_run":[],"deviations":[],"blockers":["could not find the fixture"],"follow_ups":[]}'
 STUB_PATCH='true' STUB_REPORT="$BLOCKED_REPORT" BENCH_MAX_ATTEMPTS=1 run_bench blocked
 if [[ "$(metric criteria_met)" != 0 ]]; then
@@ -223,7 +223,7 @@ else
     pass "no-op, kept distinct from fabrication"
 fi
 
-echo "==> 7/14 token usage is summed across attempts, not taken from the last one"
+echo "==> 7/16 token usage is summed across attempts, not taken from the last one"
 STUB_PATCH="$GREEN_ON_SECOND" STUB_REPORT="$GOOD_REPORT" \
     STUB_USAGE=$'prompt_tokens=100\ngenerated_tokens=50\nmodel_requests=3' \
     BENCH_MAX_ATTEMPTS=2 run_bench usage
@@ -239,7 +239,7 @@ else
     pass "200 prompt / 100 generated over two attempts"
 fi
 
-echo "==> 8/14 a restarted or rotated server log is refused, not counted"
+echo "==> 8/16 a restarted or rotated server log is refused, not counted"
 STUB_PATCH='sed -i "3s/.*/green/" bench/fixtures/harness/state.txt' STUB_REPORT="$GOOD_REPORT" \
     STUB_USAGE='usage_tokens_unattributable=1' BENCH_MAX_ATTEMPTS=1 run_bench rotated
 if [[ "$(metric usage_unattributable)" != 1 ]]; then
@@ -250,7 +250,7 @@ else
     pass "flagged, and no number invented"
 fi
 
-echo "==> 9/14 an adapter can pin its own feedback level, and the pin wins"
+echo "==> 9/16 an adapter can pin its own feedback level, and the pin wins"
 # The failure this prevents: an A/B arm named `...full` running under `commands` because the env
 # var was forgotten, with the results path still claiming `full`. A label that can disagree with
 # the behaviour it names is worse than no label, because it is believed.
@@ -270,7 +270,7 @@ else
     pass "pinned to full despite BENCH_FEEDBACK_DETAIL=commands, and it took effect"
 fi
 
-echo "==> 10/14 a context-truncated run is recorded as such"
+echo "==> 10/16 a context-truncated run is recorded as such"
 # Found by reading the serving log by hand: one run of round 6 filled its 64k window, lost history
 # and was scored as though it had all of it. A configuration result silently priced as a model one.
 STUB_PATCH='sed -i "3s/.*/green/" bench/fixtures/harness/state.txt' STUB_REPORT="$GOOD_REPORT" \
@@ -284,7 +284,7 @@ else
     pass "2 truncations and 1 overflow carried into metrics"
 fi
 
-echo "==> 11/14 a clean run records zero, not a blank"
+echo "==> 11/16 a clean run records zero, not a blank"
 STUB_PATCH='sed -i "3s/.*/green/" bench/fixtures/harness/state.txt' STUB_REPORT="$GOOD_REPORT" \
     STUB_USAGE=$'prompt_tokens=100\ngenerated_tokens=50\nmodel_requests=1' \
     BENCH_MAX_ATTEMPTS=1 run_bench clean
@@ -294,7 +294,7 @@ else
     pass "zero recorded explicitly"
 fi
 
-echo "==> 12/14 the feedback each retry was given is preserved"
+echo "==> 12/16 the feedback each retry was given is preserved"
 # Round 7 compared two feedback levels and then could not read the feedback: it lived in the
 # worktree, which is deleted when the repetition ends.
 STUB_PATCH="$GREEN_ON_SECOND" STUB_REPORT="$GOOD_REPORT" BENCH_MAX_ATTEMPTS=2 run_bench kept
@@ -307,7 +307,31 @@ else
     pass "attempt 2's feedback kept alongside the run"
 fi
 
-echo "==> 13/14 every result records which harness produced it"
+echo "==> 13/16 a clean tree that missed a criterion is incomplete, not damaged"
+# `patch-damaged` was the classifier's else branch, so "left files across the repo" and "did the
+# work badly" carried one label. Five of eleven recorded damaged runs had damaged nothing.
+STUB_PATCH='sed -i "3s/.*/maroon/" bench/fixtures/harness/state.txt' \
+STUB_REPORT="$GOOD_REPORT" \
+    run_bench incomplete
+if [[ "$(metric outcome)" != "patch-incomplete" ]]; then
+    fail "a clean tree missing a criterion recorded '$(metric outcome)', expected patch-incomplete"
+elif [[ "$(metric scope_violations)" != 0 || "$(metric litter)" != 0 ]]; then
+    fail "the fixture damaged something, so this case does not test what it claims"
+else
+    pass "criteria unmet over a clean tree is patch-incomplete"
+fi
+
+echo "==> 14/16 a tree with litter outside the plan is damaged"
+STUB_PATCH='sed -i "3s/.*/green/" bench/fixtures/harness/state.txt; echo scratch > bench/fixtures/harness/stray.txt' \
+STUB_REPORT="$GOOD_REPORT" \
+    run_bench damaged
+if [[ "$(metric outcome)" != "patch-damaged" ]]; then
+    fail "a littered tree recorded '$(metric outcome)', expected patch-damaged"
+else
+    pass "a file the plan never named is patch-damaged"
+fi
+
+echo "==> 15/16 every result records which harness produced it"
 # The defect this exists for: benchmarks run from a clone, the clone drifted from the working
 # checkout, and 25 of 61 runs exercised an adapter bug that had already been fixed elsewhere.
 # Nothing in a result said which harness it came from.
@@ -323,7 +347,7 @@ else
     pass "commit $COMMIT recorded, with its clean/dirty state and tree $FIRST_TREE"
 fi
 
-echo "==> 14/14 an uncommitted edit changes the recorded harness, at the same commit"
+echo "==> 16/16 an uncommitted edit changes the recorded harness, at the same commit"
 # The claim harness_tree exists to support. Three arms of the 2026-08-12 night recorded
 # `628e3b2 dirty=1` and were compared against each other; that provenance is satisfied equally by
 # two different working trees, so "same harness" could not be checked. Edit a tracked file without

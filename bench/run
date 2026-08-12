@@ -1033,10 +1033,25 @@ for provider in "${PROVIDER_LIST[@]}"; do
         #
         #   accepted            every gate passed and the model reported it
         #   patch-ok-no-report  the tree is acceptable; the envelope is missing or malformed
-        #   patch-damaged       the tree changed but a gate rejected it
+        #   patch-incomplete    the tree is CLEAN and the work is unfinished — criteria unmet
+        #   patch-damaged       the model touched something it was not given: scope, litter, or a
+        #                       file regenerated rather than patched
         #   fabricated          claimed success over a tree it never touched
         #   no-op               changed nothing, and said so
         #   protocol-failed     never got far enough to produce a tree to judge
+        #
+        # `patch-damaged` used to be the else branch, so "left files across the repo" and "did the
+        # work badly" carried one label. They need opposite responses — one wants a narrower plan
+        # and a re-run, the other wants a human to clean up — and `damaged` is read in the
+        # scoreboard as a DISCIPLINE measure, so folding unfinished work into it overstates
+        # indiscipline for any arm that fails criteria rather than littering.
+        #
+        # It was not hypothetical. Of eleven recorded `patch-damaged` runs, five had
+        # scope=0 rewrite=0 litter=0 and had simply missed criteria — including all three of
+        # nativewhole's, which was being compared against nativemsg on that very column.
+        #
+        # This is the same defect shape as the scratch-file miscount above, one level up: a label
+        # that answers two questions with one bit.
         TREE_OK=0
         if [[ "$DID_NOTHING" -eq 0 && "$CRITERIA_MET" -eq "$CRITERIA_TOTAL" &&
               "$SCOPE_VIOLATIONS" -eq 0 && "$REWRITES" -eq 0 ]]; then
@@ -1055,8 +1070,10 @@ for provider in "${PROVIDER_LIST[@]}"; do
             OUTCOME=accepted
         elif [[ "$TREE_OK" -eq 1 ]]; then
             OUTCOME=patch-ok-no-report
-        else
+        elif (( SCOPE_VIOLATIONS > 0 || REWRITES > 0 || LITTER > 0 )); then
             OUTCOME=patch-damaged
+        else
+            OUTCOME=patch-incomplete
         fi
 
         # Produce the evidence bundle while the worktree still exists.
