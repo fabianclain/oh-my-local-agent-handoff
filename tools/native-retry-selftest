@@ -33,6 +33,10 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 HERE = pathlib.Path(__file__).resolve().parent
 AGENT = HERE / "native-agent"
 
+# A string that appears only in the file the model reads, so a request can be searched for it.
+SECRET = "SUPERSEDED_CANARY_9f3a"
+SECRET_FILE = f"<?php\n// {SECRET}\n"
+
 PEG_BODY = json.dumps({"error": {
     "code": 500, "type": "server_error",
     "message": "The model produced output that does not match the expected peg-native format"}})
@@ -40,14 +44,15 @@ OTHER_500 = json.dumps({"error": {"code": 500, "message": "out of memory"}})
 BAD_REQUEST = json.dumps({"error": {"code": 400, "message": "context window exceeded"}})
 
 
-def ok(content: str = "", tool: tuple[str, dict] | None = None) -> tuple[int, str]:
+def ok(content: str = "", tool: tuple[str, dict] | None = None,
+       prompt_tokens: int = 10) -> tuple[int, str]:
     message: dict = {"role": "assistant", "content": content}
     if tool:
         name, arguments = tool
         message["tool_calls"] = [{"id": "call-1", "type": "function",
                                   "function": {"name": name, "arguments": json.dumps(arguments)}}]
     return 200, json.dumps({"choices": [{"message": message}],
-                            "usage": {"prompt_tokens": 10, "completion_tokens": 5}})
+                            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": 5}})
 
 
 class Server(HTTPServer):
@@ -57,6 +62,9 @@ class Server(HTTPServer):
         super().__init__(("127.0.0.1", 0), Handler)
         self.script = list(script)
         self.completions = 0
+        # Every request body, so a case can assert on what was SENT rather than on a side effect.
+        # The pruning and tool-offering changes are both properties of the request.
+        self.requests: list[dict] = []
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -77,7 +85,11 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, json.dumps({"default_generation_settings": {"n_ctx": 32768}}))
 
     def do_POST(self) -> None:
-        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        try:
+            self.server.requests.append(json.loads(raw))
+        except ValueError:
+            self.server.requests.append({})
         self.server.completions += 1
         if self.server.script:
             status, body = self.server.script.pop(0)
@@ -90,7 +102,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def run_case(name: str, script: list[tuple[int, str]], expect_completions: int,
-             expect_report: bool, expect_finish: set[str]) -> bool:
+             expect_report: bool, expect_finish: set[str], extra_args: list[str] | None = None,
+             check_requests=None, files: dict[str, str] | None = None) -> bool:
     server = Server(script)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -100,6 +113,10 @@ def run_case(name: str, script: list[tuple[int, str]], expect_completions: int,
         root = pathlib.Path(tmp)
         (root / ".handoff").mkdir()
         (root / "notes.txt").write_text("a file for the loop to read\n")
+        for rel, body in (files or {}).items():
+            target = root / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(body)
         schema = root / "schema.json"
         schema.write_text(json.dumps({"type": "object",
                                       "properties": {"status": {"type": "string"},
@@ -108,8 +125,8 @@ def run_case(name: str, script: list[tuple[int, str]], expect_completions: int,
         proc = subprocess.run(
             [sys.executable, str(AGENT), "--repo", str(root), "--schema", str(schema),
              "--result", str(result), "--log", str(log), "--host", "127.0.0.1",
-             "--port", str(port), "--prompt", "do the thing", "--max-turns", "4",
-             "--timeout", "20"],
+             "--port", str(port), "--prompt", "do the thing", "--max-turns", "6",
+             "--timeout", "20", *(extra_args or [])],
             capture_output=True, text=True, timeout=120)
         server.shutdown()
 
@@ -132,6 +149,8 @@ def run_case(name: str, script: list[tuple[int, str]], expect_completions: int,
         problems.append(f"finishReason={finish!r}, expected one of {sorted(expect_finish)}")
     if proc.returncode != 0:
         problems.append(f"exit {proc.returncode}: {proc.stderr[-200:]}")
+    if check_requests:
+        problems.extend(check_requests(server.requests) or [])
 
     if problems:
         print(f"FAIL  {name}")
@@ -345,6 +364,79 @@ def main() -> int:
         # A 400 is the request's fault and would be wrong again.
         ("does not retry a 400", [(400, BAD_REQUEST)] + [(400, BAD_REQUEST)],
          2, False, {"error"}),
+
+
+        # --- pruning -----------------------------------------------------------------------
+        # Read a file, then rewrite it. The earlier read result is now describing something that
+        # is no longer on disk, and it is the single largest thing the conversation carries:
+        # measured over six wide rounds, tool results are 76% of the text and 59% of read results
+        # had been superseded by a later write to the same file.
+        ("a read the model has since overwritten is replaced", [
+            ok(tool=("read_files", {"files": [{"path": "src/a.php"}]})),
+            ok(tool=("write_file", {"path": "src/a.php", "content": "<?php // new\n"})),
+            ok(tool=("submit_report", {"status": "complete", "summary": "done"})),
+        ], 3, True, {"completed"},
+         ["--prune-superseded"],
+         lambda reqs: ([] if not any(SECRET in json.dumps(m) for m in reqs[-1]["messages"])
+                       else ["the superseded file contents were still sent on the last request"]),
+         {"src/a.php": SECRET_FILE}),
+
+        # The other half, and the one that makes the case above mean something: WITHOUT the flag
+        # the stale contents are still there, so the check is measuring the flag and not the
+        # fixture.
+        ("without the flag the stale contents remain", [
+            ok(tool=("read_files", {"files": [{"path": "src/a.php"}]})),
+            ok(tool=("write_file", {"path": "src/a.php", "content": "<?php // new\n"})),
+            ok(tool=("submit_report", {"status": "complete", "summary": "done"})),
+        ], 3, True, {"completed"},
+         [],
+         lambda reqs: ([] if any(SECRET in json.dumps(m) for m in reqs[-1]["messages"])
+                       else ["stale contents vanished with no --prune-superseded flag"]),
+         {"src/a.php": SECRET_FILE}),
+
+        # A multi-file read must survive until EVERY file it covers has been rewritten. Dropping
+        # it when one of four is superseded would throw away three that are still current.
+        ("a multi-file read survives until all of it is stale", [
+            ok(tool=("read_files", {"files": [{"path": "src/a.php"}, {"path": "src/b.php"}]})),
+            ok(tool=("write_file", {"path": "src/a.php", "content": "<?php // new\n"})),
+            ok(tool=("submit_report", {"status": "complete", "summary": "done"})),
+        ], 3, True, {"completed"},
+         ["--prune-superseded"],
+         lambda reqs: ([] if any(SECRET in json.dumps(m) for m in reqs[-1]["messages"])
+                       else ["a read covering a file that was NOT rewritten was pruned anyway"]),
+         {"src/a.php": "<?php // a\n", "src/b.php": SECRET_FILE}),
+
+        # --- the report tool at depth --------------------------------------------------------
+        # 606 tokens in every request for a tool used once in twelve wide rounds. Offered while
+        # the conversation is short, dropped once it is not.
+        ("submit_report is dropped once the conversation passes the depth limit", [
+            ok(tool=("read_files", {"files": [{"path": "notes.txt"}]}), prompt_tokens=50),
+            ok(tool=("read_files", {"files": [{"path": "notes.txt"}]}), prompt_tokens=9000),
+            ok('{"status": "complete", "summary": "done"}', prompt_tokens=9000),
+        # Four, not three: with the tool withdrawn the model can only answer as text, so the loop
+        # breaks on a turn with no tool calls and the no-tools report turn asks once more. That is
+        # the intended path, and it is why the depth limit is not simply "never offer it".
+        ], 4, True, {"completed"},
+         ["--report-tool-max-depth", "5000"],
+         lambda reqs: (
+             (["submit_report was missing while the conversation was still shallow"]
+              if not any(t["function"]["name"] == "submit_report" for t in reqs[0].get("tools", []))
+              else [])
+             + (["submit_report was still offered past the depth limit"]
+                if any(t["function"]["name"] == "submit_report"
+                       for t in reqs[2].get("tools", [])) else [])),
+         None),
+
+        # --- the syntax budget ---------------------------------------------------------------
+        # One or two unparseable writes ended 14/14 accepted; three or more ended 1 accepted
+        # against 2 failed. Stop and report rather than spend the rest of the budget the same way.
+        ("the loop stops after too many unparseable writes", [
+            ok(tool=("write_file", {"path": "src/x.php", "content": "<?php final class A {\n"})),
+            ok(tool=("write_file", {"path": "src/y.php", "content": "<?php final class B {\n"})),
+            ok('{"status": "complete", "summary": "stopped early"}'),
+        ], 3, True, {"syntax-budget"},
+         ["--max-syntax-warnings", "2"],
+         None, None),
 
         # The report turn answers with prose the first time and JSON when told what was wrong.
         # Observed on `wide` at 14-25k depth, where the model stops using the report tool and the

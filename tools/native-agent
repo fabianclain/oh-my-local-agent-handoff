@@ -85,6 +85,12 @@ PEG_MARKER = "peg-native"
 # second ask says what was wrong with the first and a third has nothing new to add.
 REPORT_ATTEMPTS = 2
 
+# What a pruned read result is replaced with. It says the content is gone and how to get it back,
+# because a model that does not know it may re-read will work from memory instead.
+SUPERSEDED = ("[the earlier contents of {paths} are omitted here: you rewrote {this} at turn "
+              "{turn}, so what was read is no longer what is on disk. Read the file again if you "
+              "need its current contents.]")
+
 
 def emit(log, kind: str, event: dict) -> None:
     log.write(json.dumps({"type": kind, "event": event} if kind == "agent_event" else
@@ -441,6 +447,52 @@ def dispatch(repo: pathlib.Path, name: str, parsed: dict, call_id: str, log) -> 
     return result
 
 
+class ReadHistory:
+    """Which past tool messages still hold file contents that are current.
+
+    The loop re-sends the whole conversation every turn, and measured over six `wide` rounds tool
+    results are 76% of the text it carries — of which 59% of read results had been superseded by a
+    later write to the same file. So the model pays for depth, in the one currency that causes its
+    dominant failure, to be re-shown the OLD contents of files it has since rewritten. The parse
+    fault runs at 0.00% below 8k and 4.0-4.5% between 8k and 32k; nothing else available moves
+    depth this much.
+
+    A read message is dropped only when EVERY path it covers has been superseded. `read_files`
+    takes a list, and replacing a message because one of its four files was rewritten would throw
+    away three that are still current.
+    """
+
+    def __init__(self) -> None:
+        self.pending: dict[int, set[str]] = {}   # message index -> paths not yet superseded
+        self.by_path: dict[str, set[int]] = {}   # path -> message indices mentioning it
+        self.covered: dict[int, list[str]] = {}  # message index -> every path it read, for the note
+
+    def record(self, index: int, paths: list[str]) -> None:
+        live = {p for p in paths if p}
+        if not live:
+            return
+        self.pending[index] = live
+        self.covered[index] = sorted(live)
+        for path in live:
+            self.by_path.setdefault(path, set()).add(index)
+
+    def supersede(self, path: str) -> list[int]:
+        """Note a successful write to `path`. Returns message indices that are now entirely stale."""
+        done = []
+        for index in sorted(self.by_path.pop(path, set())):
+            remaining = self.pending.get(index)
+            if remaining is None:
+                continue
+            remaining.discard(path)
+            if not remaining:
+                self.pending.pop(index, None)
+                done.append(index)
+        return done
+
+    def paths_of(self, index: int) -> list[str]:
+        return self.covered.get(index, [])
+
+
 def estimate_tokens(messages: list[dict], tools: list[dict]) -> int:
     """Rough, and deliberately so — 4 characters per token, counted generously."""
     return (sum(len(json.dumps(m)) for m in messages) + len(json.dumps(tools))) // 4
@@ -614,6 +666,12 @@ def main() -> int:
                         help="drop replace_in_file, forcing whole-file writes (round 15)")
     parser.add_argument("--no-report-tool", action="store_true",
                         help="no submit_report tool; the report comes from the no-tools final turn")
+    parser.add_argument("--prune-superseded", action="store_true",
+                        help="replace read results the model has since overwritten (see ReadHistory)")
+    parser.add_argument("--report-tool-max-depth", type=int, default=0,
+                        help="stop offering submit_report once the conversation exceeds N tokens")
+    parser.add_argument("--max-syntax-warnings", type=int, default=0,
+                        help="stop the loop after N writes that do not parse, and ask for the report")
     parser.add_argument("--writable", default="")
     parser.add_argument("--readonly", default="")
     parser.add_argument("--timeout", type=int, default=600)
@@ -636,6 +694,10 @@ def main() -> int:
     totals = {"in": 0, "out": 0}
     report = None
     finish = "completed"
+    history = ReadHistory()
+    pruned = 0
+    warnings = 0
+    depth = 0
 
     with args.log.open("a") as log:
         window = served_context(args.host, args.port)
@@ -648,8 +710,15 @@ def main() -> int:
             # lesson. Leaving room for the report turn matters more than leaving room for one more
             # tool call: a round that stops with a report is usable, and one that dies of overflow
             # is not.
+            # The report tool costs 606 tokens in every request and, on `wide`, was used once in
+            # twelve rounds — roughly 24k prompt tokens per round for a tool the model does not
+            # reach for at that depth. It IS used shallow: 4 of 8 semantic rounds at ~8k. So offer
+            # it while the conversation is short and drop it once it is not, rather than choosing
+            # one of the two globally. --report-tool-max-depth 0 keeps the old behaviour.
+            offer_report = not (args.report_tool_max_depth
+                                and depth > args.report_tool_max_depth)
             if window:
-                need = estimate_tokens(messages, tool_schemas(True, schema))
+                need = estimate_tokens(messages, tool_schemas(offer_report, schema))
                 if need > window - RESERVE_FOR_REPORT:
                     emit(log, "agent_event", {"type": "error", "error": {"message": (
                         f"context-budget: conversation is ~{need} tokens against a {window} window; "
@@ -658,7 +727,8 @@ def main() -> int:
                     break
             try:
                 body = call_model_retrying(args.host, args.port, args.model, messages,
-                                           tool_schemas(True, schema), args.temp, args.timeout,
+                                           tool_schemas(offer_report, schema), args.temp,
+                                           args.timeout,
                                            log, f"turn-{turn}")
             except urllib.error.HTTPError:
                 # call_model_retrying has already logged the body and exhausted any retry the
@@ -672,6 +742,7 @@ def main() -> int:
                 break
 
             usage = body.get("usage") or {}
+            depth = usage.get("prompt_tokens") or depth
             totals["in"] += usage.get("prompt_tokens") or 0
             totals["out"] += usage.get("completion_tokens") or 0
             emit(log, "agent_event", {"type": "usage",
@@ -725,6 +796,38 @@ def main() -> int:
                 result = dispatch(args.repo, name, parsed, call.get("id"), log)
                 messages.append({"role": "tool", "tool_call_id": call.get("id"),
                                  "name": name, "content": result})
+
+                if args.prune_superseded:
+                    where = analysable_args(name, parsed)
+                    touched = ([where["path"]] if isinstance(where.get("path"), str) else []) \
+                        + [p for p in (where.get("paths") or []) if isinstance(p, str)]
+                    if name in ("read_files", "read_file"):
+                        history.record(len(messages) - 1, touched)
+                    elif name in ("write_file", "replace_in_file") \
+                            and not result.startswith("error:"):
+                        for path in touched:
+                            for index in history.supersede(path):
+                                covered = history.paths_of(index)
+                                messages[index]["content"] = SUPERSEDED.format(
+                                    paths=", ".join(covered), this=path, turn=turn)
+                                pruned += 1
+                                emit(log, "agent_event", {
+                                    "type": "prune", "turn": turn, "message": index,
+                                    "paths": covered, "superseded_by": path})
+
+                if result.count("WARNING: the file does not parse"):
+                    warnings += 1
+                    # A round that writes unparseable files repeatedly is already lost: measured
+                    # over 36 rounds, one or two such writes ended 14/14 accepted and three or
+                    # more ended 1 accepted against 2 failed. Stopping here spends the remaining
+                    # budget on a report instead of on more of the same.
+                    if args.max_syntax_warnings and warnings >= args.max_syntax_warnings:
+                        emit(log, "agent_event", {"type": "error", "error": {"message": (
+                            f"syntax-budget: {warnings} unparseable writes; stopping the loop "
+                            "and asking for the report")}})
+                        finish = "syntax-budget"
+                        done = True
+                        break
             if done:
                 break
         else:
@@ -801,6 +904,9 @@ def main() -> int:
         if finish == "error" and report is not None:
             finish = "recovered-report"
 
+        if pruned or warnings:
+            emit(log, "agent_event", {"type": "loop_stats", "pruned": pruned,
+                                      "syntaxWarnings": warnings, "finalDepth": depth})
         emit(log, "run_result", {"finishReason": finish,
                                  "usage": {"inputTokens": totals["in"],
                                            "outputTokens": totals["out"]},
