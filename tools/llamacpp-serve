@@ -90,7 +90,31 @@ model_path() {
     esac
 }
 
-usage() { echo "usage: llamacpp-serve {start <model> [context]|stop|status|calibrate <model>|residency <log> [rss-kb]}" >&2; }
+usage() { echo "usage: llamacpp-serve {start <model> [context]|foreground <model> [context]|rotate-log|stop|status|calibrate <model>|residency <log> [rss-kb]}" >&2; }
+
+# When a systemd unit owns the server, go through it rather than around it.
+#
+# The unit was added after a reboot took the server with it, and it introduced a supervisor this
+# script knew nothing about. Three ways that bites, all silent:
+#
+#   * `stop` kills the process, systemd's Restart=on-failure brings it straight back, and the next
+#     `start` finds the port held by a server it did not launch.
+#   * `calibrate` walks candidate context sizes by restarting the server for each one. Against a
+#     supervisor that restarts it too, it measures whichever server won the race.
+#   * the unit's context was hardcoded, so it served 32768 while every document said 98304 — the
+#     condition that voided round 15's first run.
+#
+# So the context lives in one file, this script writes it, and the unit reads it.
+UNIT="${LLAMACPP_UNIT:-monolith-llama.service}"
+CONTEXT_FILE="$STATE_DIR/llamacpp.context"
+
+unit_present() {
+    [[ "${LLAMACPP_IGNORE_UNIT:-0}" == 1 ]] && return 1
+    command -v systemctl >/dev/null 2>&1 || return 1
+    systemctl --user cat "$UNIT" >/dev/null 2>&1
+}
+
+unit_active() { unit_present && systemctl --user is-active --quiet "$UNIT"; }
 
 # How much context actually fits, measured rather than chosen.
 #
@@ -111,6 +135,63 @@ usage() { echo "usage: llamacpp-serve {start <model> [context]|stop|status|calib
 # a browser tab, so a candidate is only accepted if it leaves MARGIN_MIB of the card free.
 CALIBRATE_MARGIN_MIB="${CALIBRATE_MARGIN_MIB:-900}"
 CALIBRATE_STEPS="${CALIBRATE_STEPS:-32768 49152 65536 98304 131072}"
+
+# Keep the previous session's log instead of overwriting it.
+#
+# Per-session isolation is right — a parse-failure rate pooled across every session since the last
+# reboot is not a rate for anything. Achieving it by truncation was not: this log IS the
+# measurement. tools/peg-audit counts against it, bench/summary brackets token usage by byte offset
+# into it, and doctor reads it for residency. A restart destroyed 695 KB of real-use data here,
+# including the only record of a header-transposition pattern that had just been read off it.
+#
+# Rotating gives both: the new session starts clean, and the last KEEP sessions survive a restart.
+LOG_KEEP="${LLAMACPP_LOG_KEEP:-10}"
+
+cmd_rotate_log() {
+    mkdir -p "$STATE_DIR"
+    if [[ -s "$LOG" ]]; then
+        mv "$LOG" "$LOG.$(date +%Y%m%dT%H%M%S)" 2>/dev/null || return 0
+    fi
+    # Oldest first, drop everything past the keep count. `ls -1` over a timestamped suffix sorts
+    # chronologically because the stamp is fixed-width and zero-padded.
+    local old
+    while read -r old; do
+        [[ -z "$old" ]] || rm -f "$old"
+    done < <(ls -1 "$LOG".* 2>/dev/null | head -n "-$LOG_KEEP")
+}
+
+# The entry point a supervisor uses: no daemonising, no health poll, just exec the server.
+#
+# It exists so the systemd unit does not have to restate the model path, the context, the KV type
+# and the ollama eviction. That restatement is what produced a unit serving 32768 while every
+# document said 98304 — and systemd's own `$VAR` expansion in Exec lines makes inlining the shell
+# for it a trap, since `$ctx` is substituted by systemd before bash ever sees it.
+cmd_foreground() {
+    local model="$1" context="${2:-}"
+    local gguf; gguf="$(model_path "$model")"
+    [[ -n "$gguf" ]] || { echo "unknown model: $model" >&2; return 64; }
+    [[ -f "$gguf" ]] || { echo "GGUF not found: $gguf" >&2; return 1; }
+    [[ -x "$LLAMA_SERVER" ]] || { echo "llama-server not found: $LLAMA_SERVER" >&2; return 1; }
+
+    mkdir -p "$STATE_DIR"
+    if [[ -z "$context" ]]; then
+        context="$(cat "$CONTEXT_FILE" 2>/dev/null)"
+    fi
+    # The documented default for a 16 GB card that also drives a desktop. Reached only when the
+    # calibrated value is missing or unreadable; a wrong-but-plausible number here is how the 32768
+    # regression stayed invisible, so an unusable value must not silently become a small one.
+    [[ "$context" =~ ^[0-9]+$ ]] || context=98304
+
+    local loaded
+    while read -r loaded; do
+        [[ -z "$loaded" ]] || ollama stop "$loaded" >/dev/null 2>&1
+    done < <(ollama ps 2>/dev/null | awk 'NR>1 {print $1}')
+
+    printf '%s\n' "$model" >"$SERVING"
+    exec "$LLAMA_SERVER" -m "$gguf" --jinja -c "$context" -ngl 999 \
+        --host "$BIND" --port "$PORT" -ctk q8_0 -ctv q8_0 \
+        ${LLAMACPP_EXTRA_ARGS:-}
+}
 
 cmd_calibrate() {
     local model="$1"
@@ -253,6 +334,15 @@ cmd_stop() {
     # `pgrep -x` matches the process name exactly, so it finds every llama-server whatever build it
     # came from, and — unlike `pgrep -f llama-server` — cannot match the shell command line that is
     # running this script. That mistake has killed a shell here before.
+    # Ask the supervisor, or it will simply start it again. Restart=on-failure treats a killed
+    # process as a failure, so the pgrep path below would fight it rather than stop it.
+    if unit_active; then
+        systemctl --user stop "$UNIT" 2>/dev/null
+        rm -f "$SERVING"
+        echo "llama-server stopped (via $UNIT)"
+        return 0
+    fi
+
     local killed=0 pid
     for pid in $(pgrep -x "llama-server" 2>/dev/null); do
         [[ "$pid" == "$$" ]] && continue
@@ -275,19 +365,35 @@ cmd_start() {
     [[ -x "$LLAMA_SERVER" ]] || { echo "llama-server not found: $LLAMA_SERVER" >&2; return 1; }
 
     mkdir -p "$STATE_DIR"
-    cmd_stop >/dev/null 2>&1
 
-    # Free the GPU first. With one card, an ollama model still resident would either evict this
-    # one or push it into a partial CPU offload, which is a throughput cost measured elsewhere in
-    # this project and not something to incur by accident.
-    local loaded
-    while read -r loaded; do
-        [[ -z "$loaded" ]] || ollama stop "$loaded" >/dev/null 2>&1
-    done < <(ollama ps 2>/dev/null | awk 'NR>1 {print $1}')
+    # The context this run is asking for, recorded before anything starts. The unit reads it, and
+    # `status` reports against it, so there is one statement of what is being served.
+    printf '%s\n' "$context" >"$CONTEXT_FILE"
 
-    nohup "$LLAMA_SERVER" -m "$gguf" --jinja -c "$context" -ngl 999 \
-        --host "$BIND" --port "$PORT" -ctk q8_0 -ctv q8_0 \
-        ${LLAMACPP_EXTRA_ARGS:-} >"$LOG" 2>&1 &
+    if unit_present; then
+        # systemd owns the process. Restarting through it evicts ollama via ExecStartPre and
+        # re-reads the context file, and -- unlike killing it -- does not trip Restart=on-failure.
+        printf '%s\n' "$model" >"$SERVING"
+        if ! systemctl --user restart "$UNIT" 2>&1; then
+            echo "systemctl --user restart $UNIT failed" >&2
+            return 1
+        fi
+    else
+        cmd_stop >/dev/null 2>&1
+        cmd_rotate_log
+
+        # Free the GPU first. With one card, an ollama model still resident would either evict this
+        # one or push it into a partial CPU offload, which is a throughput cost measured elsewhere
+        # in this project and not something to incur by accident.
+        local loaded
+        while read -r loaded; do
+            [[ -z "$loaded" ]] || ollama stop "$loaded" >/dev/null 2>&1
+        done < <(ollama ps 2>/dev/null | awk 'NR>1 {print $1}')
+
+        nohup "$LLAMA_SERVER" -m "$gguf" --jinja -c "$context" -ngl 999 \
+            --host "$BIND" --port "$PORT" -ctk q8_0 -ctv q8_0 \
+            ${LLAMACPP_EXTRA_ARGS:-} >>"$LOG" 2>&1 &
+    fi
 
     local i
     for i in $(seq 1 100); do
@@ -330,6 +436,8 @@ status) cmd_status ;;
 # Exposed as a subcommand so the check can be run against a log after the fact — and so it can be
 # tested without a GPU, which is the only way it would ever have been tested at all.
 calibrate) shift; [[ $# -ge 1 ]] || { usage; exit 64; }; cmd_calibrate "$@" ;;
+foreground) shift; [[ $# -ge 1 ]] || { usage; exit 64; }; cmd_foreground "$@" ;;
+rotate-log) shift; cmd_rotate_log "$@" ;;
 residency) shift; [[ $# -ge 1 ]] || { usage; exit 64; }; cmd_residency "$@" ;;
 *)      usage; exit 64 ;;
 esac
