@@ -1,28 +1,71 @@
 # agent-handoff
 
-One coding agent writes the plan and verifies the result. Another writes the code.
+**Let a big hosted model do the thinking, and your own GPU do the typing.**
 
-It is a few hundred lines of bash. The value is not the code — it is the protocol, and the
-failure modes it exists to catch.
+A capable hosted model — Claude, Codex, whichever you already pay for — writes a precise,
+machine-checkable plan and reviews the result. A model running on your own machine writes the code.
+A few hundred lines of bash sit between them and decide, from the files on disk, whether the work
+is actually acceptable.
 
-> **Status: early, but measured.** Extracted from ~30 real rounds on a production Laravel
-> codebase, then put under a benchmark harness of its own: ~90 recorded runs across nine rounds,
-> with every result carrying the harness commit that produced it. Six provider adapters work.
-> Results and the reasoning behind them are in [bench/COMPARISON.md](bench/COMPARISON.md).
+## Why you would want that
 
-## Using a local model for the implementation
+**It moves the expensive part off your bill.** Implementation is where the tokens go: reading
+files, writing them, re-reading them, fixing what broke. Planning and reviewing are short by
+comparison. Handing the long middle to a local model keeps your hosted usage for the two jobs it is
+genuinely better at.
 
-**[docs/START-HERE.md](docs/START-HERE.md)** — clone, one setup command, your first plan, and how
-to read the verdict. Pre-configured for the stack that measured best.
+**Your hardware is already sitting there.** A 16 GB card runs a 20B model at conversational speed.
+It is not as strong as a frontier model — but it does not have to be, because it is never asked to
+decide anything. It is asked to implement a specification that has already been decided, and then
+its work is checked.
 
-**[docs/DRIVING.md](docs/DRIVING.md)** — the three seats, how to size a task, and how to read a
-failure. Claude plans with `/local-implement`, Codex runs the loop with `/local-drive`, the local
-model writes the code.
+**The checking is the point.** The local model's report is never trusted. Every verdict comes from
+the tree: did the acceptance commands pass, did it touch only the files the plan named, did it
+quietly rewrite a file it was told to patch. A model that says "all tests pass" and changed nothing
+is scored as a failure, automatically.
+
+## What it costs you, honestly
+
+- **Specification takes longer than the change** on small tasks. A five-minute edit is not worth a
+  plan. The break-even is somewhere around "I would have to explain this carefully anyway".
+- **A local model is slower** than a hosted one, and slower than you for trivial work. The win is
+  on mechanical changes across many files, where the tedium is real and the thinking is not.
+- **You still read the diff.** The gates catch what a command can catch. They do not catch a blank
+  line left behind by a deletion, or an odd re-indent, and if your project has no formatter those
+  land in the commit.
+
+The compensation is that a plan precise enough for a local model is precise enough to catch
+specification bugs before anyone writes code — which is the failure mode that actually ships.
+
+## Quick start
 
 ```bash
-tools/setup-local-implementer            # probes the stack with a real tool call, then stops if it is wrong
-HANDOFF_PROVIDER=local handoff do <slug> # implements, verifies, and fails if the gates reject
+git clone https://github.com/fabianclain/oh-my-local-agent-handoff
+cd oh-my-local-agent-handoff
+tools/install-local              # links `handoff` onto PATH, picks the local implementer
+tools/llamacpp-serve start gpt-oss-20b 98304   # your model server
+
+cd ~/any-project
+handoff init                     # .handoff/plans + a config template
+handoff do <slug>                # implement the plan, verify it, print the diff
 ```
+
+`handoff do` exits non-zero if the gates reject the round. Nothing is committed — the reviewer owns
+the commit, always.
+
+**[docs/START-HERE.md](docs/START-HERE.md)** — the same thing at walking pace, including how to
+read a verdict.
+
+**[docs/DRIVING.md](docs/DRIVING.md)** — the three seats. Claude plans with `/local-implement`,
+Codex runs the loop with `/local-drive`, the local model writes the code. Whoever writes the plan
+must not be whoever decides a rejected round was fine.
+
+> **Status: early, but measured.** Extracted from real feature work on a production Laravel
+> codebase, then put under a benchmark harness of its own — well over a hundred recorded rounds,
+> each carrying the harness commit and the served context that produced it, so a result can be
+> traced to the code and the stack that made it.
+> The reasoning, including the conclusions that were wrong and how they were caught, is in
+> [docs/local-models.md](docs/local-models.md) and [bench/COMPARISON.md](bench/COMPARISON.md).
 
 ## Why
 
@@ -106,14 +149,22 @@ person clicking a link.
 ## Setup
 
 ```bash
-git clone https://github.com/fabianclain/agent-handoff
-export PATH="$PWD/agent-handoff/bin:$PATH"
+git clone https://github.com/fabianclain/oh-my-local-agent-handoff
+cd oh-my-local-agent-handoff
+tools/install-local          # symlinks `handoff` into ~/.local/bin, writes your defaults
+tools/install-local --check  # confirms it the way a non-interactive shell sees it
 
 cd your-project
-mkdir -p .handoff/plans
-cp path/to/agent-handoff/templates/config.sh .handoff/config.sh   # edit it
-echo ".handoff/runs/" >> .gitignore
+handoff init                 # .handoff/plans, a config template, and the right .gitignore lines
 ```
+
+`tools/install-local` writes `~/.config/agent-handoff/config.sh`, which sets the implementer for
+every project at once. A project with its own opinions can override it in `.handoff/config.sh`, and
+an environment variable overrides both.
+
+Adding the repository's `bin/` to `PATH` in `~/.bashrc` looks equivalent and is not: the stock
+`~/.bashrc` returns early for non-interactive shells, so cron, ssh commands and anything an agent
+spawns never see it.
 
 `.handoff/config.sh` carries your project's conventions into every prompt. Without it the
 implementer cannot know how your project builds, tests, or formats — the largest avoidable source
@@ -186,12 +237,20 @@ is provider-specific.
 A local model can do real work here, within limits that are measured rather than assumed. The full
 record is in [docs/local-models.md](docs/local-models.md); the short version:
 
-**Recommended stack — gpt-oss 20B served by llama.cpp, driven by Cline.**
+**Recommended stack — gpt-oss 20B served by llama.cpp, driven by the harness's own loop.**
 
 ```bash
-tools/llamacpp-serve start gpt-oss-20b 65536
-HANDOFF_PROVIDER=lcgptossl handoff do <slug>
+tools/llamacpp-serve start gpt-oss-20b 98304
+handoff do <slug>            # `native` is the default after tools/install-local
 ```
+
+llama.cpp rather than ollama: ollama returns HTTP 500 for tool calls its own model generated, and
+every result taken through it had to be thrown away.
+
+The harness's own loop rather than a third-party CLI, measured head to head on the same plan under
+one harness commit — 18 rounds against 15. Both produced a usable tree in **every** round; they
+differ only in whether the completion report survived the serving stack, which the owned loop can
+retry and a rented one cannot.
 
 **How reliable, on 30 clean runs of a six-file task** (95% confidence intervals, because the
 spread here is wide enough that point estimates mislead):
