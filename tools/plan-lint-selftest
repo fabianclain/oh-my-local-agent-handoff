@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""plan-lint-selftest — every check, from both sides.
+
+    tools/plan-lint-selftest
+
+A linter is all edge: each check has to fire on the plan that has the defect and stay silent on the
+plan that does not, and only the second half is easy to get wrong invisibly. This repository has
+shipped four guards that could not fail — a scanner blind to strings whose fixture happened to be
+balanced, a whitespace check whose forbidden note was printed outside the text it searched — and
+each looked like a passing test until someone reintroduced the bug and nothing went red.
+
+So every case here is a PAIR: the plan that must trip the check, and the near-miss that must not.
+The near-miss differs by the smallest edit that fixes the real defect.
+"""
+
+from __future__ import annotations
+
+import pathlib
+import subprocess
+import sys
+import tempfile
+
+HERE = pathlib.Path(__file__).resolve().parent
+LINT = HERE / "plan-lint"
+
+HEAD = """# t
+
+## Files to touch
+
+| Path | Action |
+| --- | --- |
+| `src/a.php` | modify |
+
+## Acceptance criteria
+
+- [ ] it works
+
+## Verification
+
+```bash
+{commands}
+```
+
+## Out of scope
+
+Anything else.
+"""
+
+
+def plan(commands: str, extra: str = "") -> str:
+    return HEAD.format(commands=commands) + extra
+
+
+def run(text: str, repo: pathlib.Path) -> str:
+    path = repo / "plan.md"
+    path.write_text(text)
+    done = subprocess.run([sys.executable, str(LINT), str(path), "--repo", str(repo)],
+                          capture_output=True, text=True)
+    return done.stdout + done.stderr
+
+
+# (name, plan text, must appear, must NOT appear)
+CASES: list[tuple[str, str, list[str], list[str]]] = [
+
+    # 1. porcelain collapses an untracked DIRECTORY to one line, so a file-count criterion over
+    #    new-directory work stops guarding without ever failing.
+    ("porcelain, counting, and the plan creates a new directory",
+     plan("test \"$(git status --porcelain | wc -l)\" -eq 2").replace(
+         "| `src/a.php` | modify |", "| `newdir/a.php` | create |"),
+     ["WARN  porcelain-collapse", "does not exist yet"], []),
+
+    ("the same criterion with --untracked-files=all",
+     plan("test \"$(git status --porcelain --untracked-files=all | wc -l)\" -eq 2").replace(
+         "| `src/a.php` | modify |", "| `newdir/a.php` | create |"),
+     [], ["porcelain-collapse"]),
+
+    ("porcelain that is not counting anything",
+     plan("git status --porcelain"),
+     [], ["porcelain-collapse"]),
+
+    # 2. states named and never gated. The failure: four viewport and theme states named, none
+    #    gated, and a 6/6 over a page with two contrast failures.
+    ("a state with no criterion mentioning it",
+     plan("grep -q header src/a.php",
+          "\n## States to handle\n\n- **Dark theme** — the palette inverts\n"),
+     ["WARN  ungated-states", "Dark theme"], []),
+
+    ("the same state, with a criterion that mentions it",
+     plan("grep -q 'dark theme' src/a.php",
+          "\n## States to handle\n\n- **Dark theme** — the palette inverts\n"),
+     [], ["ungated-states"]),
+
+    # The admission the reviewer asked for: better to say a state is unverifiable than to let a
+    # 6/6 read as coverage it never had.
+    ("a state declared unverifiable is accepted and recorded",
+     plan("grep -q header src/a.php",
+          "\n## States to handle\n\n- [unverifiable] dark theme contrast\n"),
+     ["declared-unverifiable"], ["WARN  ungated-states"]),
+
+    # Gated by a backticked literal rather than by the state's name. This is the case that made
+    # the first version cry wolf on the repository's own benchmark plans.
+    ("a state gated by a literal in the command, not by its name",
+     plan("test \"$(./x)\" = fast",
+          "\n## States to handle\n\n- no arguments: print `fast` and exit 0\n"),
+     [], ["ungated-states"]),
+
+    ("the template's own prompts are named as unfilled, once",
+     plan("grep -q x src/a.php",
+          "\n## States to handle\n\n- **Zero** — no rows\n- **One** — no pair\n"
+          "- **Maximum** — the limit\n- **Absent optional fields** — null title\n"),
+     ["still the template"], ["ungated-states"]),
+
+    # 3. coloured output. NO_COLOR and TERM=dumb are conventions Collision ignores; this cost a
+    #    round, and the reader had followed the harness's own advice.
+    ("a grep against artisan output with no decolouring flag",
+     plan("php artisan test | grep -c 'OK'"),
+     ["WARN  coloured-output"], []),
+
+    ("the same command with --no-ansi",
+     plan("php artisan test --no-ansi | grep -c 'OK'"),
+     [], ["coloured-output"]),
+
+    ("pest with --colors=never",
+     plan("vendor/bin/pest --colors=never | grep -q 'Tests:'"),
+     [], ["coloured-output"]),
+
+    ("a coloured tool whose output is not being matched",
+     plan("php artisan test"),
+     [], ["coloured-output"]),
+
+    # 4. whitespace, counted on one side only. The damage was a REMOVED blank line.
+    ("a criterion counting added blank lines only",
+     plan("test \"$(git diff | grep -c '^+[[:space:]]*$')\" -eq 0"),
+     ["WARN  one-sided-whitespace"], []),
+
+    ("the same criterion counting both sides",
+     plan("test \"$(git diff | grep -cE '^[+-][[:space:]]*$')\" -eq 0"),
+     [], ["one-sided-whitespace"]),
+
+    # 5. the zero-assertion. A plan described renaming two divs, asserted zero, the file had a
+    #    third, and the model obeyed the criterion into malformed HTML.
+    ("zero asserted over a bare word the file currently matches",
+     plan("test \"$(grep -c 'div' page.html)\" -eq 0"),
+     # Once, and about page.html. Flattening the substitution left `-eq` looking like a grep flag
+     # and `0` like a second filename, so the same criterion was reported twice — the second time
+     # as an assertion against a file called "0".
+     ["WARN  uncounted-zero-assertion", "matches 3 line(s) now"], ["loose-zero-assertion"]),
+
+    # The ordinary removal criterion — "take this out, and it should be gone" — is most of them.
+    # A linter that shouts at the normal case is one nobody reads, so this states the count and
+    # stays quiet.
+    ("the same assertion once the pattern is anchored to what is meant",
+     plan("test \"$(grep -c '<div class=\"old\"' page.html)\" -eq 0"),
+     ["note  zero-assertion-count", "which has 1 now"], ["WARN  uncounted-zero-assertion"]),
+
+    # `grep -q` asserts PRESENCE. Reading it as a zero-assertion made the first version report a
+    # confident wrong finding on one of this repository's own plans.
+    ("a presence assertion is not a zero assertion",
+     plan("grep -q 'div' page.html"),
+     [], ["zero-assertion"]),
+
+    ("a pattern the shell builds at runtime is not guessed at",
+     plan("test \"$(grep -c \"$PATTERN\" page.html)\" -eq 0"),
+     [], ["uncounted-zero-assertion"]),
+
+    # 6. a worked example that cannot discriminate.
+    ("expected values that are all identical",
+     plan("php tests/t.php", "\n## Worked example\n\nExpected: [100, 100, 100]\n"),
+     ["WARN  symmetric-example"], []),
+
+    ("expected values that differ",
+     plan("php tests/t.php", "\n## Worked example\n\nExpected: [72, 143, 214]\n"),
+     [], ["symmetric-example"]),
+
+    ("proration with no worked example at all",
+     plan("php tests/t.php", "\n## Context\n\nThe discount is prorated across the lines.\n"),
+     ["no-worked-example"], []),
+
+    # The word this project uses for one implementation attempt. Including it in the arithmetic
+    # pattern fired the note on every plan in the repository, including two about the harness.
+    ("the word 'round' meaning an attempt is not arithmetic",
+     plan("php tests/t.php", "\n## Context\n\nThe previous round left this unfinished.\n"),
+     [], ["no-worked-example"]),
+
+    # 7. the shape notes, folded in so one command covers the ground.
+    ("no Out of scope section",
+     plan("php tests/t.php").replace("## Out of scope\n\nAnything else.\n", ""),
+     ["out-of-scope"], []),
+
+    ("nothing asserts how many files changed",
+     plan("php tests/t.php"),
+     ["unenforced-scope"], []),
+
+    ("a plan that asserts a file count",
+     plan("test \"$(git status --porcelain --untracked-files=all | wc -l)\" -eq 1"),
+     [], ["unenforced-scope"]),
+]
+
+
+def main() -> int:
+    if not LINT.exists():
+        print("plan-lint not found", file=sys.stderr)
+        return 2
+    failures = 0
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = pathlib.Path(tmp)
+        # Three `div` occurrences: an opening tag, a closing tag, and one inside a word. Exactly
+        # the shape that made `grep -c 'div'` mean more than its author did.
+        (repo / "page.html").write_text(
+            '<div class="old">\n  <p>the division of labour</p>\n</div>\n')
+        for name, text, must, must_not in CASES:
+            out = run(text, repo)
+            problems = [f"missing {m!r}" for m in must if m not in out]
+            problems += [f"must not mention {m!r}" for m in must_not if m in out]
+            if problems:
+                print(f"FAIL  {name}")
+                for problem in problems:
+                    print(f"        {problem}")
+                failures += 1
+            else:
+                print(f"pass  {name}")
+    print()
+    if failures:
+        print(f"{failures} check(s) failed")
+        return 1
+    print(f"{len(CASES)} check(s) passed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

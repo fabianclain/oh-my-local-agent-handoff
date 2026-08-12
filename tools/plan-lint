@@ -1,0 +1,531 @@
+#!/usr/bin/env python3
+"""plan-lint — what will bite about this plan, before a round is spent finding out.
+
+    tools/plan-lint .handoff/plans/my-task.md
+    tools/plan-lint .handoff/plans/*.md
+    handoff prepare <slug>              the same thing, plus check-plan and a dry run
+
+`check-plan` answers "will the harness accept this?" — a question about shape. This answers a
+harder one: "will its verdict mean anything?" Every check below comes from a round it actually
+cost, and the standing fact behind all of them is that across roughly a dozen reported rounds on
+real work, ONE failure was a genuine model defect. The rest were the harness, the infrastructure,
+or the criteria. The criteria are where the returns are, and they are what this reads.
+
+It ADVISES and never refuses. `check-plan` already decides validity; a second tool that could block
+would get bypassed, and then neither would run.
+
+WHAT IT CANNOT DO
+
+It does not understand the plan. It matches shapes that have been wrong before. A clean report
+means none of the known traps are present, not that the criteria measure the right thing — no tool
+can tell you that. The findings name the round they come from so you can judge whether yours is the
+same case.
+"""
+
+from __future__ import annotations
+
+import argparse
+import pathlib
+import re
+import shlex
+import subprocess
+import sys
+
+# ---------------------------------------------------------------------------------------------
+# Parsing. Deliberately the same expressions the harness uses, because a linter that read plans its
+# own way would advise on a document the harness does not see. bench/run and tools/check-plan are
+# the authority; these mirror them.
+# ---------------------------------------------------------------------------------------------
+
+CRITERION = re.compile(r"^- \[ \]\s*(.*)$")
+HEADING = re.compile(r"^## +(.*?)\s*$")
+
+
+def sections(text: str) -> dict[str, list[str]]:
+    """Heading -> its lines. Lower-cased keys; the last of a repeated heading wins."""
+    out: dict[str, list[str]] = {"": []}
+    current = ""
+    for line in text.splitlines():
+        match = HEADING.match(line)
+        if match:
+            current = match.group(1).lower()
+            out[current] = []
+        else:
+            out[current].append(line)
+    return out
+
+
+def verification_commands(text: str) -> list[str]:
+    """The first fenced block under '## Verification'. Mirrors bench/run."""
+    lines = text.splitlines()
+    commands: list[str] = []
+    in_section = in_block = False
+    for line in lines:
+        if re.match(r"^## Verification(\s+commands)?\s*$", line):
+            in_section = True
+            continue
+        if in_section and line.startswith("```"):
+            if in_block:
+                break
+            in_block = True
+            continue
+        if in_block and line.strip():
+            commands.append(line)
+    return commands
+
+
+def criteria(text: str) -> list[str]:
+    return [m.group(1) for m in (CRITERION.match(line) for line in text.splitlines()) if m]
+
+
+def touched_paths(text: str) -> list[tuple[str, str]]:
+    """(path, action) from the Files-to-touch table."""
+    out = []
+    for line in sections(text).get("files to touch", []):
+        if not line.startswith("|"):
+            continue
+        cells = [c.strip().strip("`") for c in line.split("|")[1:-1]]
+        if len(cells) < 1 or not cells[0] or cells[0] == "Path" or set(cells[0]) <= set("- "):
+            continue
+        out.append((cells[0], cells[1].lower() if len(cells) > 1 else ""))
+    return out
+
+
+# ---------------------------------------------------------------------------------------------
+# Findings
+# ---------------------------------------------------------------------------------------------
+
+class Report:
+    def __init__(self) -> None:
+        self.findings: list[tuple[str, str, list[str]]] = []
+
+    def warn(self, check: str, message: str, *detail: str) -> None:
+        """Has cost a round. Fix it before running."""
+        self.findings.append((f"WARN  {check}", message, list(detail)))
+
+    def note(self, check: str, message: str, *detail: str) -> None:
+        """Worth a moment's thought; not always wrong."""
+        self.findings.append((f"note  {check}", message, list(detail)))
+
+
+# --- 1. the untracked-directory collapse -----------------------------------------------------
+
+PORCELAIN = re.compile(r"git\s+status[^|;&]*?(--porcelain|--short|\s-s\b)")
+UALL = re.compile(r"(--untracked-files=all|\s-uall\b|\s-u\s+all\b)")
+
+
+def check_porcelain(report: Report, commands: list[str], paths, repo: pathlib.Path) -> None:
+    creating_new_dir = []
+    for path, action in paths:
+        parent = pathlib.PurePosixPath(path).parent
+        if str(parent) not in (".", "") and not (repo / parent).is_dir():
+            creating_new_dir.append(str(parent) + "/")
+
+    for index, command in enumerate(commands, 1):
+        if not PORCELAIN.search(command) or UALL.search(command):
+            continue
+        counting = bool(re.search(r"wc\s+-l|-eq|-ne|-le|-ge|-lt|-gt|grep\s+-c", command))
+        if not counting:
+            continue
+        message = (f"criterion {index} counts files with `git status --porcelain`, which collapses "
+                   f"an untracked DIRECTORY to a single line")
+        detail = [command.strip(),
+                  "A plan asserting `-eq 2` passed with five files inside one new directory: the",
+                  "scope guard was still there and had silently stopped guarding.",
+                  "Use `git status --porcelain --untracked-files=all`."]
+        if creating_new_dir:
+            detail.insert(1, "This plan creates files in " + ", ".join(sorted(set(creating_new_dir)))
+                          + " — a directory that does not exist yet, so this WILL collapse.")
+            report.warn("porcelain-collapse", message, *detail)
+        else:
+            report.note("porcelain-collapse", message, *detail)
+
+
+# --- 2. states named but never gated ---------------------------------------------------------
+
+# The template ships six prompts under this heading. A plan that still has them has not filled the
+# section in, and saying so once is more use than six findings about states nobody wrote.
+TEMPLATE_STATES = {"zero", "one", "maximum", "absent optional fields", "failed upstream",
+                   "unauthenticated context"}
+UNVERIFIABLE = re.compile(r"^\s*[-*]\s*[\[(]unverifiable[\])]\s*", re.IGNORECASE)
+
+
+def state_names(text: str) -> tuple[list[tuple[str, str]], list[str]]:
+    """([(display name, whole bullet)], states declared unverifiable)."""
+    wanted: list[tuple[str, str]] = []
+    declared: list[str] = []
+    for line in sections(text).get("states to handle", []):
+        if not re.match(r"^\s*[-*]\s+\S", line):
+            continue
+        if UNVERIFIABLE.match(line):
+            declared.append(UNVERIFIABLE.sub("", line).strip().strip("*").strip())
+            continue
+        body = re.sub(r"^\s*[-*]\s+", "", line).strip()
+        bold = re.match(r"\*\*(.+?)\*\*", body)
+        name = bold.group(1) if bold else re.split(r"[—:.]", body)[0]
+        name = name.strip().strip("*").strip()
+        if name:
+            wanted.append((name, body))
+    return wanted, declared
+
+
+# Words that carry no signal about WHICH state a bullet describes. Trimming this list makes the
+# check noisier; extending it makes it blinder. The two entries that matter most are "round" and
+# "state", which are this project's own vocabulary and appear in nearly every plan.
+STOPWORDS = {"when", "with", "that", "this", "there", "state", "than", "from", "then", "them",
+             "they", "their", "have", "must", "should", "does", "will", "would", "each", "into",
+             "onto", "over", "under", "above", "below", "case", "cases", "value", "values",
+             "round", "rounds", "plan", "file", "files", "line", "lines", "above", "instead",
+             "rather", "which", "what", "where", "while", "still", "also", "only", "same",
+             "other", "another", "anything", "everything", "nothing", "something"}
+
+
+def distinctive(bullet: str) -> list[str]:
+    """What a criterion would have to mention to be about this state.
+
+    Backticked literals first, because a state that names `--porcelain` or `exit 64` is gated by
+    any command containing it. Matching only the state's NAME was too blind: a bullet reading
+    "no arguments: print `fast` followed by a newline" is thoroughly gated by a criterion asserting
+    the output is `fast`, and the first version reported it ungated because the word "arguments"
+    happened not to appear in any command. A WARN-level check that cries wolf on the repository's
+    own plans is worse than no check.
+    """
+    literals = [lit.strip().lower() for lit in re.findall(r"`([^`]+)`", bullet) if lit.strip()]
+    words = [w for w in re.findall(r"[a-z0-9]{4,}", bullet.lower()) if w not in STOPWORDS]
+    return literals + words
+
+
+def check_states(report: Report, text: str) -> None:
+    wanted, declared = state_names(text)
+    if not wanted and not declared:
+        if "states to handle" not in sections(text):
+            report.note("states", "no '## States to handle' section",
+                        "Every defect this pipeline has shipped came from a state the plan did not",
+                        "mention. Unmentioned means unbuilt, untested, and green.")
+        return
+
+    if len({name.lower() for name, _ in wanted} & TEMPLATE_STATES) >= 4:
+        report.warn("states", "'## States to handle' is still the template's six prompts",
+                    "Replace them with this task's actual states, or the section is decoration.")
+        return
+
+    haystack = " ".join(criteria(text) + verification_commands(text)).lower()
+    ungated = []
+    for name, bullet in wanted:
+        tokens = distinctive(bullet)
+        # No distinctive token at all means the bullet is too vague to match either way, and
+        # saying "ungated" would be a claim the text does not support.
+        if tokens and not any(token in haystack for token in tokens):
+            ungated.append(name)
+
+    if ungated:
+        report.warn("ungated-states",
+                    f"{len(ungated)} state(s) are named and none of them has a criterion",
+                    *[f"  - {name}" for name in ungated],
+                    "A 6/6 over ungated states reads as full coverage. Four viewport and theme",
+                    "states were named and none gated; the page shipped with two contrast",
+                    "failures and an unscrollable overflow, and scored 6/6.",
+                    "Either add a criterion, or write `- [unverifiable] <state>` so the round-up",
+                    "says so out loud.")
+    if declared:
+        report.note("declared-unverifiable",
+                    f"{len(declared)} state(s) declared unverifiable — the round-up will say so",
+                    *[f"  - {name}" for name in declared])
+
+
+# --- 3. coloured output ----------------------------------------------------------------------
+
+COLOURING = re.compile(r"\b(artisan|pest|phpunit|npm|npx|cargo|jest|vitest|composer|pytest)\b")
+DECOLOURED = re.compile(r"(--colors?=(never|no|none)|--no-colors?|--no-ansi|--color=never|"
+                        r"sed[^|]*\\x1b|sed[^|]*\\033|sed[^|]*\[0-9\]\*m|perl[^|]*\\e\[)")
+MATCHING = re.compile(r"\|\s*(grep|awk|sed|rg|head|tail|cut|wc)\b")
+
+
+def check_colour(report: Report, commands: list[str]) -> None:
+    for index, command in enumerate(commands, 1):
+        if not (COLOURING.search(command) and MATCHING.search(command)):
+            continue
+        if DECOLOURED.search(command):
+            continue
+        report.warn("coloured-output",
+                    f"criterion {index} matches against output that is probably coloured",
+                    command.strip(),
+                    "NO_COLOR=1 and TERM=dumb are conventions, and Laravel's Collision ignores",
+                    "both — reported from real use, and it cost a round. `Tests:[^0-9]*77 passed`",
+                    "cannot span the escape that sits between them.",
+                    "Pass the tool's own flag (`--colors=never` for pest/phpunit, `--no-ansi` for",
+                    "artisan), or strip escapes before matching.",
+                    "`handoff check <slug> --dry-run` shows you what the last stage actually saw.")
+
+
+# --- 4. whitespace assertions ----------------------------------------------------------------
+
+# Anchored on the TAIL of the pattern, not the head. A one-sided whitespace assertion is written
+# `'^+[[:space:]]*$'` — the character between `^` and `[[:space:]]` is the whole point of the
+# criterion, and requiring them to be adjacent made this check silent on the only shape it exists
+# to catch.
+BLANKLINE = re.compile(r"\[\[:space:\]\]\*\$|\[\[:blank:\]\]\*\$|\\s\*\$|'\^\+?\$'|\"\^\+?\$\"")
+
+
+def check_whitespace(report: Report, commands: list[str]) -> None:
+    for index, command in enumerate(commands, 1):
+        if not BLANKLINE.search(command):
+            continue
+        if "git diff" in command and re.search(r"'\^\+|\"\^\+|\^\\\+", command) \
+                and not re.search(r"'\^-|\"\^-|\^\\-", command):
+            report.warn("one-sided-whitespace",
+                        f"criterion {index} counts ADDED blank lines and not removed ones",
+                        command.strip(),
+                        "The damage reported from real use was a REMOVED line: a deletion that",
+                        "left the blank line around it, and an edit that came back re-indented.",
+                        "Counting one side sees neither.")
+        elif re.search(r"-(le|lt|ge|gt)\s+\d", command):
+            report.note("bounded-whitespace",
+                        f"criterion {index} bounds blank lines rather than fixing the count",
+                        command.strip(),
+                        "An upper bound passes a file that gained one and lost one. If the file's",
+                        "current count is known, assert it exactly — that is what made this check",
+                        "catch the scar rather than merely tolerate it.")
+
+
+# --- 5. zero-assertions over a pattern the author did not count ------------------------------
+
+# A ZERO-assertion, specifically. `grep -q` on its own asserts PRESENCE and is the opposite claim;
+# treating it as a zero-assertion made this check fire on `grep -qxF -- "$l" || exit 1`, which is a
+# line-survival check in one of the repository's own plans. A linter whose first live run produced
+# a confident wrong finding teaches the reader to skim it.
+ZERO_ASSERTION = re.compile(r"-eq\s+0\b|(?<=\s)==?\s+0\b|(^|[|;&(]\s*)!\s*grep")
+# A pattern the shell builds at runtime cannot be counted here, and guessing at one is how a
+# checker starts inventing findings.
+UNEVALUABLE = re.compile(r"[$`]")
+
+
+SUBSTITUTION = re.compile(r'"?\$\(([^()]*)\)"?')
+
+
+def flatten(command: str) -> str:
+    """Lift command substitutions out so the tokeniser can see inside them.
+
+    Nearly every count criterion is written `test "$(grep -c X f)" -eq 0`, and shlex hands that
+    back as ONE token because the substitution sits inside double quotes. The first version of
+    this check therefore found no grep in the exact shape it was written to read, and passed a
+    plan carrying the defect it exists to catch. Innermost-first, repeatedly, so nesting unwraps.
+    """
+    previous = None
+    while previous != command:
+        previous = command
+        command = SUBSTITUTION.sub(r" \1 ", command)
+    return command
+
+
+def grep_calls(command: str) -> list[tuple[str, str, bool]]:
+    """(pattern, path, extended) for each grep in a command, best-effort."""
+    try:
+        tokens = shlex.split(flatten(command), comments=True)
+    except ValueError:
+        return []
+    calls = []
+    index = 0
+    while index < len(tokens):
+        if pathlib.PurePosixPath(tokens[index]).name not in ("grep", "egrep", "rg"):
+            index += 1
+            continue
+        extended = tokens[index].endswith("egrep")
+        index += 1
+        pattern = None
+        operands: list[str] = []
+        # `-eq` and friends end the grep's arguments. Without them, flattening
+        # `test "$(grep -c div page.html)" -eq 0` leaves `-eq` looking like a grep flag and `0`
+        # like a second FILE, so the same criterion was reported twice — once correctly, and once
+        # as a zero-assertion against a file named "0" that of course does not exist.
+        while index < len(tokens) and tokens[index] not in (
+                "|", ";", "&&", "||", ")", "}", "]", "]]",
+                "-eq", "-ne", "-lt", "-le", "-gt", "-ge", "-a", "-o", "=", "=="):
+            token = tokens[index]
+            if token == "--":
+                index += 1
+                continue
+            if token.startswith("-") and len(token) > 1:
+                if "E" in token[1:]:
+                    extended = True
+                if token in ("-e", "--regexp"):
+                    index += 1
+                    pattern = tokens[index] if index < len(tokens) else None
+                index += 1
+                continue
+            if pattern is None:
+                pattern = token
+            else:
+                operands.append(token)
+            index += 1
+        if pattern is not None:
+            for operand in operands or [""]:
+                calls.append((pattern, operand, extended))
+    return calls
+
+
+def current_matches(pattern: str, path: pathlib.Path, extended: bool) -> int | None:
+    if not path.is_file():
+        return None
+    args = ["grep", "-c"] + (["-E"] if extended else []) + ["-e", pattern, "--", str(path)]
+    try:
+        done = subprocess.run(args, capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode not in (0, 1):
+        return None
+    return int(done.stdout.strip() or 0)
+
+
+def check_zero_assertions(report: Report, commands: list[str], repo: pathlib.Path) -> None:
+    for index, command in enumerate(commands, 1):
+        if not ZERO_ASSERTION.search(command):
+            continue
+        for pattern, operand, extended in grep_calls(command):
+            if not operand or UNEVALUABLE.search(pattern) or UNEVALUABLE.search(operand):
+                continue
+            path = repo / operand
+            count = current_matches(pattern, path, extended)
+            # An unanchored bare word matches wherever it occurs — as a closing tag, inside
+            # another word, in a comment. That breadth is the defect; a count on its own is not.
+            #
+            # Warning on every zero-assertion that currently matches something would fire on the
+            # ordinary "remove this and it should be gone" criterion, which is most of them, and a
+            # linter that fires on the normal case gets skimmed. So the loud finding needs BOTH:
+            # a pattern broader than a person means, and something for it to catch.
+            loose = not re.search(r"[\^\$\\<>/(){}\[\]|*+?=\"' ]", pattern)
+            if loose and count:
+                report.warn("uncounted-zero-assertion",
+                            f"criterion {index} asserts zero `{pattern}` in {operand}, unanchored, "
+                            f"and it matches {count} line(s) now",
+                            command.strip(),
+                            "A zero-assertion is a claim about EVERY occurrence, and the author",
+                            "usually means the ones they had in mind. A plan described renaming",
+                            "two divs and asserted `grep -c 'div' -eq 0`; the file had a third,",
+                            "the criterion was stricter than the prose, and the model obeyed the",
+                            "criterion — it changed an opening tag and left the closing one,",
+                            "producing malformed HTML that 85 tests passed over.",
+                            f"`{pattern}` also matches it as a substring. Anchor it to the {count}",
+                            "you mean, or say in the plan what happens to all of them.")
+            elif loose:
+                report.note("loose-zero-assertion",
+                            f"criterion {index} asserts zero `{pattern}`, unanchored",
+                            command.strip(),
+                            f"`{pattern}` matches anywhere it appears as a substring. It matches "
+                            + ("nothing yet — the file does not exist, so run"
+                               if count is None else "nothing now, but anchor it anyway, or run"),
+                            "`handoff check <slug> --dry-run` before the round to see what it does"
+                            " match.")
+            elif count:
+                report.note("zero-assertion-count",
+                            f"criterion {index} asserts zero `{pattern}` in {operand}, which has "
+                            f"{count} now",
+                            command.strip(),
+                            f"Confirm all {count} are meant to go. This is the ordinary shape of a"
+                            " removal",
+                            "criterion and is probably fine — it is here so the number is in front"
+                            " of you",
+                            "rather than in your head.")
+
+
+# --- 6. worked examples that cannot discriminate ---------------------------------------------
+
+NUMERIC_LIST = re.compile(r"\[\s*(-?\d+(?:\s*,\s*-?\d+){1,})\s*\]")
+# Narrow on purpose. The first version included `round`, which is this project's word for one
+# implementation attempt, so it fired on every plan in the repository — including two about the
+# harness itself. A note that appears everywhere is read nowhere.
+ARITHMETIC = re.compile(r"\b(prorat\w*|remainder|apportion\w*|rounding|weighted average|"
+                        r"leftover cents?|distribut\w+ (the )?(cents?|amount|remainder))",
+                        re.IGNORECASE)
+
+
+def check_worked_example(report: Report, text: str) -> None:
+    lists = [[int(n) for n in re.split(r"\s*,\s*", m.group(1))]
+             for m in NUMERIC_LIST.finditer(text)]
+    for values in lists:
+        if len(set(values)) == 1 and len(values) > 1:
+            report.warn("symmetric-example",
+                        f"the worked example expects {values} — every element the same",
+                        "Two wrong implementations passed every criterion of a proration plan:",
+                        "three identical lines cannot catch an ordering bug, and one leftover",
+                        "cent cannot catch a mis-distribution. Choose inputs whose correct answer",
+                        "differs from the plausible wrong one.")
+    if ARITHMETIC.search(text) and not lists:
+        report.note("no-worked-example",
+                    "this plan describes arithmetic with a remainder and shows no worked example",
+                    "State the inputs and the exact expected output. An asymmetric one: three",
+                    "lines over different day counts, so an ordering error changes the answer.")
+
+
+# --- 7. what check-plan warns about, so one command covers it --------------------------------
+
+def check_shape(report: Report, text: str, commands: list[str]) -> None:
+    if "out of scope" not in sections(text):
+        report.note("out-of-scope", "no '## Out of scope' section",
+                    "Everything not written in the plan is out of scope, and saying which nearby",
+                    "work is deliberately excluded is what stops it being done anyway.")
+    if commands and not any(re.search(r"git\s+(status|diff)", c) for c in commands):
+        report.note("unenforced-scope",
+                    "nothing asserts how many files changed",
+                    "The scope gate uses the Files-to-touch table, but nothing in the plan's own",
+                    "criteria notices a file the model added inside a directory it was allowed to",
+                    "create.")
+
+
+# ---------------------------------------------------------------------------------------------
+
+CHECKS_RUN = 7
+
+
+def lint(path: pathlib.Path, repo: pathlib.Path) -> Report:
+    text = path.read_text(errors="replace")
+    commands = verification_commands(text)
+    report = Report()
+    check_porcelain(report, commands, touched_paths(text), repo)
+    check_states(report, text)
+    check_colour(report, commands)
+    check_whitespace(report, commands)
+    check_zero_assertions(report, commands, repo)
+    check_worked_example(report, text)
+    check_shape(report, text, commands)
+    return report
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("plans", nargs="+")
+    parser.add_argument("--repo", default=".",
+                        help="the project the plan's paths are relative to (default: cwd)")
+    args = parser.parse_args()
+
+    repo = pathlib.Path(args.repo).resolve()
+    warnings = 0
+    for name in args.plans:
+        path = pathlib.Path(name)
+        if not path.is_file():
+            print(f"MISSING  {name}", file=sys.stderr)
+            return 2
+        report = lint(path, repo)
+        print(f"== {name}")
+        if not report.findings:
+            print("   nothing known to be wrong.")
+        for label, message, detail in report.findings:
+            warnings += label.startswith("WARN")
+            print(f"   {label}  {message}")
+            for line in detail:
+                print(f"          {line}")
+        print()
+
+    print(f"{CHECKS_RUN} check(s) run. They match shapes that have been wrong before; a clean")
+    print("report does not mean the criteria measure the right thing — only that none of the")
+    print("known traps are present.")
+    if warnings:
+        print(f"\n{warnings} finding(s) marked WARN have each cost a round in real use.")
+    # Advisory by design. check-plan decides validity; a second gate that could block would be
+    # bypassed, and then neither would run.
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

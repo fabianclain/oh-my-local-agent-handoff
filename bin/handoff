@@ -7,6 +7,7 @@
 #   handoff diff <slug>     exactly what the implementer changed during the run
 #   handoff init            wire this project up: plans dir, config, gitignore
 #   handoff check <slug>    will the harness accept this plan, before you run it
+#   handoff prepare <slug>  the whole pre-flight: check, lint, and every criterion dry-run
 #   handoff verify <slug>   run the gates over the tree and print the verdict
 #   handoff log [slug]      every run recorded so far, one line each
 #   handoff stats           how the local model is actually performing, across runs
@@ -142,7 +143,7 @@ if [[ "$MODE" == "log" || "$MODE" == "stats" ]]; then
 fi
 
 if [[ -z "$MODE" || -z "$SLUG" ]]; then
-    echo "usage: handoff {do|check|resume|diff|verify|retro|auto} <slug>" >&2
+    echo "usage: handoff {do|prepare|check|resume|diff|verify|retro|auto} <slug>" >&2
     echo "       handoff {init|log|stats|doctor}" >&2
     exit 64
 fi
@@ -394,7 +395,7 @@ ${PROJECT_RULES}
 Leave all changes uncommitted."
     ;;
 
-check)
+check | prepare)
     # Reachable from any project, which tools/check-plan is not: only bin/ is on PATH, and asking
     # someone to know where the harness is checked out defeats the point of checking at all.
     CHECKER="$HANDOFF_HOME/tools/check-plan"
@@ -404,7 +405,25 @@ check)
         echo "plans for this project live in ${PLANS_DIR#"$REPO_ROOT"/}" >&2
         exit 1
     }
+    # Shape first, and it is the only part that can refuse: a plan with six criteria and two
+    # commands can never score above 2/6, so the harness will not run it.
     "$CHECKER" "$PLAN_FILE" || exit $?
+
+    # Then the advisory pass. Separate tool, deliberately: this one never refuses, because a
+    # second gate that could block would get bypassed and then neither would run.
+    #
+    # `prepare` is `check --dry-run` under a name that says what it is for. Three of the failures
+    # it reads for were found by a reviewer AFTER a round had been spent, and each was visible in
+    # the plan beforehand — an unanchored zero-assertion, a grep against coloured output, a state
+    # named and never gated. One command before the round, rather than three.
+    LINTER="$HANDOFF_HOME/tools/plan-lint"
+    if [[ -x "$LINTER" ]]; then
+        echo
+        "$LINTER" "$PLAN_FILE" --repo "$REPO_ROOT" || true
+    fi
+    if [[ "$MODE" == "prepare" ]]; then
+        set -- "$1" "$2" --dry-run "${@:4}"
+    fi
 
     # --dry-run: run every acceptance command against the tree AS IT IS NOW, before any model time
     # is spent, and show what each one actually saw.
@@ -465,6 +484,18 @@ check)
                 # unable to span ^[[39m. It re-runs the left-hand side, so it costs whatever that
                 # costs — acceptable in a mode whose entire purpose is inspection.
                 DRY_LEFT="${dry_command%|*}"
+                # Only when the split lands between stages, not inside a substitution.
+                #
+                # `test "$(git status --porcelain | wc -l)" -eq 1` has its only pipe INSIDE $( ),
+                # so cutting at the last one produces `test "$(git status --porcelain ` — which
+                # bash refuses with "unexpected EOF while looking for matching `)'". That message
+                # then appeared under a criterion as though it were the criterion's own output,
+                # which is exactly the kind of misdirection this mode exists to remove.
+                if [[ "$(tr -cd '(' <<<"$DRY_LEFT" | wc -c)" != "$(tr -cd ')' <<<"$DRY_LEFT" | wc -c)" ]]; then
+                    echo "      | (silent, and its only pipe is inside a \$( ) substitution, so"
+                    echo "      |  there is no left-hand side to show. Run it yourself.)"
+                    continue
+                fi
                 echo "      | (silent. What its last stage was matching against:)"
                 if DRY_IN="$(cd "$REPO_ROOT" && NO_COLOR=1 TERM=dumb CLICOLOR=0 \
                     timeout 60 bash -o pipefail -c "$DRY_LEFT" 2>&1)"; then :; fi
@@ -526,7 +557,7 @@ retro)
     ;;
 
 *)
-    echo "unknown mode: $MODE (expected do|check|resume|diff|verify|retro|auto|overnight|log|stats|init|doctor)" >&2
+    echo "unknown mode: $MODE (expected do|prepare|check|resume|diff|verify|retro|auto|overnight|log|stats|init|doctor)" >&2
     exit 64
     ;;
 esac
