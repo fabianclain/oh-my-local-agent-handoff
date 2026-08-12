@@ -605,10 +605,40 @@ for provider in "${PROVIDER_LIST[@]}"; do
         PROVIDER_FEEDBACK_DETAIL="$BENCH_FEEDBACK_DETAIL"
 
         ACTIVE_WORKTREE="$WORK_DIR/$PLAN-$provider-$repetition"
-        [[ ! -e "$ACTIVE_WORKTREE" ]] || {
-            echo "worktree path already exists: ${ACTIVE_WORKTREE#"$REPO_ROOT"/}" >&2
-            exit 1
-        }
+
+        # A leftover worktree is debris from a killed run, and it used to end the whole job.
+        #
+        # These directories are disposable by construction: created detached from BASE_COMMIT for
+        # one repetition and removed after it. Nothing in one is ever wanted again — the artifacts
+        # that matter were already copied into the results directory. So the old guard refused a
+        # path it could simply reclaim, and `exit 1` took every remaining repetition with it.
+        #
+        # Measured cost: a killed run left bench/.work/site-dark-native-3 behind, and the next
+        # `--repeat 4` job swept the ghost process, hit this line, and stopped after two runs. On an
+        # unattended night every later wave would have died at the same repetition — which is
+        # precisely the crash-at-02:00 case `tools/overnight --resume` exists to survive.
+        #
+        # What is NOT reclaimed is a directory some live process is still working in. That is a
+        # concurrent run rather than debris, and mixing two rounds in one tree is the failure the
+        # original guard was protecting against.
+        if [[ -e "$ACTIVE_WORKTREE" ]]; then
+            _holder=""
+            for _proc in /proc/[0-9]*; do
+                _cwd="$(readlink "$_proc/cwd" 2>/dev/null)" || continue
+                case "$_cwd" in
+                    "$ACTIVE_WORKTREE"|"$ACTIVE_WORKTREE"/*) _holder="${_proc#/proc/}"; break ;;
+                esac
+            done
+            if [[ -n "$_holder" ]]; then
+                echo "worktree path in use by pid $_holder: ${ACTIVE_WORKTREE#"$REPO_ROOT"/}" >&2
+                echo "that is a concurrent run, not leftover debris — refusing to share a tree" >&2
+                exit 1
+            fi
+            echo "reclaiming leftover worktree ${ACTIVE_WORKTREE#"$REPO_ROOT"/} (a previous run was killed)" >&2
+            git -C "$REPO_ROOT" worktree remove --force "$ACTIVE_WORKTREE" >/dev/null 2>&1 || true
+            rm -rf "$ACTIVE_WORKTREE"
+            git -C "$REPO_ROOT" worktree prune >/dev/null 2>&1 || true
+        fi
 
         if ! git -C "$REPO_ROOT" worktree add --detach "$ACTIVE_WORKTREE" "$BASE_COMMIT" \
             >"$RESULT_DIR/worktree.log" 2>&1; then
