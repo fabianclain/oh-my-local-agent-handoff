@@ -506,8 +506,111 @@ def served_context(host: str, port: int) -> int:
         return 0
 
 
+
+# ------------------------------------------------------------------------------------------------
+# harmony, parsed here instead of by the server
+
+
+# Messages are split on their TERMINATORS, not on `<|start|>`. The model does not always emit
+# `<|start|>assistant` between an analysis message and the tool call that follows it, and splitting
+# on it merged the two: the tool call ended up inside the analysis body and was lost entirely. That
+# cost a live round its report — on the change built to stop losing reports — and the harness saw
+# only "submit_report arguments did not parse as JSON".
+HARMONY_SPLIT = re.compile(r"<\|end\|>|<\|call\|>|<\|return\|>")
+# `to=functions.NAME` is the canonical recipient. The garbled form drops `to=` and puts the name
+# straight after a channel token, which is 75 of the 99 discarded completions measured overnight.
+RECIPIENT = re.compile(r"(?:to=)?functions\.([A-Za-z_][A-Za-z0-9_]*)")
+CHANNEL_NAME = re.compile(r"<\|channel\|>\s*([A-Za-z]+)")
+
+
+def parse_harmony(text: str) -> dict:
+    """Read gpt-oss's harmony output leniently, and return it in OpenAI message shape.
+
+    llama.cpp discards a completion whose header it cannot map, and answers HTTP 500 with the text
+    gone. Measured over one night: 99 of 3,131 completions, 3.16%, of which 75 were a header the
+    model garbled by one token and 18 were a `final` message tagged `<|constrain|>json`. Both are
+    unambiguous to a reader:
+
+        <|channel|>functions.write_file<|channel|>commentary json<|message|>{"path": ...}
+        <|channel|>final <|constrain|>json<|message|>{"status": "complete", ...}
+
+    The first is a call to write_file. The second is a final message carrying JSON. Nothing about
+    either is genuinely ambiguous — the grammar simply does not admit them, and the round dies for
+    it. This parser admits them.
+
+    Deliberately tolerant in exactly three ways, each from an observed failure:
+      * the recipient is found anywhere in the header, with or without `to=`
+      * `<|constrain|>` and its argument are ignored wherever they appear
+      * a repeated `<|channel|>` does not invalidate the header
+
+    Deliberately strict about the one thing that matters: a segment with no `<|message|>` has no
+    body, and is dropped rather than guessed at. Reconstructing a truncated tool call is how a
+    partial `newString` replaces a file with a valid-looking partial copy, which this project
+    declined to do once already.
+    """
+    calls, reasoning, content = [], [], []
+    for chunk in HARMONY_SPLIT.split(text):
+        if "<|message|>" not in chunk:
+            continue
+        header, _, body = chunk.partition("<|message|>")
+
+        recipient = RECIPIENT.search(header)
+        channels = CHANNEL_NAME.findall(header)
+        channel = next((c for c in channels if c in ("analysis", "commentary", "final")), "")
+
+        if recipient:
+            calls.append({"id": f"call-{len(calls) + 1}", "type": "function",
+                          "function": {"name": recipient.group(1), "arguments": body.strip()}})
+        elif channel == "analysis":
+            reasoning.append(body)
+        else:
+            # `final`, and anything whose channel could not be read. A body that reached here is
+            # the model's answer; refusing it because the header was unreadable is the behaviour
+            # being replaced.
+            content.append(body)
+
+    message = {"role": "assistant", "content": "".join(content).strip()}
+    if calls:
+        message["tool_calls"] = calls
+    if reasoning:
+        message["reasoning_content"] = "".join(reasoning).strip()
+    return message
+
+
+def call_model_raw(host: str, port: int, messages: list[dict], tools: list[dict],
+                   temperature: float, timeout: int) -> dict:
+    """Generate through /completions, with the server's own template but not its parser.
+
+    /apply-template renders exactly the prompt /v1/chat/completions would build, so the prompt is
+    not a reimplementation and cannot drift from the server's idea of it. Only the parsing is ours.
+    """
+    rendered = json.loads(http_post(host, port, "/apply-template",
+                                    {"messages": messages, "tools": tools}, timeout))
+    body = json.loads(http_post(host, port, "/completions",
+                                {"prompt": rendered["prompt"], "n_predict": -1,
+                                 "temperature": temperature}, timeout))
+    usage = {"prompt_tokens": body.get("tokens_evaluated") or 0,
+             "completion_tokens": body.get("tokens_predicted") or 0}
+    return {"choices": [{"message": parse_harmony(body.get("content") or ""),
+                         "finish_reason": "stop"}], "usage": usage}
+
+
+def http_post(host: str, port: int, path: str, payload: dict, timeout: int) -> bytes:
+    request = urllib.request.Request(f"http://{host}:{port}{path}",
+                                     data=json.dumps(payload).encode(),
+                                     headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.read()
+
+
+RAW_HARMONY = False
+
+
 def call_model(host: str, port: int, model: str, messages: list[dict], tools: list[dict],
                temperature: float, timeout: int) -> dict:
+    # The raw path takes llama.cpp's chat parser off the critical path: same prompt, our parsing.
+    if RAW_HARMONY:
+        return call_model_raw(host, port, messages, tools, temperature, timeout)
     payload = {"model": model, "messages": messages, "stream": False,
                "temperature": temperature}
     if tools:
@@ -666,6 +769,8 @@ def main() -> int:
                         help="drop replace_in_file, forcing whole-file writes (round 15)")
     parser.add_argument("--no-report-tool", action="store_true",
                         help="no submit_report tool; the report comes from the no-tools final turn")
+    parser.add_argument("--raw-harmony", action="store_true",
+                        help="generate via /completions and parse harmony here, not in the server")
     parser.add_argument("--prune-superseded", action="store_true",
                         help="replace read results the model has since overwritten (see ReadHistory)")
     parser.add_argument("--report-tool-max-depth", type=int, default=0,
@@ -677,6 +782,8 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=600)
     args = parser.parse_args()
 
+    if args.raw_harmony:
+        globals()["RAW_HARMONY"] = True
     if args.no_replace:
         DISABLED.add("replace_in_file")
     if args.no_report_tool:
@@ -770,8 +877,23 @@ def main() -> int:
                 messages.append({"role": "assistant", "content": text or ""})
                 break
 
+            # The arguments go back to the server on every later render, and /apply-template
+            # VALIDATES them: one malformed argument returns HTTP 500 and poisons every subsequent
+            # request in the round, not just the turn that produced it. Observed on the raw path,
+            # where a tool call whose body was not valid JSON killed an attempt that had already
+            # met every criterion. What the tool actually ran is unaffected — `parsed` below is
+            # taken from the raw text; this only sanitises the copy kept for context.
+            history_calls = []
+            for call in calls:
+                function = dict(call.get("function") or {})
+                raw_args = function.get("arguments")
+                try:
+                    json.loads(raw_args if isinstance(raw_args, str) else json.dumps(raw_args))
+                except (ValueError, TypeError):
+                    function["arguments"] = "{}"
+                history_calls.append({**call, "function": function})
             messages.append({"role": "assistant", "content": text or "",
-                             "tool_calls": calls})
+                             "tool_calls": history_calls})
             done = False
             for call in calls:
                 function = call.get("function") or {}

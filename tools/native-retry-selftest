@@ -253,6 +253,83 @@ def check_extractor() -> tuple[int, int]:
     return len(cases) + len(keyed_cases), failures
 
 
+
+def check_harmony() -> tuple[int, int]:
+    """parse_harmony, against strings llama.cpp actually discarded.
+
+    The two failure classes are verbatim from tools/peg-audit over 3,131 completions: a header the
+    model garbled by one token (75 occurrences) and a `final` message tagged `<|constrain|>json`
+    (18). The server answers HTTP 500 for both and throws the text away. Every one of them is a
+    round that produced work and could not report it.
+    """
+    parse = load_agent().parse_harmony
+    cases = [
+        ("canonical tool call, channel-first with to= and constrain",
+         '<|channel|>analysis<|message|>thinking<|end|><|start|>assistant<|channel|>commentary '
+         'to=functions.read_files <|constrain|>json<|message|>{"files":[]}',
+         {"tools": ["read_files"], "content": "", "reasoning": True}),
+        # The 75-occurrence class: `to=` dropped, the name pulled in after the channel token.
+        ("a garbled header is still a tool call",
+         '<|channel|>functions.write_file<|channel|>commentary json<|message|>{"path":"a.php"}',
+         {"tools": ["write_file"], "content": "", "reasoning": False}),
+        # The 18-occurrence class: the report, complete, thrown away for a tag.
+        ("a final message tagged constrain is still the report",
+         '<|channel|>final <|constrain|>json<|message|>{"status":"complete"}',
+         {"tools": [], "content": '{"status":"complete"}', "reasoning": False}),
+        ("a plain final message",
+         '<|channel|>final<|message|>All done.<|return|>',
+         {"tools": [], "content": "All done.", "reasoning": False}),
+        ("analysis is reasoning, not content",
+         '<|channel|>analysis<|message|>thinking out loud<|end|>',
+         {"tools": [], "content": "", "reasoning": True}),
+        # The bug that cost a live round its report. The model does not always emit
+        # `<|start|>assistant` between the analysis message and the tool call after it; splitting
+        # on `<|start|>` merged them and the call vanished into the analysis body.
+        ("a tool call with no <|start|> before it is still found",
+         '<|channel|>analysis<|message|>thinking<|end|>'
+         '<|channel|>commentary to=functions.submit_report <|constrain|>json'
+         '<|message|>{"status":"complete"}',
+         {"tools": ["submit_report"], "content": "", "reasoning": True}),
+        ("two tool calls in one completion",
+         '<|start|>assistant<|channel|>commentary to=functions.a<|message|>{"x":1}<|call|>'
+         '<|start|>assistant<|channel|>commentary to=functions.b<|message|>{"y":2}<|call|>',
+         {"tools": ["a", "b"], "content": "", "reasoning": False}),
+        # The one place tolerance must stop. A header with no body is not a call to guess at:
+        # rebuilding a truncated tool call is how a partial write replaces a file with a
+        # valid-looking partial copy, which this project declined to do deliberately.
+        ("a header with no body is dropped, not guessed",
+         '<|channel|>commentary to=functions.write_file <|constrain|>json',
+         {"tools": [], "content": "", "reasoning": False}),
+        ("the body stops at the terminator",
+         '<|channel|>final<|message|>keep<|end|>DISCARD-THIS',
+         {"tools": [], "content": "keep", "reasoning": False}),
+    ]
+    failures = 0
+    for name, text, want in cases:
+        try:
+            got = parse(text)
+        except Exception as error:  # noqa: BLE001
+            print(f"FAIL  harmony: {name}\n        raised {type(error).__name__}")
+            failures += 1
+            continue
+        tools = [c["function"]["name"] for c in got.get("tool_calls", [])]
+        problems = []
+        if tools != want["tools"]:
+            problems.append(f"tool_calls {tools}, expected {want['tools']}")
+        if got.get("content", "") != want["content"]:
+            problems.append(f"content {got.get('content','')!r}, expected {want['content']!r}")
+        if bool(got.get("reasoning_content")) != want["reasoning"]:
+            problems.append(f"reasoning present={bool(got.get('reasoning_content'))}")
+        if problems:
+            print(f"FAIL  harmony: {name}")
+            for problem in problems:
+                print(f"        {problem}")
+            failures += 1
+        else:
+            print(f"pass  harmony: {name}")
+    return len(cases), failures
+
+
 def check_syntax_note() -> tuple[int, int]:
     """The post-write parse check, against the corruption that motivated it.
 
@@ -452,9 +529,10 @@ def main() -> int:
 
     extractor_cases, extractor_failures = check_extractor()
     syntax_cases, syntax_failures = check_syntax_note()
+    harmony_cases, harmony_failures = check_harmony()
     loop_failures = sum(0 if run_case(*case) else 1 for case in cases)
-    failures = extractor_failures + syntax_failures + loop_failures
-    total = extractor_cases + syntax_cases + len(cases)
+    failures = extractor_failures + syntax_failures + harmony_failures + loop_failures
+    total = extractor_cases + syntax_cases + harmony_cases + len(cases)
     print()
     if failures:
         print(f"{failures} check(s) failed")
