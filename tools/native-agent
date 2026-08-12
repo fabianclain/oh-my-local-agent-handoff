@@ -591,8 +591,20 @@ def call_model_raw(host: str, port: int, messages: list[dict], tools: list[dict]
                                  "temperature": temperature}, timeout))
     usage = {"prompt_tokens": body.get("tokens_evaluated") or 0,
              "completion_tokens": body.get("tokens_predicted") or 0}
-    return {"choices": [{"message": parse_harmony(body.get("content") or ""),
-                         "finish_reason": "stop"}], "usage": usage}
+    raw = body.get("content") or ""
+    message = parse_harmony(raw)
+    # Keep the raw completion whenever the parse produced a tool call whose arguments are not
+    # JSON. Owning the parser means owning its failures, and the first round of them was not
+    # diagnosable at all: the loop reported "submit_report arguments did not parse as JSON" and
+    # the text that caused it was already gone. A parser that cannot be debugged from its own log
+    # is worse than the one it replaced.
+    for call in message.get("tool_calls") or []:
+        try:
+            json.loads(call["function"]["arguments"])
+        except (ValueError, TypeError):
+            message["_raw_harmony"] = raw[-2000:]
+            break
+    return {"choices": [{"message": message, "finish_reason": "stop"}], "usage": usage}
 
 
 def http_post(host: str, port: int, path: str, payload: dict, timeout: int) -> bytes:
@@ -864,6 +876,10 @@ def main() -> int:
             if reasoning:
                 emit(log, "agent_event", {"type": "content_end", "contentType": "reasoning",
                                           "reasoning": reasoning})
+            if message.get("_raw_harmony"):
+                emit(log, "agent_event", {"type": "error", "error": {"message": (
+                    "raw-harmony: a tool call parsed with non-JSON arguments; tail of the "
+                    f"completion: {message['_raw_harmony'][-600:]!r}")}})
             text = (message.get("content") or "").strip()
             calls = message.get("tool_calls") or []
 
