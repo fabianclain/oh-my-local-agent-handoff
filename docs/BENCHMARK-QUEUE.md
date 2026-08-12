@@ -571,3 +571,32 @@ button's text must invert with the scheme.
 The `darkscheme` gate exists because contrast alone would have been toothless here: it can only
 judge pairs that exist, so a page with **no** dark block has no dark pairs and passes without
 checking anything. Absence of the work would have read as the work being correct.
+
+### Both site plans are happy paths, and the "hard" one only looked hard because a gate was wrong
+
+`site-dark` was built to fail. The palette makes the requirement real — `#d9232d` is 3.36:1 on
+`#1e1e1e` so the brand colour cannot carry over, and white on the dark brand is 2.78:1 so a
+button's text must invert with the scheme — and the first two live runs duly failed, one of them
+spending 1,018 seconds and a second attempt on the repair path.
+
+Both were **the gate's fault**. `darkscheme` folded CSS comments into its selector keys, so a
+commented light sheet never matched an uncommented dark block and it reported six selectors as
+uncovered against a block that defined all six. With that fixed, the first clean wave is 4/4
+accepted, 13/13, every one green on the first attempt.
+
+So the measured position is: this model writes a two-scheme, self-contained, WCAG-checked landing
+page from a dictated spec, correctly, first time, in about three minutes. Neither `site` nor
+`site-dark` discriminates.
+
+**The methodological point is worth more than the result.** A plan validated only against a
+reference and a trap written by the same hand as the gate shares that gate's blind spots — both of
+mine were written without CSS comments, so neither could catch a comment bug. The live run found it
+in minutes. A reference solution is a necessary check and not a sufficient one, and the cheapest
+way to find what it missed is to run the plan and read the failures with suspicion pointed at the
+harness first.
+
+**What would actually be hard is still open.** Not more visual requirements — the model handles
+those. The failures this project has recorded on real work are mis-anchored edits into files over
+150 lines on a second pass, which is an EDITING shape rather than a creation one, and greenfield
+work carrying design decisions rather than a dictated spec. A plan that reliably fails once, which
+roadmap item 1 has needed since round 7, is still unbuilt.
