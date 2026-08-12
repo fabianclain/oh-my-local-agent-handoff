@@ -165,6 +165,24 @@ else
     HARNESS_DIRTY=0
 fi
 
+# The commit is not enough, and the dirty bit is not enough either.
+#
+# Three arms of the 2026-08-12 night all recorded `harness_commit=628e3b2 harness_dirty=1`. That
+# names a commit and says "plus some edits" — it does not say WHICH edits, so two arms hours apart
+# can carry identical provenance and have been produced by different code. Every comparison drawn
+# across them rests on an assumption the metrics cannot support.
+#
+# So hash the tree the run actually executed. A throwaway index means this neither touches the real
+# index nor requires a clean checkout, which is the same technique the run uses for before/after
+# tree snapshots. .gitignore keeps results, logs and scratch out of it; measured at ~25 ms.
+HARNESS_TREE="$(
+    _harness_index="$(mktemp -u)"
+    GIT_INDEX_FILE="$_harness_index" git -C "$REPO_ROOT" add -A 2>/dev/null
+    GIT_INDEX_FILE="$_harness_index" git -C "$REPO_ROOT" write-tree 2>/dev/null
+    rm -f "$_harness_index"
+)"
+HARNESS_TREE="${HARNESS_TREE:-unknown}"
+
 [[ -f "$PLAN_FILE" ]] || { echo "plan not found: bench/plans/$PLAN.md" >&2; exit 1; }
 
 # Checked once here rather than discovered mid-round. A missing renderer would abort under `set -e`
@@ -428,6 +446,7 @@ write_metrics() {
         "outcome=$outcome" \
         "harness_commit=$HARNESS_COMMIT" \
         "harness_dirty=$HARNESS_DIRTY" \
+        "harness_tree=$HARNESS_TREE" \
         "feedback_detail=$PROVIDER_FEEDBACK_DETAIL" \
         "prompt_tokens=$PROMPT_TOKENS" \
         "generated_tokens=$GENERATED_TOKENS" \
