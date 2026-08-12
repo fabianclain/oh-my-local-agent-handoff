@@ -631,3 +631,27 @@ and are hardened by that history. The view gates were days old and had been vali
 a reference and a trap written by the same hand as the gate, which shares its blind spots by
 construction. Both of mine were written without CSS comments, so neither could catch a comment bug.
 Fuzz the young gate; the old one has already met its adversary.
+
+### site-dark does discriminate — 1 in 16, and it is the defect the plan was built for
+
+Run 16 is the first genuine failure of the clean night: 11 of 13, two attempts, 567 seconds,
+`patch-incomplete` with a scope-clean tree. The model wrote a dark block covering thirteen
+selectors and missed five, all of them containers:
+
+    #colophon   #cta   #features   #features .card   #testimonials blockquote footer
+
+The consequence is not cosmetic. `.card` keeps its white background in dark mode while the body
+text turns light grey, so the feature cards render **#c9d1d9 on #ffffff — 1.54:1**. The dark brand
+colour lands on the same un-overridden white at 2.78:1, and the testimonial attribution keeps
+#556270 against #1e1e1e at 2.67:1.
+
+**Two independent implementations agree**, which is what makes this trustworthy rather than a
+repeat of the comment bug. `darkscheme` compares selector sets and names those five; `css-contrast`
+resolves the cascade and computes the ratios. Neither shares code with the other, and after a gate
+that failed a correct page earlier the same night, agreement between two implementations is the
+standard a failure has to meet before it is called the model's.
+
+So the plan is not saturated after all — it is a **1-in-16 instrument**, which is worth having and
+is not the ~50% one roadmap item 1 needs. Note also that the repair attempt did not recover it: the
+run failed, was told which commands failed, tried again, and still shipped 11 of 13. That is the
+repair loop exercised on a real failure for the first time tonight, and it did not help.
