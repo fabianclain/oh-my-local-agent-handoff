@@ -312,6 +312,23 @@ every number in round 6 was scored under the current rule.
 
 ---
 
+## 1c. `bench/report` shows the recorded outcome; two other tools re-derive it
+
+After the damaged/incomplete split, `bench/summary` and `bench/compare` re-derive the label from
+each run's own scope, rewrite and litter counts — a recorded `patch-damaged` predates the split and
+means "not accepted" and nothing more. `bench/report` still prints what is in the metrics file.
+
+So the same run reads `patch-damaged` in one view and `patch-incomplete` in another. The evidence
+is at least adjacent: report prints scope, rewrite and litter on the same row, so a reader who
+looks can see nothing was damaged. That is the "reader must interpret a bare fact" shape this
+project has already been burned by once tonight.
+
+**Not fixed deliberately.** It was found at midnight with a measurement queue running, and adding a
+third implementation of the classifier mid-queue is the drift this item is about. The fix is to
+have one implementation the three views share, at a round boundary — not another copy.
+
+---
+
 ## 2. Converge `verify-round` and `bench/run` — lower priority than it looked
 
 Two implementations of "is this acceptable" exist. Scoring comes from `bench/run`; the evidence
