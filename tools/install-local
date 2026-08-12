@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+#
+# install-local — make `handoff` usable from any repository on this machine.
+#
+#   tools/install-local [--provider native] [--model gpt-oss-20b] [--port 8071]
+#   tools/install-local --check
+#
+# WHAT IT DOES, AND WHY EACH PART EXISTS
+#
+# 1. Symlinks `handoff` into ~/.local/bin.
+#
+#    Adding the repository's own bin/ to PATH via ~/.bashrc looks equivalent and is not. Ubuntu's
+#    stock ~/.bashrc returns at line 5 for non-interactive shells, so `bash -c handoff`, cron, ssh
+#    commands and anything an agent spawns never see it — which cost a benchmark night its first
+#    launch, because the queue runner found no `handoff` on PATH. ~/.profile adds ~/.local/bin for
+#    login shells and it is already present in the systemd user environment, so a symlink there
+#    works in the cases the PATH export does not.
+#
+# 2. Writes ~/.config/agent-handoff/config.sh with the provider, model and port.
+#
+#    bin/handoff defaults to `codex`, a hosted CLI. Driving a local model in an arbitrary repo
+#    otherwise means `HANDOFF_PROVIDER=native` on every invocation, or committing a config file
+#    into every project you touch. The user config is read before the project's, so a repository
+#    with its own opinions still overrides it, and an environment variable overrides both.
+#
+# It does NOT touch the model server, ~/.bashrc, or any repository. Setting up a repo is
+# `handoff init`, which is one command and belongs to the repo, not to this.
+
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$HERE/.." && pwd)"
+
+PROVIDER="native"
+MODEL="gpt-oss-20b"
+PORT="8071"
+CHECK=0
+
+while (( $# > 0 )); do
+    case "$1" in
+    --provider) PROVIDER="${2:?--provider needs a name}"; shift 2 ;;
+    --model) MODEL="${2:?--model needs a name}"; shift 2 ;;
+    --port) PORT="${2:?--port needs a number}"; shift 2 ;;
+    --check) CHECK=1; shift ;;
+    -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown argument: $1" >&2; exit 64 ;;
+    esac
+done
+
+BIN_DIR="$HOME/.local/bin"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/agent-handoff"
+CONFIG="$CONFIG_DIR/config.sh"
+FAILED=0
+
+say()  { printf '  %-8s %s\n' "$1" "$2"; }
+bad()  { say FAIL "$1"; FAILED=1; }
+
+if (( CHECK )); then
+    echo "handoff, as any repository would find it"
+    # Deliberately a NON-interactive, non-login shell: that is the case ~/.bashrc does not cover
+    # and the one every agent, hook and cron job actually runs in.
+    if resolved="$(bash -c 'command -v handoff' 2>/dev/null)" && [[ -n "$resolved" ]]; then
+        say ok "on PATH for non-interactive shells ($resolved)"
+    else
+        bad "not on PATH for non-interactive shells — run tools/install-local"
+    fi
+    if [[ -f "$CONFIG" ]]; then
+        say ok "user config at ${CONFIG/#$HOME/\~}"
+        sed 's/^/           /' "$CONFIG" | grep -E "HANDOFF_|LLAMACPP_" || true
+    else
+        bad "no user config — every repo would need HANDOFF_PROVIDER set by hand"
+    fi
+    exit "$FAILED"
+fi
+
+mkdir -p "$BIN_DIR" "$CONFIG_DIR"
+
+# --force so re-running after moving the checkout repoints the link rather than failing.
+if ln -sfn "$REPO/bin/handoff" "$BIN_DIR/handoff"; then
+    say linked "${BIN_DIR/#$HOME/\~}/handoff -> ${REPO/#$HOME/\~}/bin/handoff"
+else
+    bad "could not link into $BIN_DIR"
+fi
+
+if [[ -f "$CONFIG" ]]; then
+    say kept "${CONFIG/#$HOME/\~} already exists — not overwritten"
+else
+    cat > "$CONFIG" <<EOF
+# agent-handoff, user-level defaults. Read by bin/handoff before any repository's own
+# .handoff/config.sh, so a project with its own opinions still overrides these, and an environment
+# variable on the command line overrides both.
+#
+# Written by tools/install-local. Safe to edit.
+
+: "\${HANDOFF_PROVIDER:=$PROVIDER}"
+: "\${HANDOFF_MODEL:=$MODEL}"
+: "\${LLAMACPP_PORT:=$PORT}"
+export HANDOFF_PROVIDER HANDOFF_MODEL LLAMACPP_PORT
+EOF
+    say wrote "${CONFIG/#$HOME/\~}  (provider=$PROVIDER model=$MODEL port=$PORT)"
+fi
+
+echo
+echo "Check it the way a repository would see it:"
+echo "  tools/install-local --check"
+echo
+echo "Then, in any repository:"
+echo "  handoff init                 # creates .handoff/plans and a config template"
+echo "  handoff check <slug>         # is the plan well formed"
+echo "  handoff do <slug>            # implement it, verify, and print the diff"
+echo
+echo "The model server is separate and stays yours to start:"
+echo "  tools/llamacpp-serve start $MODEL 98304"
+exit "$FAILED"

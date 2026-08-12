@@ -24,6 +24,28 @@
 
 set -euo pipefail
 
+# Where this script really lives, following symlinks.
+#
+# `dirname "${BASH_SOURCE[0]}"` is the directory the script was INVOKED through, which stops being
+# the checkout once it is installed. tools/install-local links ~/.local/bin/handoff at the repo,
+# and every path built from the invocation directory then pointed into ~/.local: `handoff init`
+# failed on a missing ~/.local/templates/config.sh, and `handoff do` reported "unknown provider:
+# native" because it looked in ~/.local/providers. Both faults appear only when installed — which
+# is the state every user is in, and the one no test had ever been in.
+_handoff_real_self() {
+    if command -v readlink >/dev/null 2>&1; then
+        local resolved
+        resolved="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null)"
+        [[ -n "$resolved" ]] && { printf '%s\n' "$resolved"; return 0; }
+    fi
+    local target="${BASH_SOURCE[0]}"
+    while [[ -L "$target" ]]; do
+        local link; link="$(ls -ld -- "$target" | sed 's/.* -> //')"
+        [[ "$link" == /* ]] && target="$link" || target="$(dirname "$target")/$link"
+    done
+    printf '%s\n' "$target"
+}
+
 MODE="${1:-}"
 SLUG="${2:-}"
 
@@ -31,7 +53,12 @@ if [[ "$MODE" == "init" ]]; then
     # Everything a project needs before its first run, and nothing else. Idempotent: safe to run
     # on a project that is already set up, which is what makes it safe for a skill to call.
     ROOT="$(git rev-parse --show-toplevel)"
-    HOME_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    HOME_DIR="$(cd "$(dirname "$(_handoff_real_self)")/.." && pwd)"
+    # `init` runs long before the user config is sourced further down, so read it here or the
+    # summary tells a new project it will use `codex` when it will not.
+    # shellcheck disable=SC1091
+    [[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/agent-handoff/config.sh" ]] &&
+        source "${XDG_CONFIG_HOME:-$HOME/.config}/agent-handoff/config.sh"
     cd "$ROOT"
     PLANS="$ROOT/.handoff/plans"
     # Respect an existing config's choice of plans directory rather than imposing a second one.
@@ -71,20 +98,26 @@ if [[ "$MODE" == "init" ]]; then
 
     echo
     echo "Next: write a plan in ${PLANS#"$ROOT"/}, then"
-    echo "  handoff check <slug>   &&  HANDOFF_PROVIDER=local handoff do <slug>"
+    # Names the provider that will actually be used, rather than a fixed string. The old hint
+    # hard-coded `HANDOFF_PROVIDER=local`; providers/local.sh does exist, but with a user config in
+    # place the variable is unnecessary, and naming the wrong provider in the first instruction a
+    # new project sees is worse than naming none.
+    echo "  handoff check <slug>   &&  handoff do <slug>"
+    echo
+    echo "provider:  ${HANDOFF_PROVIDER:-codex}$([[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/agent-handoff/config.sh" ]] && echo " (from your user config)" || echo " (default — see tools/install-local)")"
     exit 0
 fi
 
 # Read-only, needs no slug, and must work before anything else does — so it comes first.
 if [[ "$MODE" == "doctor" ]]; then
-    HANDOFF_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    HANDOFF_HOME="$(cd "$(dirname "$(_handoff_real_self)")/.." && pwd)"
     shift
     exec "$HANDOFF_HOME/tools/doctor" "$@"
 fi
 
 # The ladder runs the driver repeatedly, so it lives outside it rather than inside the mode switch.
 if [[ "$MODE" == "auto" ]]; then
-    HANDOFF_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    HANDOFF_HOME="$(cd "$(dirname "$(_handoff_real_self)")/.." && pwd)"
     shift
     exec "$HANDOFF_HOME/tools/escalate" "$@"
 fi
@@ -92,7 +125,7 @@ fi
 # A queue of jobs, run unattended. Outside the mode switch for the same reason as `auto`: it
 # invokes the driver (and the bench) many times rather than being one invocation of it.
 if [[ "$MODE" == "overnight" ]]; then
-    HANDOFF_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    HANDOFF_HOME="$(cd "$(dirname "$(_handoff_real_self)")/.." && pwd)"
     export HANDOFF_HOME
     shift
     exec "$HANDOFF_HOME/tools/overnight" "$@"
@@ -100,7 +133,7 @@ fi
 
 # `log` and `stats` read the journal and need no slug — they are about the history, not one run.
 if [[ "$MODE" == "log" || "$MODE" == "stats" ]]; then
-    HANDOFF_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    HANDOFF_HOME="$(cd "$(dirname "$(_handoff_real_self)")/.." && pwd)"
     REPO_ROOT="$(git rev-parse --show-toplevel)"
     [[ "$MODE" == "log" ]] &&
         exec "$HANDOFF_HOME/tools/journal" --repo "$REPO_ROOT" list ${SLUG:+--slug "$SLUG"}
@@ -114,7 +147,7 @@ if [[ -z "$MODE" || -z "$SLUG" ]]; then
     exit 64
 fi
 
-HANDOFF_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+HANDOFF_HOME="$(cd "$(dirname "$(_handoff_real_self)")/.." && pwd)"
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
 
@@ -129,6 +162,19 @@ cd "$REPO_ROOT"
 # and got obeyed: the first clean-room run of the quickstart was rejected for an invented file the
 # harness had told it to invent. Setup instructions belong in the setup output, not in the task.
 PROJECT_RULES="(This project has no .handoff/config.sh, so no build, test or formatting conventions were supplied. Follow the conventions visible in the files you are editing. Do not create a config file.)"
+# A user-level config, so the harness is usable in a repository that knows nothing about it.
+#
+# Without this, driving a local model anywhere meant `HANDOFF_PROVIDER=native handoff do <slug>`
+# every time, or a config file committed into every project. Neither is reasonable for a tool whose
+# whole point is being pointed at arbitrary code. Anything the provider contract reads belongs
+# here: HANDOFF_PROVIDER, HANDOFF_MODEL, LLAMACPP_PORT.
+#
+# Sourced BEFORE the project's own config, so a repository that does have opinions still wins. An
+# environment variable set on the command line beats both, because every assignment in either file
+# is a `:=` default rather than a plain one.
+# shellcheck disable=SC1091
+USER_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/agent-handoff/config.sh"
+[[ -f "$USER_CONFIG" ]] && source "$USER_CONFIG"
 # shellcheck disable=SC1091
 [[ -f "$REPO_ROOT/.handoff/config.sh" ]] && source "$REPO_ROOT/.handoff/config.sh"
 

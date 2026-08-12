@@ -988,6 +988,28 @@ else
     fail "sync-bench-clone would delete the archives bench/run --force creates"
 fi
 
+# --- installed via symlink, every path pointed at the wrong place -------------------------------
+# tools/install-local links ~/.local/bin/handoff at the checkout, and HANDOFF_HOME was computed
+# from `dirname "${BASH_SOURCE[0]}"` — the directory it was INVOKED through. Installed, that is
+# ~/.local, so `handoff init` failed on a missing ~/.local/templates/config.sh and `handoff do`
+# reported "unknown provider: native" while looking in ~/.local/providers. Both faults exist only
+# when installed, which is the state every user is in and no test had been in.
+SYMLINK_DIR="$SANDBOX/fake-bin"
+mkdir -p "$SYMLINK_DIR"
+ln -sfn "$REPO/bin/handoff" "$SYMLINK_DIR/handoff"
+SYMREPO="$SANDBOX/symlink-target"
+mkdir -p "$SYMREPO"
+( cd "$SYMREPO" && git init -q && echo x >a.txt && git add -A &&
+  git -c user.email=t@t.invalid -c user.name=t commit -qm init ) >/dev/null 2>&1
+SYM_OUT="$( cd "$SYMREPO" && "$SYMLINK_DIR/handoff" init 2>&1 )"
+if grep -q "cannot stat" <<<"$SYM_OUT"; then
+    fail "handoff invoked through a symlink resolves its own home to the link's directory"
+elif [[ -f "$SYMREPO/.handoff/config.sh" ]]; then
+    pass "handoff works when installed as a symlink, not only from its checkout"
+else
+    fail "handoff init through a symlink left no config: $(tail -1 <<<"$SYM_OUT")"
+fi
+
 # --- the prompt was never recorded ---------------------------------------------------------------
 # An arm whose whole variable is a prompt layer can be a silent no-op, and every artifact looks
 # identical to a working arm. This was found by being unable to answer that question at all.
