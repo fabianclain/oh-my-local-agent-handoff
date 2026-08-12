@@ -196,6 +196,16 @@ def main() -> int:
              "<html><head><style>@media (prefers-color-scheme: dark)"
              "{body{color:#fff;background:#000}}</style></head><body><p>x</p></body></html>",
              False),
+            # From the first live site-dark run: the gate reported six selectors missing from a
+            # dark block that defined all six, because the light sheet was commented and the dark
+            # block was not. A harness fault charged to the model.
+            ("a commented light sheet against an uncommented dark block",
+             "<html><head><style>/* Links */ a{color:#d9232d}"
+             "/* Body */ body{color:#556270;background:#ffffff}"
+             "@media (prefers-color-scheme: dark){a{color:#ff6b6b}"
+             "body{color:#c9d1d9;background:#1e1e1e}}</style></head><body>"
+             "<p>x</p><a href=\"#x\">y</a></body></html>",
+             True),
             ("a dark block nested inside @supports",
              "<html><head><style>body{color:#556270;background:#ffffff}"
              "@media (prefers-color-scheme: dark){@supports (display:grid)"

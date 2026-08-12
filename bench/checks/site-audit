@@ -310,6 +310,18 @@ def gate_darkscheme(doc: Doc) -> int:
     if not css.strip():
         return bad("no inline <style> block, so there is no dark scheme to check")
 
+    # Strip comments before anything reads a selector.
+    #
+    # Without this the rule matcher below takes everything between `}` and `{` as the selector, so
+    # `/* Links */ a { ... }` keys as `/* Links */ a` while the dark block's plain `a { ... }` keys
+    # as `a`. They stop matching, and the gate reports a selector as uncovered WHEN IT IS COVERED.
+    #
+    # Caught on the first live run of site-dark: six selectors reported missing from a dark block
+    # that defined every one of them, because the light sheet was commented and the dark block was
+    # not. That is a harness fault being charged to the model, which is the failure this whole
+    # project is built to prevent -- and it was in a gate written to catch that same shape.
+    css = re.sub(r"/\*.*?\*/", " ", css, flags=re.S)
+
     opening = re.search(r"@media[^{]*prefers-color-scheme\s*:\s*dark[^{]*\{", css)
     if not opening:
         return bad("no @media (prefers-color-scheme: dark) block",
