@@ -403,3 +403,111 @@ gate exists, and the mechanism is visible in both failures (repeated unparseable
 rounds cannot separate 0 from 2. The earlier reading in this file, that whole-file writes cost
 turns rather than correctness, is now wrong in both halves: the turn limit binds both arms equally,
 and the damage does not.
+
+## The night of 2026-08-11/12: what the three questions answered
+
+Six waves on `wide`, n=18 per native arm and n=15 control (wave 1's control was lost to a
+segfaulting client), plus two semantic waves at n=8. One harness commit, gpt-oss-20b on b10331 at
+98304, default sampling.
+
+### 1. native against lcgptossl — identical code, and only the report differs
+
+| | control | native | Fisher p |
+| --- | ---: | ---: | ---: |
+| usable tree | 15/15 | 18/18 | chance |
+| accepted | 9/15 | **18/18** | **0.00** |
+| no final report | 6/15 | **0/18** | **0.00** |
+| damaged | 0/15 | 0/18 | chance |
+| green on first attempt | 15/15 | 15/18 | chance |
+
+**Both arms produce a usable tree every single time.** The entire acceptance gap is whether the
+report survives the transport. This is not a claim that the native loop writes better code, and the
+gates say it does not.
+
+**The speed advantage was noise, and it is worth recording how convincingly it presented.**
+
+| after wave | n control/treatment | seconds ratio | Mann-Whitney p | the tool's verdict |
+| ---: | --- | ---: | ---: | --- |
+| 2 | 3/6 | 0.53x | 0.020 | **difference** |
+| 3 | 6/9 | 0.51x | 0.077 | suggestive |
+| 4 | 9/12 | 0.68x | 0.118 | suggestive |
+| 5 | 12/15 | 0.79x | 0.262 | chance |
+| 6 | 15/18 | 0.67x | 0.193 | chance |
+
+A twofold speedup at p = 0.02 walked to nothing over twelve more runs. Generated tokens did the
+same, 0.52x at p = 0.020 to 0.68x at p = 0.133. The queue file's own noise-floor warning applied
+and was still nearly banked as a result.
+
+### 2. Round 15 — whole-file writes are worse, and the mechanism is repeated bad writes
+
+| | `native` | `nativewhole` | Fisher p |
+| --- | ---: | ---: | ---: |
+| accepted | 18/18 | 13/18 | **0.05** |
+| usable tree | 18/18 | 15/18 | 0.23 |
+| `patch-damaged` | 0/18 | 3/18 | 0.23 |
+
+Acceptance separates; the damage count on its own does not at this n. Both damaged rounds examined
+had written unparseable files repeatedly — 4 and 6 post-write syntax warnings — so the failure is
+not one bad edit but a round that never recovers. Round 15 is answered for a six-file fixture:
+**do not force whole-file writes.** It says nothing about the 421-line service that motivated the
+patch-only gate, which is the version still worth running.
+
+### 3. Round 12 — offering the report tool changes nothing at this depth
+
+| | `native` | `nativemsg` | Fisher p |
+| --- | ---: | ---: | ---: |
+| accepted | 18/18 | 17/18 | 1.00 |
+| no final report | 0/18 | 0/18 | 1.00 |
+| usable tree | 18/18 | 17/18 | 1.00 |
+
+Removing `submit_report` entirely costs nothing on `wide`, because the model never reaches for it
+there: across 12 `wide` rounds it used the tool once. Round 10's 1/12-against-4/15 signal does not
+survive at n=18 under one client.
+
+The reason is depth, and it is measured rather than supposed. At `semantic`'s ~8k the model reports
+through the tool in 4 of 8 rounds; at `wide`'s 14–33k, in 1 of 12. So the arm to run is the shallow
+one — whether dropping the tool hurts rounds that would have used it — and this night could not ask
+it, because `nativemsg` only runs against `wide`.
+
+### What the retry actually bought, and a characterisation it overturns
+
+`tools/peg-audit` over the night's server log: **3,131 completions, 99 discarded, 3.16%** — far
+above the 0.69–1.32% of earlier eras, because these conversations run deeper.
+
+| class | n | rate | depth |
+| --- | ---: | ---: | --- |
+| `header-transposition` | 75 | 2.40% | 8.9k–48.0k |
+| `report-in-final-channel` | 18 | 0.57% | 8.9k–41.4k |
+| other | 6 | 0.19% | 8.5k–19.8k |
+
+| depth | completions | failures | rate |
+| --- | ---: | ---: | ---: |
+| 0k–8k | 678 | 0 | 0.00% |
+| 8k–16k | 1113 | 45 | 4.04% |
+| 16k–32k | 1060 | 48 | 4.53% |
+| 32k–48k | 220 | 6 | 2.73% |
+| 48k+ | 60 | 0 | 0.00% |
+
+Across the native arms, **85 peg faults and 76 retried, 89%**. And this file has described
+`header-transposition` as *"the fault that costs a whole round: the call never reaches the client,
+so the model reads files for its entire budget and writes nothing."* It is now the dominant class,
+75 of 99 — and the arm that hit 85 of them went 18 for 18. **A retry neutralises it.** The
+description was accurate for a loop that could not re-ask and is wrong for one that can.
+
+The 9 unretried faults are not sampling noise either: one round produced four failures on a single
+turn, exhausting `PEG_RETRIES=3`. Four independent draws at the observed per-completion rate would
+be about one in ten thousand, so that conversation state emits malformed harmony deterministically
+— consistent with the temperature-0 result in docs/local-models.md. Retries recover the large
+majority; a minority are context-locked and no retry count reaches them.
+
+### semantic, n=8 per arm
+
+| | control | native |
+| --- | ---: | ---: |
+| accepted | 4/8 | 7/8 |
+| correct under 4000-trial fuzzing | 7/8 | **8/8** |
+| seconds per usable patch | 249 | 143 |
+| tokens per usable patch | 13,418 | 8,797 |
+
+One wrong implementation in sixteen, and it passed all nine criteria. See the tenth criterion added
+above.
