@@ -404,8 +404,86 @@ check)
         echo "plans for this project live in ${PLANS_DIR#"$REPO_ROOT"/}" >&2
         exit 1
     }
-    "$CHECKER" "$PLAN_FILE"
-    exit $?
+    "$CHECKER" "$PLAN_FILE" || exit $?
+
+    # --dry-run: run every acceptance command against the tree AS IT IS NOW, before any model time
+    # is spent, and show what each one actually saw.
+    #
+    # This turns two failures that used to cost a whole round into a ten-second read:
+    #
+    #   already PASSES   the criterion does not test the change. It was true before the work
+    #                    started, so it will be true afterwards whatever the model does.
+    #   cannot pass      an unsatisfiable command — one that greps for a pattern the tool never
+    #                    emits, asserts a count the file already violates, or matches against
+    #                    coloured output. Reported from real use twice: a plan asserted zero double
+    #                    blank lines in a file that already had eleven, and another grepped
+    #                    `Tests:[^0-9]*77 passed` against output whose colour escapes contain
+    #                    digits. Both are indistinguishable from a broken implementation once a
+    #                    round has been spent.
+    #
+    # A failing command here is NORMAL — the work has not been done yet. The point is that you read
+    # the output and can say why each one fails.
+    if [[ "${3:-}" == "--dry-run" || "${HANDOFF_DRY_RUN:-}" == "1" ]]; then
+        echo
+        echo "==> acceptance commands against the CURRENT tree (no model, nothing changed)"
+        DRY_CMDS="$(mktemp)"
+        awk '
+            /^## Verification/ { in_section=1; next }
+            in_section && /^## / { exit }
+            in_section && /^```/ { if (in_block) exit; in_block=1; next }
+            in_block && NF { print }
+        ' "$PLAN_FILE" >"$DRY_CMDS"
+        DRY_IDX=0; DRY_PASS=0
+        while IFS= read -r dry_command; do
+            DRY_IDX=$(( DRY_IDX + 1 ))
+            # The assignment IS the condition, deliberately. `set -e` is in force, and a plain
+            # `DRY_OUT="$(...)"` whose command fails aborts the whole script — which is every
+            # criterion here, since the work has not been done yet. The first version of this
+            # printed the heading and then silently exited before a single line.
+            if DRY_OUT="$(cd "$REPO_ROOT" && NO_COLOR=1 TERM=dumb CLICOLOR=0 \
+                timeout 120 bash -o pipefail -c "$dry_command" 2>&1)"; then
+                DRY_PASS=$(( DRY_PASS + 1 ))
+                printf '  %2d  ALREADY PASSES  %s\n' "$DRY_IDX" "${dry_command:0:88}"
+                echo "      ^ this criterion does not test the change — it was true before it"
+            else
+                printf '  %2d  fails now       %s\n' "$DRY_IDX" "${dry_command:0:88}"
+            fi
+            # Show the output with control characters VISIBLE. The whole point of this mode is
+            # the colour trap, and colour is invisible in a terminal by construction — the escapes
+            # are what you need to see. `cat -v` renders them as ^[[90m, which is the form the
+            # failure is recognisable in.
+            if [[ -n "$DRY_OUT" ]]; then
+                sed -n '1,2p' <<<"$DRY_OUT" | cat -v | sed 's/^/      | /'
+            elif [[ "$dry_command" == *"|"* ]]; then
+                # A silent failure in a pipeline tells you nothing, and "drop -q" does not help:
+                # a grep that does not MATCH prints nothing either way. The only thing that shows
+                # the trap is the input the last stage was matching against, so run the pipeline
+                # up to the final `|` and show that instead.
+                #
+                # This is what turns the colour failure from a mystery into an obvious one: the
+                # escapes appear, rendered by cat -v, and `Tests:[^0-9]*77 passed` is visibly
+                # unable to span ^[[39m. It re-runs the left-hand side, so it costs whatever that
+                # costs — acceptable in a mode whose entire purpose is inspection.
+                DRY_LEFT="${dry_command%|*}"
+                echo "      | (silent. What its last stage was matching against:)"
+                if DRY_IN="$(cd "$REPO_ROOT" && NO_COLOR=1 TERM=dumb CLICOLOR=0 \
+                    timeout 60 bash -o pipefail -c "$DRY_LEFT" 2>&1)"; then :; fi
+                if [[ -n "$DRY_IN" ]]; then
+                    sed -n '1,3p' <<<"$DRY_IN" | cat -v | sed 's/^/      | /'
+                else
+                    echo "      |  (nothing — the left-hand side produced no output either)"
+                fi
+            else
+                echo "      | (no output — a silent command, so there is nothing to show. Run it"
+                echo "      |  yourself if the reason it fails is not obvious.)"
+            fi
+        done <"$DRY_CMDS"
+        rm -f "$DRY_CMDS"
+        echo
+        echo "  $DRY_PASS of $DRY_IDX already pass. Every one of those needs a reason, and"
+        echo "  every failure above should fail for the reason you expect — read the output."
+    fi
+    exit 0
     ;;
 
 verify)

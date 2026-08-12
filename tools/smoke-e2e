@@ -988,6 +988,50 @@ else
     fail "sync-bench-clone would delete the archives bench/run --force creates"
 fi
 
+# --- the pre-flight dry run -----------------------------------------------------------------
+# Two failures used to cost a whole round each and are now a ten-second read: a criterion that
+# ALREADY passes (so it does not test the change), and one that cannot pass over any tree. The
+# second is only diagnosable if the escapes are visible, which is why the silent-pipeline case
+# re-runs the left-hand side.
+DRY_REPO="$SANDBOX/dryrun"
+mkdir -p "$DRY_REPO/.handoff/plans" "$DRY_REPO/src"
+( cd "$DRY_REPO" && git init -q && echo x >src/a.php && git add -A &&
+  git -c user.email=t@t.invalid -c user.name=t commit -qm init ) >/dev/null 2>&1
+cat >"$DRY_REPO/colour" <<'COLOUR'
+#!/bin/bash
+printf '\033[90mTests:\033[39m    \033[32;1m77 passed\033[39;22m\n'
+COLOUR
+chmod +x "$DRY_REPO/colour"
+cat >"$DRY_REPO/.handoff/plans/dry.md" <<'DRYPLAN'
+# Dry
+
+## Files to touch
+
+| Path | Action |
+| --- | --- |
+| `src/a.php` | modify |
+
+## Acceptance criteria
+
+- [ ] src exists
+- [ ] the suite reports 77 passing
+
+## Verification
+
+```bash
+test -d src
+./colour | grep -qE 'Tests:[^0-9]*77 passed'
+```
+DRYPLAN
+DRY_OUT="$( cd "$DRY_REPO" && "$REPO/bin/handoff" check dry --dry-run 2>&1 )"
+if ! grep -q "ALREADY PASSES" <<<"$DRY_OUT"; then
+    fail "the dry run does not flag a criterion that already passes before the work"
+elif ! grep -q '\^\[\[90mTests:' <<<"$DRY_OUT"; then
+    fail "the dry run does not reveal the escapes a silent pipeline was matching against"
+else
+    pass "the dry run flags a criterion that already passes, and shows what a silent one matched"
+fi
+
 # --- setup --check claimed the skills were fine when none were installed ------------------------
 # It asked `build-integrations --check`, which compares the repository's GENERATED files against
 # their sources — a question about the checkout, not about what is installed. So it passed happily

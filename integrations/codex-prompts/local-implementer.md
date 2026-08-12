@@ -422,8 +422,19 @@ other plausible improvements to the retry path already were.
 
 ## Acceptance commands that read tool output must not grep for colour
 
-The harness runs every acceptance command with `NO_COLOR=1` and `TERM=dumb`, so this is handled by
-default. It is worth knowing anyway, because it produced the most confusing failure yet reported:
+The harness runs every acceptance command with `NO_COLOR=1`, `TERM=dumb` and `CLICOLOR=0`. **That
+is a reduction in risk, not a guarantee, and you must not rely on it.** Those variables are a
+convention, and a tool that ignores them still colours its output — Laravel's test runner is
+exactly such a tool, because it prints through Collision, which honours none of them. A reader who
+trusted this paragraph in its earlier, stronger form dropped their own `sed` guard and lost a round
+to it.
+
+**So: pass the tool's own flag whenever it has one.** `artisan test --colors=never`,
+`pytest --color=no`, `rg --color never`, `git --no-pager`. Then confirm with
+`handoff check <slug> --dry-run`, which runs every criterion against the current tree and shows you
+the output it is matching against.
+
+The failure this produced is worth seeing, because it is the most confusing kind:
 
 ```
 php artisan test | grep -qE 'Tests:[^0-9]*77 passed'
@@ -444,7 +455,36 @@ the diff.
 Prefer counting to pattern-matching where you can: `test "$(… | grep -c …)" -eq 0` survives
 formatting changes that a shape-matching regex does not.
 
+## A follow-up plan must name the files it is KEEPING
+
+When a round half-works and you keep the good part, the next plan covers only what is left — and
+the scope gate then charges the kept work as "modified out of scope", because those files changed
+against the base commit and the new plan does not name them. Reported from real use: a follow-up
+passed 6 of 6 criteria and was still `patch-damaged` for four deletions the reviewer had
+deliberately kept.
+
+**List them under `## Files to touch` with the action `keep`,** or the gate is measuring the
+previous round rather than this one. The rule is that the plan's file list describes the tree's
+whole diff from the base commit, not just the increment you are asking for.
+
+## Size a step by what it must READ, not by how many files it writes
+
+File count is the obvious heuristic and it is the wrong one. A step of four one-line deletions plus
+"find two passages inside a 468-line file" looks tiny — five files, five trivial edits — and it
+blew the turn limit, because the cost was never the writing. It was holding 468 lines of context
+while looking for two things in it.
+
+Bundling a surgical edit with trivial deletions is the specific trap: **the deletions make the step
+look small and the surgical part sets the real depth.** Split the reading-heavy edit into its own
+round.
+
 ## Two things the gates cannot see
+
+**Assert whitespace in BOTH directions.** A criterion counting *added* blank lines does not catch a
+*removed* one, and removal is just as common: a heading came back flush against the paragraph above
+it because the blank line that separated them was eaten. If you assert on blank lines, pin the
+exact count rather than an upper bound — and check the count against the current tree first, since
+a file that already violates it makes the criterion unsatisfiable.
 
 **Whitespace scarring — a risk of EDIT steps, not delete steps.** This tells you which rounds need
 the manual read: a step that only deletes whole files has no surviving edited file to scar, and a
