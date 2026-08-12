@@ -61,6 +61,23 @@ done
 
 echo
 echo "$CHECKED implementation(s) fuzzed."
+
+# Nothing fuzzed is not a clean bill of health.
+#
+# This takes the PLAN directory and iterates the arms beneath it. Handed an ARM directory instead,
+# it reads each run as an arm, finds no tree.diff below that, checks nothing, and exits 0 — which
+# reads in a queue log as "no wrong implementations found".
+#
+# That is exactly how it was broken: a queue job was narrowed to bench/results/semantic/native to
+# stop it reporting a finding from an earlier night, and the narrowing silently disabled the only
+# check in this project that can catch an answer the gates accepted and the specification rejects.
+# A fix for a noisy signal turned it into no signal.
+if (( CHECKED == 0 )); then
+    echo
+    echo "NOTHING WAS CHECKED. This is not a pass."
+    echo "Point this at the PLAN directory — bench/results/semantic — not at one arm inside it."
+    exit 2
+fi
 if (( BAD > 0 )); then
     echo "$BAD were ACCEPTED BY THE GATES AND ARE WRONG. That is a criteria gap, not a model failure:"
     echo "the plan's examples do not discriminate the case they disagree on. Find a discriminating"
