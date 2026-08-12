@@ -54,7 +54,7 @@ BASE="$(git rev-parse HEAD)"
 
 restore() { git checkout --quiet -- file.php; }
 
-echo "==> 1/6 a clean surgical edit is accepted"
+echo "==> 1/7 a clean surgical edit is accepted"
 python3 - <<'PY'
 import pathlib
 p = pathlib.Path("file.php")
@@ -71,7 +71,7 @@ else
 fi
 restore
 
-echo "==> 2/6 deleting an original line is rejected"
+echo "==> 2/7 deleting an original line is rejected"
 sed -i '/public function addLine/,+3d' file.php
 if "$SHAPE" "$BASE" file.php --allow-changed '        return $total;' 2>"$WORK/err2"; then
     fail "a deleted method was accepted"
@@ -81,7 +81,7 @@ else
 fi
 restore
 
-echo "==> 3/6 reordering methods is rejected — the old grep-per-line check passed this"
+echo "==> 3/7 reordering methods is rejected — the old grep-per-line check passed this"
 python3 - <<'PY'
 import pathlib, re
 p = pathlib.Path("file.php")
@@ -102,7 +102,7 @@ else
 fi
 restore
 
-echo "==> 4/6 deleting one of two identical lines is rejected"
+echo "==> 4/7 deleting one of two identical lines is rejected"
 printf '\n$x = 0;\n$x = 0;\n' >>file.php
 git add file.php && git commit --quiet -m dup
 DUP_BASE="$(git rev-parse HEAD)"
@@ -122,7 +122,7 @@ fi
 git checkout --quiet -- file.php
 git reset --quiet --hard "$BASE"
 
-echo "==> 5/6 an insertion between two lines passes the order check — as documented"
+echo "==> 5/7 an insertion between two lines passes the order check — as documented"
 # The failure that motivated all of this: a signature separated from its body, altering neither
 # line. Nothing is removed and nothing is reordered, so order-preservation cannot see it.
 python3 -c "
@@ -137,7 +137,7 @@ else
 fi
 restore
 
-echo "==> 6/6 a scattered change is caught by the hunk bound instead"
+echo "==> 6/7 a scattered change is caught by the hunk bound instead"
 python3 - <<'PY'
 import pathlib
 p = pathlib.Path("file.php")
@@ -161,6 +161,33 @@ else
     grep -q 'changed in [0-9]* places' "$WORK/err6" &&
         pass "the hunk bound catches what order-preservation cannot" ||
         fail "rejected, but not by the hunk bound"
+fi
+restore
+
+echo "==> 7/7 a file appended to itself is one hunk, and --max-added is what bounds it"
+# Case 7: one hunk, and the whole file appended to itself.
+#
+# Found by fuzzing, not by design. Every original line survives in order, nothing is removed, and
+# it is a SINGLE insertion point — so the order check, the removal check and --max-hunks all pass
+# a file that now contains two copies of its own implementation. That is the shape agent-rules.md
+# calls "never leave an earlier attempt beside a later one"; in PHP a duplicate class is a fatal
+# redeclaration the tests catch, in a view or a stylesheet it renders.
+python3 - "$WORK/repo/file.php" <<'PY2'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1])
+p.write_text(p.read_text() * 2)
+PY2
+if "$SHAPE" "$BASE" file.php --max-hunks 1 2>/dev/null; then
+    pass "the known limit is visible: a doubled file is one hunk and passes the hunk bound"
+else
+    fail "a doubled file was rejected by --max-hunks, so this case no longer documents the limit"
+fi
+if "$SHAPE" "$BASE" file.php --max-hunks 1 --max-added 5 2>"$WORK/err7"; then
+    fail "a doubled file passed --max-added 5"
+else
+    grep -q 'added [0-9]* lines' "$WORK/err7" &&
+        pass "--max-added bounds how much arrives, where --max-hunks bounds only where" ||
+        fail "rejected, but not by the added-line bound"
 fi
 restore
 

@@ -2,7 +2,7 @@
 #
 # patch-shape — assert that a change to a tracked file has the shape a surgical plan asked for.
 #
-#   tools/patch-shape <base-ref> <path> [--max-hunks N] [--allow-changed <line>]...
+#   tools/patch-shape <base-ref> <path> [--max-hunks N] [--max-added N] [--allow-changed <line>]...
 #
 # Plans currently assert "nothing else changed" with a loop that greps each original line out of
 # the modified file. That check has three holes, and this replaces it:
@@ -29,11 +29,18 @@
 # and one changed return line is asking for a handful of hunks; a change scattered across a dozen
 # places in the file is not that change, whatever the tests say. --max-hunks makes the plan state
 # the number, and the harness enforce it.
+#
+# What --max-hunks does NOT bound is how much arrives at each point, and --max-added exists for
+# that. Appending an entire second copy of a file is ONE hunk: every original line survives, in
+# order, nothing is removed, and the shape checks all pass. That is the shape of the failure
+# templates/agent-rules.md names as "never leave an earlier attempt beside a later one" — and in
+# PHP a duplicate class is a fatal redeclaration the tests catch, while in a view or a stylesheet
+# it renders and passes. Found by fuzzing: a doubled 60-line file passed at --max-hunks 1.
 
 set -uo pipefail
 
 usage() {
-    echo "usage: patch-shape <base-ref> <path> [--max-hunks N] [--allow-changed <line>]..." >&2
+    echo "usage: patch-shape <base-ref> <path> [--max-hunks N] [--max-added N] [--allow-changed <line>]..." >&2
 }
 
 BASE_REF="${1:-}"
@@ -42,6 +49,7 @@ TARGET="${2:-}"
 shift 2
 
 MAX_HUNKS=""
+MAX_ADDED=""
 ALLOWED_FILE="$(mktemp)"
 trap 'rm -f "$ALLOWED_FILE" "${ORIGINAL_FILE:-}" "${REMOVED_FILE:-}"' EXIT
 : >"$ALLOWED_FILE"
@@ -51,6 +59,11 @@ while (( $# > 0 )); do
     --max-hunks)
         [[ $# -ge 2 ]] || { echo "--max-hunks requires a number" >&2; exit 64; }
         MAX_HUNKS="$2"
+        shift 2
+        ;;
+    --max-added)
+        [[ $# -ge 2 ]] || { echo "--max-added requires a number" >&2; exit 64; }
+        MAX_ADDED="$2"
         shift 2
         ;;
     --allow-changed)
@@ -66,6 +79,10 @@ while (( $# > 0 )); do
     esac
 done
 
+[[ -z "$MAX_ADDED" || "$MAX_ADDED" =~ ^[0-9]+$ ]] || {
+    echo "--max-added must be a non-negative integer" >&2
+    exit 64
+}
 [[ -z "$MAX_HUNKS" || "$MAX_HUNKS" =~ ^[0-9]+$ ]] || {
     echo "--max-hunks must be a non-negative integer" >&2
     exit 64
@@ -104,6 +121,14 @@ if [[ -n "$MAX_HUNKS" ]]; then
     HUNKS="$(git diff --unified=0 "$BASE_REF" -- "$TARGET" | grep -c '^@@' || true)"
     if (( HUNKS > MAX_HUNKS )); then
         echo "patch-shape: $TARGET changed in $HUNKS places, at most $MAX_HUNKS allowed" >&2
+        STATUS=1
+    fi
+fi
+
+if [[ -n "$MAX_ADDED" ]]; then
+    ADDED="$(git diff --unified=0 "$BASE_REF" -- "$TARGET" | grep -c '^+[^+]' || true)"
+    if (( ADDED > MAX_ADDED )); then
+        echo "patch-shape: $TARGET added $ADDED lines, at most $MAX_ADDED allowed" >&2
         STATUS=1
     fi
 fi
