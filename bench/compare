@@ -168,13 +168,45 @@ def main() -> int:
     print(f"n = {len(control)} control, {len(treatment)} treatment.")
 
     # Configuration differences worth knowing before reading anything below.
-    for field, label in (("harness_commit", "harness"), ("feedback_detail", "feedback"),
-                         ("harness_dirty", "uncommitted harness changes")):
+    #
+    # These used to print as bare field dumps -- "harness: control 628e3b2, treatment d2aaf47" --
+    # above a table of p-values, and round 10 shipped a comparison across two harnesses anyway. A
+    # line that states a fact the reader must interpret is not a warning. Name the consequence.
+    for field, label in (("feedback_detail", "feedback"),):
         a = {r.get(field) for r in control}
         b = {r.get(field) for r in treatment}
         if a != b and a and b:
             print(f"  {label}: control {'/'.join(sorted(map(str, a)))}, "
                   f"treatment {'/'.join(sorted(map(str, b)))}")
+
+    # `harness_tree` hashes the working tree the run executed, so it catches the case
+    # `harness_commit` cannot: same commit, different uncommitted edits. Prefer it, and fall back
+    # to commit+dirty for runs recorded before it existed.
+    def harness_of(rows: list[dict]) -> set[str]:
+        seen = set()
+        for r in rows:
+            tree = r.get("harness_tree")
+            if tree:
+                seen.add(f"tree:{tree[:10]}")
+            else:
+                dirty = "+edits" if r.get("harness_dirty") == "1" else ""
+                seen.add(f"{r.get('harness_commit', 'unknown')}{dirty}")
+        return seen
+
+    control_h, treatment_h = harness_of(control), harness_of(treatment)
+    unpinned = [r for arm_rows in (control, treatment) for r in arm_rows
+                if not r.get("harness_tree") and r.get("harness_dirty") == "1"]
+    if control_h != treatment_h and control_h and treatment_h:
+        print()
+        print(f"> **CONFOUNDED — the arms ran under different harnesses.** control "
+              f"{'/'.join(sorted(control_h))}, treatment {'/'.join(sorted(treatment_h))}.")
+        print("> Any difference below is the harness plus the variable, and this data cannot"
+              " separate them. Re-run one arm under the other's harness before reading it.")
+    elif unpinned:
+        print()
+        print(f"> **Harness not pinned** — {len(unpinned)} run(s) recorded `harness_dirty=1` with no"
+              " `harness_tree`, so 'same harness' here means 'same commit plus unknown edits'.")
+        print("> Runs recorded before harness_tree existed cannot be verified as comparable.")
 
     truncated = [r for arm_rows in (control, treatment) for r in arm_rows
                  if r.get("truncated_requests", "0") not in ("0", "")]
