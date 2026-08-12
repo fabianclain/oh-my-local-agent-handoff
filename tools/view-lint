@@ -95,6 +95,9 @@ class Balance(HTMLParser):
         self.component_errors: list[str] = []
         self.tags: set[str] = set()
         self.ids: list[str] = []
+        # How many elements the balance check actually applied to. Reported so the pass message
+        # states its denominator instead of asserting a result that is vacuous at zero.
+        self.checked = 0
 
     def report(self, tag: str, message: str) -> None:
         (self.component_errors if is_component(tag) else self.errors).append(message)
@@ -106,6 +109,7 @@ class Balance(HTMLParser):
             if key.lower() == "id" and value:
                 self.ids.append(value)
         if tag not in VOID:
+            self.checked += 1
             self.stack.append((tag, self.getpos()[0]))
 
     def handle_startendtag(self, tag, attrs):
@@ -204,6 +208,26 @@ def main() -> int:
         return 2
     raw = path.read_text(errors="replace")
 
+    # A file with nothing in it is not well-formed markup; it is an absence.
+    #
+    # Reporting "every element that requires an end tag has one" over an empty file is true and
+    # useless: the statement is vacuous at zero elements, and it converts "nothing was written"
+    # into a green gate. This tool runs as an acceptance criterion in real plans, so an empty
+    # deliverable would have passed the only gate looking at the markup.
+    #
+    # Exit 2 rather than 1, following the convention the rest of the harness uses: this is not a
+    # verdict of malformed, it is a refusal to give a verdict at all — the same distinction
+    # css-contrast draws when it lists what it could not resolve instead of passing over it.
+    #
+    # Only a file that is empty or all whitespace is treated this way. A file with text and no
+    # tags is a legitimate shape — a Blade partial that is nothing but directives strips to
+    # exactly that — and failing it would be a false positive on real templates.
+    if not raw.strip():
+        print(f"{path}")
+        print("\n  NOTHING TO CHECK — the file is empty.")
+        print("  This is not a pass. A gate cannot certify markup that does not exist.")
+        return 2
+
     conditional = bool(BLADE_CONDITIONAL.search(raw))
     text = raw
     for pattern in (PHP_BLOCK, BLADE_PHP, BLADE_EXPR, BLADE_DIRECTIVE):
@@ -231,8 +255,15 @@ def main() -> int:
             print("\n  This file has Blade conditionals. A tag opened in one branch and closed in")
             print("  another is legitimate and cannot be checked here — read the lines above")
             print("  before believing them.")
+    elif balance.checked:
+        print(f"\n  well-formed: all {balance.checked} element(s) that require an end tag have"
+              " one, in order")
     else:
-        print("\n  well-formed: every element that requires an end tag has one, in order")
+        # Content, but no element the check applies to — a text fragment, or bytes that are not
+        # markup at all. Saying "well-formed" here states a result over an empty denominator,
+        # which is the shape this project has had to retract numbers for before.
+        print("\n  no elements requiring an end tag were found, so nothing was checked.")
+        print("  That is not the same as well-formed.")
 
     if advisories:
         print("\n  advisory:")

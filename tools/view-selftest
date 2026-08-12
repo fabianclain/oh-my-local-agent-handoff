@@ -121,6 +121,22 @@ SMALL_TEXT = LARGE_TEXT.replace("font-size: 30px", "font-size: 14px")
 
 VIEW_CASES = [
     # (name, file contents, suffix, must appear, must not appear, expected exit)
+
+    # A gate that certifies an absence is the failure this project keeps finding. view-lint
+    # reported "every element that requires an end tag has one" over an EMPTY file and exited 0,
+    # so a plan whose markup gate is this one would have passed an empty deliverable.
+    ("an empty file is refused, not certified",
+     "", ".html", ["NOTHING TO CHECK", "not a pass"], ["well-formed"], 2),
+
+    ("a whitespace-only file is refused too",
+     "\n\n   \n", ".html", ["NOTHING TO CHECK"], ["well-formed"], 2),
+
+    # The pass message states its denominator. "every element ... has one" is vacuously true at
+    # zero, and this project has had to retract numbers whose denominator was not what the label
+    # said -- see tools/turn-economy-selftest, which exists entirely for that shape.
+    ("the pass states how many elements were checked",
+     "<html><body><main><h1>T</h1></main></body></html>",
+     ".html", ["well-formed: all 4 element(s)"], ["MALFORMED"], 0),
     ("an opening tag renamed and the closing one left behind",
      "<html><body><section class=\"card\"><h1>T</h1></div></body></html>",
      ".html", ["MALFORMED", "</div> closes nothing"], [], 1),
