@@ -39,15 +39,75 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import importlib.util
 import json
 import os
 import pathlib
 import subprocess
 import sys
+from importlib.machinery import SourceFileLoader
 
 INFRA_ERRORS = {"tool-call-format", "context-overflow", "connection", "timeout",
                 "context-budget", "harness-io", "harness-encoding", "harness-postcondition",
                 "harness-scope"}
+
+
+def plan_lint():
+    """tools/plan-lint, imported rather than reimplemented.
+
+    A second parser of the same section is how check-plan and verify-round drifted, and the
+    agreement check in selftest-all exists because of it. Here the stakes are higher than usual:
+    if this file decided on its own which states count as gated, a round-up could report full
+    coverage over a plan the linter had already warned about.
+    """
+    path = pathlib.Path(__file__).resolve().parent / "plan-lint"
+    if not path.exists():
+        return None
+    spec = importlib.util.spec_from_file_location(
+        "plan_lint", path, loader=SourceFileLoader("plan_lint", str(path)))
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception:  # noqa: BLE001
+        return None
+    return module
+
+
+def ungated_states(record: dict, repo: pathlib.Path) -> tuple[list[str], list[str]]:
+    """(declared unverifiable, named but never gated) for the plan this round actually ran.
+
+    The ARCHIVED plan, not the one on disk. `.handoff/journal/runs/<id>/plan.md` is a copy taken
+    at run time; the working file may have been rewritten between rounds, and reporting a later
+    plan's states against an earlier round's score would be a quiet lie about what was covered.
+    """
+    lint = plan_lint()
+    if lint is None:
+        return [], []
+    candidates = []
+    archive = record.get("archive")
+    if archive:
+        candidates.append(repo / archive / "plan.md")
+    path = ((record.get("plan") or {}).get("path"))
+    if path:
+        candidates.append(pathlib.Path(path))
+    for candidate in candidates:
+        try:
+            if not candidate.is_file():
+                continue
+            text = candidate.read_text(errors="replace")
+        except OSError:
+            continue
+        wanted, declared = lint.state_names(text)
+        if not wanted and not declared:
+            return [], []
+        haystack = " ".join(lint.criteria(text) + lint.verification_commands(text)).lower()
+        ungated = []
+        for name, bullet in wanted:
+            tokens = lint.distinctive(bullet)
+            if tokens and not any(token in haystack for token in tokens):
+                ungated.append(name)
+        return declared, ungated
+    return [], []
 
 
 def journal_records(repo: pathlib.Path) -> list[dict]:
@@ -170,6 +230,36 @@ def render(records: list[dict], slug: str, repo: pathlib.Path) -> str:
         lines.append("")
     if not said_something:
         lines += ["Nothing mechanical to report — every round passed its gates.", ""]
+
+    # What the score does not cover.
+    #
+    # A score is a fraction of the criteria, and it is read as a fraction of the work. Those are
+    # the same number only when every state the plan names has a criterion. In the round that
+    # prompted this, four viewport and theme states were named, none was gated, the round scored
+    # 6/6, and the page shipped with two contrast failures and an unscrollable overflow.
+    #
+    # The reviewer's own words: "I'd rather the skill forced that admission than let a 6/6 read as
+    # coverage." So the admission is printed here, next to the score, rather than left to memory.
+    declared_all: list[str] = []
+    ungated_all: list[str] = []
+    for r in records:
+        declared, ungated = ungated_states(r, repo)
+        declared_all += [d for d in declared if d not in declared_all]
+        ungated_all += [u for u in ungated if u not in ungated_all]
+    if declared_all or ungated_all:
+        lines += ["## What the score does not cover", ""]
+        if declared_all:
+            lines += ["The plan declared these states unverifiable. No command was run for them, "
+                      "and", "the score above is not a claim about any of them.", ""]
+            lines += [f"- {name}" for name in declared_all] + [""]
+        if ungated_all:
+            lines += ["These states are named in the plan and no criterion mentions them. That is "
+                      "the",
+                      "same absence as the list above; the only difference is that the plan did "
+                      "not say so.", ""]
+            lines += [f"- {name}" for name in ungated_all] + [""]
+            lines += ["`handoff prepare <slug>` reports these before the round, where they can "
+                      "still", "become criteria.", ""]
 
     # The blanks. Deliberately not guessed at: see the module docstring.
     lines += [

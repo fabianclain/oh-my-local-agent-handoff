@@ -38,10 +38,18 @@ def record(**kw) -> dict:
     return base
 
 
-def run(records: list[dict]) -> str:
+def run(records: list[dict], plan: str | None = None) -> str:
     with tempfile.TemporaryDirectory() as tmp:
         repo = pathlib.Path(tmp) / "repo"
         (repo / ".handoff" / "journal").mkdir(parents=True)
+        if plan is not None:
+            # Where the journal archives the plan a round actually ran, which is the only copy
+            # that can be trusted: the working file is routinely rewritten between rounds.
+            for record in records:
+                archive = repo / ".handoff" / "journal" / "runs" / record["run_id"]
+                archive.mkdir(parents=True, exist_ok=True)
+                (archive / "plan.md").write_text(plan)
+                record["archive"] = f".handoff/journal/runs/{record['run_id']}"
         subprocess.run(["git", "init", "-q", str(repo)], check=True)
         (repo / "a.txt").write_text("x\n")
         subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
@@ -99,6 +107,47 @@ CASES = [
      ["| 11 |"], [], "all"),
 ]
 
+# --- what the score does not cover ------------------------------------------------------------
+#
+# A score is a fraction of the criteria and is read as a fraction of the work. Those are the same
+# number only when every state the plan names is gated. A 6/6 over four ungated viewport and theme
+# states is the round this exists for.
+
+PLAN_HEAD = """# t
+## Files to touch
+| Path | Action |
+| --- | --- |
+| `src/a.php` | modify |
+## Acceptance criteria
+- [ ] the header renders
+## Verification
+```bash
+grep -q header src/a.php
+```
+"""
+
+PLAN_UNGATED = PLAN_HEAD + "\n## States to handle\n\n- **Dark theme** — the palette inverts\n"
+PLAN_DECLARED = PLAN_HEAD + "\n## States to handle\n\n- [unverifiable] dark theme contrast\n"
+PLAN_GATED = (PLAN_HEAD.replace("grep -q header src/a.php", "grep -q 'dark theme' src/a.php")
+              + "\n## States to handle\n\n- **Dark theme** — the palette inverts\n")
+
+PLAN_CASES = [
+    ("a state named and never gated is printed next to the score",
+     PLAN_UNGATED, ["What the score does not cover", "Dark theme"], []),
+
+    ("a state declared unverifiable is printed as the plan's own admission",
+     PLAN_DECLARED, ["What the score does not cover", "dark theme contrast",
+                     "declared these states unverifiable"], []),
+
+    # The check has to be silent when the plan did its job, or the section becomes wallpaper and
+    # the one round that needed it reads like every other.
+    ("a plan whose states are all gated says nothing",
+     PLAN_GATED, [], ["What the score does not cover"]),
+
+    ("a plan with no states section says nothing",
+     PLAN_HEAD, [], ["What the score does not cover"]),
+]
+
 
 def main() -> int:
     if not ROUNDUP.exists():
@@ -131,11 +180,24 @@ def main() -> int:
             failures += 1
         else:
             print(f"pass  {name}")
+
+    for name, plan, must, must_not in PLAN_CASES:
+        out = run([record()], plan=plan)
+        problems = [f"missing {m!r}" for m in must if m not in out]
+        problems += [f"must not contain {m!r}" for m in must_not if m in out]
+        if problems:
+            print(f"FAIL  {name}")
+            for problem in problems:
+                print(f"        {problem}")
+            failures += 1
+        else:
+            print(f"pass  {name}")
+
     print()
     if failures:
         print(f"{failures} check(s) failed")
         return 1
-    print(f"{len(CASES)} check(s) passed")
+    print(f"{len(CASES) + len(PLAN_CASES)} check(s) passed")
     return 0
 
 
