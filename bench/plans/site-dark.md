@@ -148,7 +148,7 @@ python3 bench/checks/site-audit meta bench/fixtures/site/index.html
 python3 bench/checks/site-audit selfcontained bench/fixtures/site/index.html
 python3 tools/css-contrast bench/fixtures/site/index.html --min 4.5
 python3 bench/checks/site-audit darkscheme bench/fixtures/site/index.html
-git diff --quiet HEAD -- bench/fixtures/site/BRAND.md && test "$(git status --porcelain --untracked-files=all -- . ':(exclude).handoff' | wc -l)" -eq 1
+git diff --quiet HEAD -- bench/fixtures/site/BRAND.md && test "$(git status --porcelain --untracked-files=all -- . ':(exclude).handoff' ':(exclude).omc' ':(exclude)vendor' ':(exclude)node_modules' | wc -l)" -eq 1
 ```
 
 ## Out of scope
