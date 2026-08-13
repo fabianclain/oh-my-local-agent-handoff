@@ -67,6 +67,41 @@ evidence into apparent evidence of correctness.
 | `truncated_requests`, `context_overflows` | a run that silently lost history is a configuration result, not a model result |
 | `usage_unattributable` | set when the server log shrank mid-round, so tokens cannot honestly be assigned |
 
+### `events.jsonl` — the same round, in one vocabulary
+
+Written beside the artifacts by `bin/handoff`, and by `tools/run-events` for anything after the
+fact. It is a **view**, not a replacement: `provider.log` stays authoritative, because twelve tools
+read its names and 258 preserved runs encode them.
+
+| Event | When |
+| --- | --- |
+| `ai-run-start` | a round began — slug, plan, base tree |
+| `ai-run-resume` | a round continued an existing provider session |
+| `message.append` | the model produced prose or reasoning |
+| `tool.append` | the model called a tool, with its name and whether it succeeded |
+| `run.event` | a gate ran, with its command and status |
+| `run.state` | the round changed state — notably entering repair |
+| `ai-run-end` | terminal, carrying the verdict **the gates reached** |
+
+That last row is the rule the rest of the harness follows, restated in event form: a provider that
+exited cleanly over a rejected tree ends `rejected`, and one that died over an accepted tree ends
+`accepted`. The report is untrusted metadata.
+
+The names live in one place — `VOCABULARY` in `tools/run-events` — so changing one is a one-line
+edit. `tools/smoke-e2e` asserts that a real round's stream begins with `ai-run-start`, ends with
+`ai-run-end`, carries at least one `run.event`, and contains nothing outside the vocabulary.
+
+Two subcommands turn existing artifacts into it without instrumenting anything:
+
+```bash
+tools/run-events translate <provider.log> <events.jsonl>   # the model's stream
+tools/run-events gates <evidence.json> <events.jsonl>      # what each gate said
+tools/run-events vocabulary                                # the definition
+```
+
+Emission is best-effort throughout. A failure to write an event must never fail a round, which is
+why every call is `|| true`.
+
 ---
 
 ## 2. Server-side — `~/.cache/agent-handoff/llamacpp.log`

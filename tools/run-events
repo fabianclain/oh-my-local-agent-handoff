@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""run-events — one vocabulary for what a round did, without renaming what already exists.
+
+    tools/run-events vocabulary
+    tools/run-events emit <events.jsonl> <event> [key=value ...]
+    tools/run-events translate <provider.log> <events.jsonl> [--attempt N]
+
+WHY THIS IS A TRANSLATOR AND NOT A RENAME
+
+The harness already has an event stream: `provider.log`, one JSON object per line, written by the
+agent loop. Twelve tools and selftests read it — turn-economy, report-audit, final-turn-shape,
+journal, replay-final-turn — and 258 preserved runs encode its names. Renaming
+`content_end`/`iteration_start`/`run_result` would break every one of those and make the archive
+unreadable by the tools built to read it, which is a permanent version of a loss this project has
+already taken once.
+
+So `provider.log` stays authoritative and unchanged. `events.jsonl` is a second, canonical-vocabulary
+VIEW of the same round, written beside it. Nothing reads it yet; it exists so that the vocabulary is
+consistent and defined in exactly one place.
+
+THE VOCABULARY
+
+    ai-run-start     a round began — plan, slug, attempt, base tree
+    ai-run-resume    a round continued an existing provider session
+    message.append   the model produced a block of prose or reasoning
+    tool.append      the model called a tool, with the tool's name and whether it succeeded
+    run.event        an acceptance command ran, with its exit code
+    run.state        the round changed state — notably entering repair with the failing commands
+    ai-run-end       terminal, carrying the verdict the GATES reached, never the model's claim
+
+Three of those names were given as partial — "structured append/event", "run event", "step/run
+state". They are made concrete here as `tool.append`, `run.event` and `run.state`. Changing any of
+them is a one-line edit to VOCABULARY below, and nothing else in the harness depends on them.
+
+WHAT AN EVENT IS NOT
+
+It is not a claim by the model. `ai-run-end` carries the verdict the gates reached; a provider that
+exited cleanly over a rejected tree ends `rejected`, and a provider that died over an accepted tree
+ends `accepted`. That is the same rule as everywhere else here: judge the tree, treat the report as
+untrusted metadata.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import sys
+import time
+
+# The single definition. Everything that emits or documents these names reads them from here.
+VOCABULARY = {
+    "ai-run-start": "a round began",
+    "ai-run-resume": "a round continued an existing provider session",
+    "message.append": "the model produced a block of prose or reasoning",
+    "tool.append": "the model called a tool",
+    "run.event": "an acceptance command ran",
+    "run.state": "the round changed state",
+    "ai-run-end": "terminal, carrying the verdict the gates reached",
+}
+
+# provider.log's shape -> this vocabulary. The left side is what the agent loop and Cline write;
+# neither is changed by anything here.
+FROM_PROVIDER = {
+    ("content_end", "text"): "message.append",
+    ("content_end", "reasoning"): "message.append",
+    ("content_end", "tool"): "tool.append",
+}
+
+
+def append(path: pathlib.Path, event: str, **fields) -> dict:
+    if event not in VOCABULARY:
+        raise SystemExit(f"unknown event {event!r}. Known: {', '.join(sorted(VOCABULARY))}")
+    record = {"event": event, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    record.update({k: v for k, v in fields.items() if v not in (None, "")})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return record
+
+
+def translate(provider_log: pathlib.Path, events: pathlib.Path, attempt: int | None) -> int:
+    """Expand one provider log into the canonical vocabulary.
+
+    Reads only; the provider log is never modified. Cline writes two events per tool call — a
+    content_start carrying the arguments and a content_end carrying the result — so only the
+    content_end is translated, or one call would appear as two.
+    """
+    written = 0
+    for line in provider_log.read_text(errors="replace").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        inner = record.get("event") or {}
+        name = FROM_PROVIDER.get((inner.get("type"), inner.get("contentType")))
+        if not name:
+            continue
+        fields: dict[str, object] = {"attempt": attempt}
+        if name == "tool.append":
+            output = inner.get("output")
+            entries = [output] if isinstance(output, dict) else (
+                [e for e in output if isinstance(e, dict)] if isinstance(output, list) else [])
+            fields["tool"] = inner.get("toolName") or "?"
+            fields["ok"] = bool(entries) and all(e.get("success") for e in entries)
+        else:
+            fields["kind"] = inner.get("contentType")
+            text = inner.get(inner.get("contentType") or "", "")
+            if isinstance(text, str) and text:
+                fields["chars"] = len(text)
+        append(events, name, **fields)
+        written += 1
+    return written
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("vocabulary")
+
+    emit = sub.add_parser("emit")
+    emit.add_argument("events", type=pathlib.Path)
+    emit.add_argument("event")
+    emit.add_argument("fields", nargs="*")
+
+    ev = sub.add_parser("gates")
+    ev.add_argument("evidence_json", type=pathlib.Path)
+    ev.add_argument("events", type=pathlib.Path)
+
+    tr = sub.add_parser("translate")
+    tr.add_argument("provider_log", type=pathlib.Path)
+    tr.add_argument("events", type=pathlib.Path)
+    tr.add_argument("--attempt", type=int)
+
+    args = parser.parse_args()
+
+    if args.command == "vocabulary":
+        width = max(len(name) for name in VOCABULARY)
+        for name, meaning in VOCABULARY.items():
+            print(f"  {name:<{width}}  {meaning}")
+        return 0
+
+    if args.command == "emit":
+        fields = {}
+        for pair in args.fields:
+            if "=" not in pair:
+                print(f"fields are key=value, got {pair!r}", file=sys.stderr)
+                return 64
+            key, _, value = pair.partition("=")
+            fields[key] = value
+        append(args.events, args.event, **fields)
+        return 0
+
+    if args.command == "gates":
+        if not args.evidence_json.is_file():
+            print(f"cannot read {args.evidence_json}", file=sys.stderr)
+            return 2
+        bundle = json.loads(args.evidence_json.read_text())
+        written = 0
+        # `passed`, `failed` and `skipped` are COUNTS in this bundle, not lists. The gates
+        # themselves are under `gates`, and assuming otherwise raised on the first real file.
+        for gate in bundle.get("gates", []):
+            if not isinstance(gate, dict):
+                continue
+            append(args.events, "run.event", gate=gate.get("gate"),
+                   status=gate.get("status"), command=gate.get("command"),
+                   advisory=gate.get("advisory"), detail=gate.get("detail"))
+            written += 1
+        print(f"{written} event(s) written to {args.events}")
+        return 0
+
+    if not args.provider_log.is_file():
+        print(f"cannot read {args.provider_log}", file=sys.stderr)
+        return 2
+    written = translate(args.provider_log, args.events, args.attempt)
+    print(f"{written} event(s) written to {args.events}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -272,8 +272,49 @@ fi
 DO_STATUS=$?
 
 RUN="$R/.handoff/runs/ship"
+
+# The canonical event view. It is written beside the artifacts, never instead of them, so this
+# asserts both that it exists and that it says the same thing the gates did — an `ai-run-end`
+# carrying the provider's exit status rather than the verdict would be a quieter version of the
+# failure the whole taxonomy exists to prevent.
+check_events() {
+    local events="$RUN/events.jsonl"
+    [[ -s "$events" ]] || { fail "a completed run wrote no events.jsonl"; return; }
+    python3 - "$events" <<'PYEV'
+import json, sys
+seen = []
+for line in open(sys.argv[1]):
+    line = line.strip()
+    if line:
+        seen.append(json.loads(line))
+names = [e["event"] for e in seen]
+problems = []
+if names[0] != "ai-run-start":
+    problems.append(f"first event is {names[0]!r}, expected ai-run-start")
+if names[-1] != "ai-run-end":
+    problems.append(f"last event is {names[-1]!r}, expected ai-run-end")
+if "run.event" not in names:
+    problems.append("no run.event — the gates ran and none was recorded")
+end = seen[-1]
+if end.get("outcome") not in {"accepted", "rejected"}:
+    problems.append(f"ai-run-end outcome is {end.get('outcome')!r}")
+unknown = [n for n in names if n not in {
+    "ai-run-start", "ai-run-resume", "message.append", "tool.append",
+    "run.event", "run.state", "ai-run-end"}]
+if unknown:
+    problems.append(f"events outside the vocabulary: {sorted(set(unknown))}")
+print("\n".join(problems))
+PYEV
+}
+EVENT_PROBLEMS="$(check_events)"
+if [[ -n "$EVENT_PROBLEMS" ]]; then
+    fail "the event view disagrees with the round: $EVENT_PROBLEMS"
+else
+    pass "the round is also recorded in the canonical vocabulary, ending on the gates' verdict"
+fi
+
 STATE_OK=1
-for f in tree-before tree-after result.json stdout.log evidence/evidence.json evidence/evidence.md; do
+for f in tree-before tree-after result.json stdout.log evidence/evidence.json evidence/evidence.md events.jsonl; do
     [[ -s "$RUN/$f" ]] || { STATE_OK=0; fail "a completed run left no $f"; }
 done
 if [[ -s "$RUN/tree-before" && -s "$RUN/tree-after" ]] &&

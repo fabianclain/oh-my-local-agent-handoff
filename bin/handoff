@@ -611,7 +611,33 @@ echo "==> handoff $MODE '$SLUG'  provider=$PROVIDER model=${HANDOFF_MODEL:-defau
     printf '%s\n' "$PROMPT"
 } >"$RUN_DIR/prompt.md" 2>/dev/null || true
 
+# A canonical-vocabulary view of the round, beside the artifacts rather than instead of them.
+#
+# provider.log stays authoritative: twelve tools read its names and 258 archived runs encode them.
+# events.jsonl is a second view in one agreed vocabulary, so that "what happened in this round" has
+# a single set of names. Nothing in the harness reads it, and nothing breaks if it is absent —
+# every emit is best-effort and a failure here must never fail a round.
+EVENTS="$RUN_DIR/events.jsonl"
+RUN_EVENTS="$HANDOFF_HOME/tools/run-events"
+event() {
+    [[ -x "$RUN_EVENTS" ]] || return 0
+    "$RUN_EVENTS" emit "$EVENTS" "$@" 2>/dev/null || true
+}
+
 STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+if [[ "$MODE" == "resume" ]]; then
+    event ai-run-resume "slug=$SLUG" "plan=${PLAN_FILE#"$REPO_ROOT"/}"
+else
+    event ai-run-start "slug=$SLUG" "plan=${PLAN_FILE#"$REPO_ROOT"/}" \
+        "base=$(cat "$RUN_DIR/tree-before" 2>/dev/null)"
+fi
+
+# A repair attempt is a state change, and it is the one worth seeing: the round did not start here,
+# it came back with the harness's account of what failed.
+if [[ -n "${HANDOFF_FEEDBACK_FILE:-}" && -s "${HANDOFF_FEEDBACK_FILE:-}" ]]; then
+    event run.state "state=repair" "slug=$SLUG"
+fi
 
 set +e
 if [[ "$MODE" == "resume" ]]; then
@@ -628,6 +654,12 @@ if SID="$(provider_parse_session_id "$RUN_DIR/stdout.log")" && [[ -n "$SID" ]]; 
 fi
 
 snapshot_tree >"$RUN_DIR/tree-after"
+
+# The model's stream, in the same vocabulary. Read from the log the provider already wrote, so this
+# adds no coupling to any adapter.
+if [[ -x "$RUN_EVENTS" && -s "$RUN_DIR/stdout.log" ]]; then
+    "$RUN_EVENTS" translate "$RUN_DIR/stdout.log" "$EVENTS" >/dev/null 2>&1 || true
+fi
 
 echo
 echo "==> exit=$STATUS"
@@ -662,6 +694,16 @@ if [[ ( "$MODE" == "do" || "$MODE" == "resume" ) && "${HANDOFF_NO_VERIFY:-0}" !=
         echo "==>       but the gates accept this tree. Judging the tree: accepted."
     fi
     STATUS="$VERDICT"
+
+    # Each gate, then the terminal event. `ai-run-end` carries the GATES' verdict: a provider that
+    # exited cleanly over a rejected tree ends rejected, and one that died over an accepted tree
+    # ends accepted. Judge the tree; the report is untrusted metadata.
+    if [[ -x "$RUN_EVENTS" && -f "$RUN_DIR/evidence/evidence.json" ]]; then
+        "$RUN_EVENTS" gates "$RUN_DIR/evidence/evidence.json" "$EVENTS" >/dev/null 2>&1 || true
+    fi
+    event ai-run-end "slug=$SLUG" \
+        "outcome=$( [[ "$VERDICT" -eq 0 ]] && echo accepted || echo rejected )" \
+        "provider_exit=$STATUS"
 fi
 
 # Record the round, after the verdict exists so the journal carries it rather than guessing.
