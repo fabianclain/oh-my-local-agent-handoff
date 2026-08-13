@@ -53,7 +53,10 @@ column cannot carry both.
 
 The "not checked" list in the evidence bundle is load-bearing. `pint`, `phpstan` and `pest` run
 only if present, and a gate that quietly runs fewer checks than you think converts absence of
-evidence into apparent evidence of correctness.
+evidence into apparent evidence of correctness. That is the whole of `docs/answerability.md`: every
+gate exits `0` holds, `1` does not hold, `2` could not check — and `2` must say why. Five tools
+here got that wrong, four of them printing the correct reason in prose above an exit code that
+contradicted it.
 
 ### The scored summary
 

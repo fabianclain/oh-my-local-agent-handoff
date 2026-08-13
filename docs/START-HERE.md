@@ -409,10 +409,17 @@ dishonest:
 | [DRIVING.md](DRIVING.md) | Who does what, how to size a task, how to read a failure |
 | [usage.md](usage.md) | The full command surface, provider table, settings with their evidence |
 | [how-it-works.md](how-it-works.md) | The gates, the four prompt layers, who decides what "verified" means |
+| [answerability.md](answerability.md) | The three exit codes every gate uses, and what a check must do when it cannot answer |
 | [local-models.md](local-models.md) | Every measured finding, and the register of conclusions that turned out wrong |
 | [../bench/COMPARISON.md](../bench/COMPARISON.md) | Round-by-round results |
 
-If you take one thing from the rest of the documentation, take this: **ten harness defects have
-been found in this project and six were mistaken for model behaviour first.** When a run looks
+If you take one thing from the rest of the documentation, take this: **fifteen harness defects have
+been found in this project and nine were mistaken for model behaviour first.** When a run looks
 wrong, ask whether something other than the model could have produced it, before concluding
 anything about the model.
+
+The most recent three are the shape to watch for. A model spent three rounds searching a file
+whose anchors sat past the read cap, unreachable by any tool it had; a round was told it had
+"damaged the tree" when a second agent session had reverted the file underneath it; and a gate
+reported `pass` over a file that did not parse. In each case the harness produced a confident,
+specific, wrong account of what the model had done.

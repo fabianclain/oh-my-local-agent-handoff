@@ -399,6 +399,15 @@ reported as **ALREADY PASSES** does not test the change; anything reported as fa
 for the reason you expect, and if you cannot say why, read the output it prints rather than
 assuming.
 
+**Watch for exit 2 specifically.** The gates here use three codes: `0` holds, `1` does not hold,
+`2` could not check. A `2` in the dry run means your criterion is pointed at something the gate
+cannot read — a file that is not built yet, a stylesheet with no document, a file that does not
+parse. It rejects the round, so it is not dangerous, but it is not testing what you think either,
+and it will still be `2` after the model has done the work perfectly. Read the reason it prints;
+every gate that returns 2 is required to give one. See `docs/answerability.md`.
+
+A criterion whose gate says `UNKNOWN` is a criterion you have not written yet.
+
 ### 7. Run it
 
 ```bash

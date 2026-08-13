@@ -278,6 +278,12 @@ def gate_selfcontained(doc: Doc) -> int:
     Two reasons, and the second is why this is a gate rather than a preference. A page that
     <link>s a CDN stylesheet makes tools/css-contrast check NOTHING -- it does not follow external
     sheets -- so the contrast criterion would report "not checked" and be read as passing.
+
+    That second reason is now also fixed where it belongs: css-contrast exits 2 rather than 0 when
+    it resolves no pairs, so an externally-styled page fails its own contrast criterion instead of
+    sailing through it. This gate stays because it is still the better error -- it names the CDN
+    link, where css-contrast can only say it found nothing -- and because a check worth having
+    twice is worth having twice. See docs/answerability.md.
     """
     offenders = []
     for node in doc.nodes:

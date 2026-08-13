@@ -174,9 +174,9 @@ def parses(path: pathlib.Path) -> bool | None:
 def unparseable(path: pathlib.Path) -> bool:
     """Report and return True when the file cannot be trusted to be read by regex."""
     if parses(path) is False:
-        print(f"FAIL  {path} — the file does not parse, so the docblocks cannot be checked")
-        print("        Every declaration this gate can see may be wrong. Fix the parse error, "
-              "then run it again.")
+        print(f"UNKNOWN  {path} — the file does not parse, so the docblocks cannot be checked")
+        print("         Every declaration this gate can see may be wrong. Fix the parse error,")
+        print("         then run it again. This is not a pass and it is not a finding.")
         return True
     return False
 
@@ -188,14 +188,18 @@ def main() -> int:
     parser.add_argument("files", nargs="+", type=pathlib.Path)
     args = parser.parse_args()
 
+    # Two independent facts, because collapsing them loses the one that matters. A definite finding
+    # outranks an unknown: both reject, but only one tells you what to go and fix, and reporting 2
+    # over a file that also has a real orphaned docblock would bury it.
+    found, unknown = False, False
+
     if args.base:
-        status = 0
         for path in args.files:
             if not path.is_file():
                 print(f"cannot read {path}", file=sys.stderr)
                 return 2
             if unparseable(path):
-                status = 1
+                unknown = True
                 continue
             shown = subprocess.run(["git", "show", f"{args.base}:{path}"],
                                    capture_output=True, text=True)
@@ -204,25 +208,24 @@ def main() -> int:
                 continue
             problems = check_against_base(path, shown.stdout)
             if problems:
-                status = 1
+                found = True
                 print(f"FAIL  {path} — {len(problems)} docblock(s) moved to another declaration")
                 for problem in problems:
                     print(f"        {problem}")
             else:
                 print(f"pass  {path} — every docblock still sits on the declaration it did")
-        return status
+        return 1 if found else (2 if unknown else 0)
 
-    status = 0
     for path in args.files:
         if not path.is_file():
             print(f"cannot read {path}", file=sys.stderr)
             return 2
         if unparseable(path):
-            status = 1
+            unknown = True
             continue
         checked, problems = check(path)
         if problems:
-            status = 1
+            found = True
             print(f"FAIL  {path} — {len(problems)} orphaned docblock(s) of {checked}")
             for problem in problems:
                 print(f"        {problem}")
@@ -230,9 +233,12 @@ def main() -> int:
             print(f"pass  {path} — all {checked} docblock(s) sit on a declaration")
         else:
             # No docblocks is not a pass over a file that should have them, and not a failure over
-            # one that never did. Say which happened rather than printing a verdict either way.
-            print(f"note  {path} — no docblocks found, so nothing was checked")
-    return status
+            # one that never did. Say which happened rather than printing a verdict either way —
+            # and exit 2, because "nothing was checked" reported as exit 0 IS a verdict, and the
+            # wrong one. An empty file passed this gate for as long as it existed.
+            print(f"UNKNOWN  {path} — no docblocks found, so nothing was checked")
+            unknown = True
+    return 1 if found else (2 if unknown else 0)
 
 
 if __name__ == "__main__":

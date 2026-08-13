@@ -532,11 +532,27 @@ def main() -> int:
 
     results, notes, skipped = check(path, args.min, args.media)
     failed = [r for r in results if not r["passed"]]
+    # Nothing resolved is not a clean run. The note explaining why has been printed since this tool
+    # was written, and the exit code said `pass` underneath it anyway — so an empty file, a
+    # stylesheet with no document, and a build that produced no markup all came back green. Exit 2
+    # is "could not check", distinct from 1 for "checked, and it fails".
+    unknown = not results
 
     if args.json:
         print(json.dumps({"file": str(path), "minimum": args.min, "results": results,
-                          "notes": notes, "unparsed_selectors": skipped}, indent=2))
-        return 1 if failed else 0
+                          "notes": notes, "unparsed_selectors": skipped,
+                          "answered": not unknown}, indent=2))
+        return 2 if unknown else (1 if failed else 0)
+
+    if unknown:
+        print(f"UNKNOWN  {path} — no colour pair could be resolved, so nothing was checked")
+        for note in notes:
+            print(f"         {note}")
+        if skipped:
+            print(f"         {len(skipped)} selector(s) could not be parsed")
+        print("         This is not a pass. Point the tool at the HTML that uses the stylesheet,")
+        print("         or check that the file is what you think it is.")
+        return 2
 
     print(f"{path}: {len(results)} colour pair(s) resolved, minimum {args.min}:1\n")
     for result in sorted(results, key=lambda r: (r["passed"], r["media"])):
