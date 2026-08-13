@@ -655,3 +655,35 @@ So the plan is not saturated after all — it is a **1-in-16 instrument**, which
 is not the ~50% one roadmap item 1 needs. Note also that the repair attempt did not recover it: the
 run failed, was told which commands failed, tried again, and still shipped 11 of 13. That is the
 repair loop exercised on a real failure for the first time tonight, and it did not help.
+
+### Does `--max-turns 40` bind? Yes — 1 in 20, and the cause is not exploration
+
+The queue asked for the rate before anyone changed the setting. Measured on `site-dark`, n=20:
+one run ended `patch-ok-no-report` with **13 of 13 criteria met**, 42 model requests against a
+40-turn ceiling, and `report-audit` giving the reason as `turn limit reached`. The tree was
+finished and there was no turn left to say so. That is the second observed instance, after a
+`wide` round that ended the same way at 11 of 11.
+
+`turn-economy` says where the budget went, and it is not where raising the ceiling would help:
+
+| | the turn-limited run | the arm |
+| --- | ---: | ---: |
+| tool calls | 40 | ~19 median |
+| edits | 11 | 4.5 |
+| **edits that failed** | **5 of 11 (45%)** | 23% |
+| epilogue turns | **0 (0%)** | 4.4 (23%) |
+| redundant reads | 0 of 4 | 6% |
+| repeated commands | 0 of 13 | 0% |
+
+Nothing was wasted on orientation. The run spent 90% of its turns in the work phase retrying edits
+that did not apply, and arrived at a correct tree with an empty budget.
+
+**So the lever is edit success, not the ceiling.** Raising `--max-turns` would let this run report,
+at the cost of deeper context in every run — and depth is what correlates with discarded output.
+Whereas tonight's own numbers say the failure rate is addressable: `nativewhole` measured 2.5%
+failed edits against `nativemsg`'s 13.5% (p = 0.0002), because a whole-file write cannot
+mis-anchor. For a plan that creates one self-contained file, whole-file writes are not a trade-off
+at all — there is no existing content to regenerate.
+
+The arm-wide 23% edit-failure rate is the number to watch. At 4.5 edits per run it is survivable;
+this run took 11 and it was not.
