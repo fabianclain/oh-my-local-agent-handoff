@@ -13,6 +13,8 @@
 #   handoff stats           how the local model is actually performing, across runs
 #   handoff retro <slug>    ask the model what it thinks went wrong, and record the answer
 #   handoff auto <slug>     the ladder: local tries, a hosted planner re-specifies, local retries
+#   handoff queue [<slug>]  add a round to the machine-wide queue, or list what is queued
+#   handoff drain [--once]  run the queued rounds, one at a time
 #   handoff doctor          can this machine run a round right now? read-only
 #   handoff contrast <file> WCAG contrast for every colour pair a view declares
 #   handoff view-lint <file>  tag balance, the 100vh overflow trap, missing heading
@@ -229,6 +231,56 @@ provider_parse_session_id() { return 1; }
 
 # shellcheck disable=SC1090
 source "$PROVIDER_FILE"
+
+# One round at a time against the shared local model.
+#
+# The repository lock above stops two rounds sharing a working tree. This stops two rounds sharing
+# the GPU, which is a different failure and a quieter one. llama-server here has four slots, so
+# concurrent rounds do not fail — they succeed, and providers/lcpp.sh states the cost in its own
+# comment: token accounting brackets a round by BYTE OFFSET into llamacpp.log, and "a second
+# client talking to the same server would be counted into whichever run happened to be open".
+# Nothing rejects that round. Its numbers are simply wrong.
+#
+# flock, and re-exec, for the reason bench/run records: `--close` keeps the descriptor out of the
+# child, so a model process that outlives its parent cannot go on holding the lock. A pid file
+# cannot do that, and an inherited descriptor once wedged the bench for a full 600 seconds.
+#
+# The whole round runs under it, not just the model call. Holding it through verification costs a
+# few extra seconds of serialisation and keeps this identical to bench/run — one pattern, one
+# recorded lesson, two callers — rather than inventing a narrower scope that needs its own proof.
+GPU_LOCK="${TMPDIR:-/tmp}/agent-handoff-gpu.lock"
+if [[ ( "$MODE" == "do" || "$MODE" == "resume" ) && -n "${HANDOFF_USES_LOCAL_GPU:-}" \
+      && -z "${HANDOFF_GPU_LOCK_HELD:-}" ]]; then
+    export HANDOFF_GPU_LOCK_HELD=1
+    _queue="$HANDOFF_HOME/tools/gpu-queue"
+    _ticket=""
+    # `flock -n <file> true` takes the lock and drops it again, which is the only honest way to
+    # ask "is it free" — and if it is, say nothing at all. A queue that announces itself when
+    # there is no queue is noise, and noise is how a real message gets skimmed past.
+    if [[ -x "$_queue" ]] && ! flock -n "$GPU_LOCK" true 2>/dev/null; then
+        _ticket="$("$_queue" take "$SLUG" "$REPO_ROOT" --pid $$ 2>/dev/null || true)"
+        echo "==> the local model is busy — waiting"
+        "$_queue" status "$_ticket" 2>/dev/null || true
+        echo "    (Ctrl-C to give up; nothing has been written yet)"
+        _waited=0
+        until flock -n "$GPU_LOCK" true 2>/dev/null; do
+            # Configurable only so the selftest can exercise the wait without taking a minute.
+            sleep "${HANDOFF_GPU_POLL:-15}"
+            _waited=$(( _waited + ${HANDOFF_GPU_POLL:-15} ))
+            # Every two minutes, not every fifteen seconds: the estimate moves slowly and a line
+            # that repeats faster than the thing it describes stops being read.
+            if (( _waited % ${HANDOFF_GPU_REPORT:-120} == 0 )); then
+                echo "==> still waiting (${_waited}s)"
+                "$_queue" status "$_ticket" 2>/dev/null || true
+            fi
+        done
+        [[ -n "$_ticket" ]] && "$_queue" drop "$_ticket" 2>/dev/null || true
+        echo "==> the model is free — starting"
+    fi
+    # -w is a backstop, not the mechanism: the loop above has already waited for it to be free.
+    # It bounds the case where another round wins the race between that check and this line.
+    exec flock --close -w "${HANDOFF_GPU_WAIT:-7200}" "$GPU_LOCK" "$0" "$@"
+fi
 
 # A provider with no session support cannot resume, and must say so rather than appearing to work.
 #
@@ -500,6 +552,28 @@ ${PROJECT_RULES}
 Leave all changes uncommitted."
     ;;
 
+queue | drain)
+    # The detached half of the GPU lock: enqueue from any project, drain them one at a time.
+    # Placed before the modes that need a plan file, because `queue --list` and `drain` need a
+    # slug for neither.
+    SPOOL="$HANDOFF_HOME/tools/spool"
+    [[ -x "$SPOOL" ]] || { echo "no spool at tools/spool" >&2; exit 1; }
+    export HANDOFF_BIN="$(_handoff_real_self)"
+    if [[ "$MODE" == "drain" ]]; then
+        shift
+        exec "$SPOOL" drain "$@"
+    fi
+    shift
+    if [[ $# -eq 0 || "${1:-}" == "--list" ]]; then
+        exec "$SPOOL" list
+    fi
+    if [[ "${1:-}" == "--clear" ]]; then
+        shift; exec "$SPOOL" clear "$@"
+    fi
+    QUEUE_SLUG="$1"; shift
+    exec "$SPOOL" add "$QUEUE_SLUG" "$REPO_ROOT" "$@"
+    ;;
+
 check | prepare)
     # Reachable from any project, which tools/check-plan is not: only bin/ is on PATH, and asking
     # someone to know where the harness is checked out defeats the point of checking at all.
@@ -712,6 +786,15 @@ event() {
 }
 
 STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+STARTED_EPOCH="$(date +%s)"
+
+# Who is on the GPU, for anything that waits behind us. Best-effort throughout: this is a register
+# a person reads, and it must never be able to fail a round.
+if [[ -n "${HANDOFF_GPU_LOCK_HELD:-}" && -x "$HANDOFF_HOME/tools/gpu-queue" ]]; then
+    "$HANDOFF_HOME/tools/gpu-queue" holding "$SLUG" "$REPO_ROOT" --pid $$ 2>/dev/null || true
+    _release_gpu_holder() { "$HANDOFF_HOME/tools/gpu-queue" released 2>/dev/null || true; }
+    trap '_release_gpu_holder; release_lock' EXIT INT TERM
+fi
 
 if [[ "$MODE" == "resume" ]]; then
     event ai-run-resume "slug=$SLUG" "plan=${PLAN_FILE#"$REPO_ROOT"/}"
@@ -807,6 +890,29 @@ if [[ ( "$MODE" == "do" || "$MODE" == "resume" ) && "${HANDOFF_NO_JOURNAL:-0}" !
         --reasoning "${HANDOFF_CLINE_THINKING:-}" --context "${HANDOFF_CONTEXT:-}" \
         --started "$STARTED_AT" --exit-status "$STATUS" \
         --handoff-home "$HANDOFF_HOME" || true
+fi
+
+# What the next waiter's estimate is drawn from. Recorded per provider, because a `native` round
+# and a cloud round are not the same measurement and averaging them would describe neither.
+if [[ ( "$MODE" == "do" || "$MODE" == "resume" ) && -x "$HANDOFF_HOME/tools/gpu-queue" ]]; then
+    "$HANDOFF_HOME/tools/gpu-queue" record "$PROVIDER" \
+        "$(( $(date +%s) - STARTED_EPOCH ))" 2>/dev/null || true
+fi
+
+# The callback. `ai-run-end` already carries the verdict THE GATES REACHED — this only delivers it
+# somewhere a person or an orchestrator is watching, so a detached round can announce itself
+# instead of being polled for.
+#
+# Best-effort by construction, and deliberately not part of the verdict: a webhook that is down
+# must not turn an accepted round into a failed one. The command is given the event as JSON on
+# stdin and the verdict as $1, so a one-line notify script is enough to use it.
+if [[ ( "$MODE" == "do" || "$MODE" == "resume" ) && -n "${HANDOFF_CALLBACK:-}" ]]; then
+    _verdict=$([[ "$STATUS" -eq 0 ]] && echo accepted || echo rejected)
+    printf '{"event":"ai-run-end","slug":"%s","repo":"%s","verdict":"%s","exit":%s,"seconds":%s,"started":"%s"}\n' \
+        "$SLUG" "$REPO_ROOT" "$_verdict" "$STATUS" \
+        "$(( $(date +%s) - STARTED_EPOCH ))" "$STARTED_AT" \
+        | ( bash -c "$HANDOFF_CALLBACK" "$HANDOFF_CALLBACK" "$_verdict" "$SLUG" "$REPO_ROOT" \
+            >/dev/null 2>&1 || true )
 fi
 
 exit "$STATUS"

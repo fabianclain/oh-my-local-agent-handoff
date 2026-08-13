@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""spool — hand off work from several projects and let it run one at a time.
+
+    tools/spool add <slug> <repo> [--provider P] [--mode do|resume]
+    tools/spool list
+    tools/spool drain [--once] [--until HH:MM]
+    tools/spool clear [--done]
+
+WHAT THIS IS FOR, AND WHAT IT IS NOT
+
+The GPU lock in bin/handoff already makes concurrent rounds safe: a second `handoff do` waits, and
+prints its position and an estimate while it does. That is enough when you are sitting there. It is
+not enough when you want to hand off four steps across three projects and go and do something else,
+because each one still needs a terminal that stays open.
+
+So this is the detached half, and nothing more. It does not schedule, prioritise, or run anything
+in parallel — it runs `handoff do` in one repository at a time, in the order things were added, and
+the lock is still what enforces exclusivity. If you run a drain and an interactive round at once,
+they serialise against each other correctly because both go through the same lock.
+
+WHY NOT tools/overnight
+
+overnight sequences BENCHMARKS from a bash file written in advance: it exists to spend a night on a
+comparison and have evidence in the morning. This exists to let you enqueue one more thing at 3pm
+without editing a file. They share a principle and almost no mechanics, and folding either into the
+other would give one tool two jobs.
+
+A JOB THAT FAILS IS FINISHED, NOT RETRIED
+
+A rejected round is a real result and the queue moves on. Retrying it would re-ask a question the
+harness has already answered three times internally — and the skill is explicit that the response
+to a rejection is a NEW, SMALLER plan written by a person, not the same one again.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import os
+import pathlib
+import subprocess
+import sys
+import time
+
+STATE = pathlib.Path(os.environ.get("HANDOFF_STATE")
+                     or pathlib.Path.home() / ".cache" / "agent-handoff")
+QUEUE = STATE / "queue"
+PENDING, RUNNING, DONE = QUEUE / "pending", QUEUE / "running", QUEUE / "done"
+
+
+def read_job(path: pathlib.Path) -> dict:
+    try:
+        return dict(line.split("=", 1) for line in
+                    path.read_text().splitlines() if "=" in line)
+    except OSError:
+        return {}
+
+
+def write_job(path: pathlib.Path, job: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(f"{k}={v}\n" for k, v in job.items()))
+
+
+def jobs(where: pathlib.Path) -> list[pathlib.Path]:
+    return sorted(where.iterdir()) if where.is_dir() else []
+
+
+def cmd_add(args) -> int:
+    repo = pathlib.Path(args.repo).resolve()
+    if not (repo / ".git").exists():
+        print(f"not a git repository: {repo}", file=sys.stderr)
+        return 2
+    plan = repo / ".handoff" / "plans" / f"{args.slug}.md"
+    # Checked here rather than at drain time, because a typo found at 3pm is a correction and the
+    # same typo found at 2am is a job that silently did nothing.
+    if args.mode == "do" and not plan.is_file():
+        print(f"no plan at {plan}", file=sys.stderr)
+        return 2
+    name = f"{time.time():.6f}-{args.slug}.job"
+    write_job(PENDING / name, {
+        "slug": args.slug, "repo": str(repo), "mode": args.mode,
+        "provider": args.provider or os.environ.get("HANDOFF_PROVIDER", ""),
+        "enqueued": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    print(f"queued {args.slug} ({len(jobs(PENDING))} pending)")
+    return 0
+
+
+def cmd_list(_args) -> int:
+    running = [read_job(p) for p in jobs(RUNNING)]
+    pending = [read_job(p) for p in jobs(PENDING)]
+    done = [read_job(p) for p in jobs(DONE)][-10:]
+    if not (running or pending or done):
+        # Not "the queue is empty" as a verdict over an unread directory: say where it looked.
+        print(f"nothing queued (spool at {QUEUE})")
+        return 0
+    for job in running:
+        print(f"  RUNNING  {job.get('slug'):<24} {job.get('repo')}")
+    for index, job in enumerate(pending, 1):
+        print(f"  #{index:<7} {job.get('slug'):<24} {job.get('repo')}"
+              f"   queued {job.get('enqueued', '?')}")
+    for job in done:
+        print(f"  {job.get('verdict', 'done'):<8} {job.get('slug'):<24} {job.get('repo')}"
+              f"   {job.get('seconds', '?')}s")
+    return 0
+
+
+def run_one(path: pathlib.Path, handoff: str) -> str:
+    job = read_job(path)
+    active = RUNNING / path.name
+    RUNNING.mkdir(parents=True, exist_ok=True)
+    path.rename(active)
+    environment = dict(os.environ)
+    if job.get("provider"):
+        environment["HANDOFF_PROVIDER"] = job["provider"]
+    started = time.time()
+    print(f"==> {job.get('slug')} in {job.get('repo')}", flush=True)
+    try:
+        done = subprocess.run([handoff, job.get("mode", "do"), job.get("slug", "")],
+                              cwd=job.get("repo"), env=environment)
+        status = done.returncode
+    except OSError as error:
+        print(f"    could not start: {error}", file=sys.stderr)
+        status = 127
+    job["verdict"] = "accepted" if status == 0 else "rejected"
+    job["exit"] = str(status)
+    job["seconds"] = str(int(time.time() - started))
+    job["finished"] = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    DONE.mkdir(parents=True, exist_ok=True)
+    write_job(DONE / path.name, job)
+    active.unlink(missing_ok=True)
+    print(f"    {job['verdict']} in {job['seconds']}s", flush=True)
+    return job["verdict"]
+
+
+def cmd_drain(args) -> int:
+    handoff = os.environ.get("HANDOFF_BIN") or "handoff"
+    deadline = None
+    if args.until:
+        now = dt.datetime.now()
+        hour, _, minute = args.until.partition(":")
+        deadline = now.replace(hour=int(hour), minute=int(minute or 0), second=0, microsecond=0)
+        # Reported from real use on the overnight runner: `--until 06:55` typed at 07:10 resolved
+        # to a deadline in the past and armed a 22-hour queue. Same trap, same fix.
+        if deadline <= now:
+            deadline += dt.timedelta(days=1)
+        print(f"draining until {deadline:%Y-%m-%d %H:%M}")
+
+    ran = 0
+    while True:
+        pending = jobs(PENDING)
+        if not pending:
+            break
+        if deadline and dt.datetime.now() >= deadline:
+            print(f"deadline reached; {len(pending)} job(s) left queued")
+            break
+        run_one(pending[0], handoff)
+        ran += 1
+        if args.once:
+            break
+    print(f"{ran} job(s) run, {len(jobs(PENDING))} still queued")
+    return 0
+
+
+def cmd_clear(args) -> int:
+    targets = [DONE] if args.done else [PENDING, DONE]
+    removed = 0
+    for where in targets:
+        for path in jobs(where):
+            path.unlink(missing_ok=True)
+            removed += 1
+    # RUNNING is never cleared here. A job in there belongs to a live drainer, and removing its
+    # record would not stop the round — it would only lose the only note of what is running.
+    print(f"removed {removed} job file(s); anything RUNNING was left alone")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="command", required=True)
+    add = sub.add_parser("add")
+    add.add_argument("slug"); add.add_argument("repo")
+    add.add_argument("--provider"); add.add_argument("--mode", default="do",
+                                                     choices=["do", "resume"])
+    sub.add_parser("list")
+    drain = sub.add_parser("drain")
+    drain.add_argument("--once", action="store_true"); drain.add_argument("--until")
+    clear = sub.add_parser("clear"); clear.add_argument("--done", action="store_true")
+    args = parser.parse_args()
+    return {"add": cmd_add, "list": cmd_list, "drain": cmd_drain, "clear": cmd_clear}[
+        args.command](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

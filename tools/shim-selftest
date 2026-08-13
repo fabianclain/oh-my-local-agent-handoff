@@ -57,6 +57,22 @@ trap cleanup EXIT
 pass() { echo "    PASS: $1"; }
 fail() { echo "    FAIL: $1"; FAILURES=$(( FAILURES + 1 )); }
 
+# The shim is a PROXY. Every check below drives it and reads what it forwards, so with the
+# upstream daemon down there is nothing here to test — and for an hour this suite reported that
+# state as FAIL, with the message "shim did not come up", which points at the shim.
+#
+# It is not a shim fault and it is not a pass. It is the third answer: could not check. selftest-all
+# already reads exit 2 as SKIP and prints the reason, and its own comment says why — "reporting
+# that as a pass would convert nothing was checked into apparent evidence". This suite simply was
+# not using the mechanism that existed for it. See docs/answerability.md.
+UPSTREAM="${OLLAMA_HOST:-http://127.0.0.1:11434}"
+[[ "$UPSTREAM" == http* ]] || UPSTREAM="http://$UPSTREAM"
+if ! curl -fsS --max-time 3 "$UPSTREAM/api/tags" >/dev/null 2>&1; then
+    echo "ollama is not answering at $UPSTREAM, and this suite only tests a proxy to it" >&2
+    echo "nothing was checked. Start it with 'systemctl start ollama' and run this again." >&2
+    exit 2
+fi
+
 python3 "$HERE/toolcall-shim.py" "$PORT" >"$WORK/shim.log" 2>&1 &
 SHIM_PID=$!
 for _ in $(seq 1 20); do

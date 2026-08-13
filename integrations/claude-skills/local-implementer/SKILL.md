@@ -243,6 +243,12 @@ this run". It is harmless only when it lands somewhere excluded — `.handoff/pl
 scratch note anywhere else is charged to the model. Nothing should touch the tree between
 `handoff do` and its verdict. Reported from real use.
 
+**Several projects at once.** `handoff do` also takes a machine-wide lock on the local model, and
+waits rather than refusing when another project is mid-round — printing who holds it, your position
+and an estimate drawn from real round durations. Concurrent rounds do not fail; they silently
+misattribute each other's tokens, which is worse. For fire-and-forget across projects there is
+`handoff queue <slug>` and `handoff drain`. See `docs/queueing.md`.
+
 **That includes another agent session.** `handoff do` and `handoff resume` now take a lock on
 `.handoff/.lock` and refuse to start while a round is running in the same checkout, because the
 rule above was written and then broken the same day: two sessions drove this harness at one

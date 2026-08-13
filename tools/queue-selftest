@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+#
+# queue-selftest — the GPU lock, the register behind it, and the spool.
+#
+#   tools/queue-selftest
+#
+# WHY THERE IS A QUEUE AT ALL
+#
+# llama-server here runs four slots, so two rounds against it do not fail — they both succeed, and
+# providers/lcpp.sh states the cost in its own comment: token accounting brackets a round by BYTE
+# OFFSET into llamacpp.log, and "a second client talking to the same server would be counted into
+# whichever run happened to be open". Nothing rejects that round. Its numbers are simply wrong.
+#
+# So the lock is not protecting the GPU from saturation. It is protecting the MEASUREMENT, which is
+# the thing this project has repeatedly found itself unable to trust.
+#
+#   1  no history          an estimate over too few rounds is not printed at all
+#   2  position            #2 waits for one round longer than #1, drawn from real durations
+#   3  dead waiters        a killed waiter's ticket does not inflate anybody's queue position
+#   4  nothing to say      with the GPU free, a round says nothing about queues
+#   5  the wait            a busy GPU makes a second round wait, and tell you where it is
+#   6  release             the lock is released when the round ends
+#   7  enqueue validation  a typo'd slug is refused at 3pm rather than discovered at 2am
+#   8  drain order         jobs run oldest first, in their own repository
+#   9  a rejected job      is a result, not a wedge: the queue moves on
+#  10  the callback        fires with the verdict the gates reached
+#
+# Cases 4 and 9 are the ones that keep the rest honest. A queue that announced itself when there is
+# no queue would be noise, and noise is how a real message gets skimmed past; a queue that stopped
+# on the first rejection would strand every job behind it.
+
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$HERE/.." && pwd)"
+SANDBOX="$(mktemp -d)"
+FAILURES=0
+export HANDOFF_STATE="$SANDBOX/state"
+export TMPDIR="$SANDBOX"          # so the flock file is this run's, not the machine's
+GPU_LOCK="$SANDBOX/agent-handoff-gpu.lock"
+
+cleanup() { rm -rf "$SANDBOX"; }
+trap cleanup EXIT
+pass() { echo "    PASS: $1"; }
+fail() { echo "    FAIL: $1"; FAILURES=$(( FAILURES + 1 ));
+         [[ -n "${2:-}" ]] && sed -n '1,3p' <<<"$2" | sed 's/^/        /'; }
+
+Q="$HERE/gpu-queue"
+SPOOL="$HERE/spool"
+
+project() {  # a throwaway repo with one plan
+    local root="$SANDBOX/$1"
+    mkdir -p "$root/.handoff/plans"
+    ( cd "$root" && git init -q . && git config user.email a@b.c && git config user.name t
+      echo "# plan" > .handoff/plans/alpha.md
+      git add -A && git commit -qm init ) >/dev/null 2>&1
+    echo "$root"
+}
+
+echo "==> 1/10 an estimate is not invented from too little history"
+OUT="$("$Q" status 2>&1)"
+if grep -qE "~[0-9]" <<<"$OUT"; then
+    fail "printed a number with no rounds recorded" "$OUT"
+elif ! grep -q "needed" <<<"$OUT"; then
+    fail "gave no estimate and did not say why" "$OUT"
+else
+    pass "says how many rounds it has and how many it needs"
+fi
+
+echo "==> 2/10 position and estimate scale with the queue"
+for s in 300 300 300; do "$Q" record native "$s"; done
+T1="$("$Q" take alpha /a --pid $$)"; T2="$("$Q" take beta /b --pid $$)"
+"$Q" holding running /c --pid $$
+ONE="$("$Q" status "$T1")"; TWO="$("$Q" status "$T2")"
+if ! grep -q "#1 of 2" <<<"$ONE" || ! grep -q "#2 of 2" <<<"$TWO"; then
+    fail "positions wrong" "$ONE$TWO"
+# Matched loosely on purpose: the estimate correctly subtracts however long the current round has
+# already run, so pinning it to 5m00s exactly would fail on a holder that started a second ago.
+# The property under test is "one round versus two", not the arithmetic to the second.
+elif ! grep -qE "~[45]m[0-9]{2}s" <<<"$ONE" || ! grep -qE "~(9m[0-9]{2}|10m00)s" <<<"$TWO"; then
+    fail "the second waiter is not estimated one round behind the first" "$ONE$TWO"
+else
+    pass "#1 waits one round, #2 waits two — from recorded durations, not a guess"
+fi
+
+echo "==> 3/10 a dead waiter's ticket does not inflate the queue"
+bash -c 'sleep 30' & DEAD=$!
+DEADTICKET="$("$Q" take zombie /z --pid $DEAD)"
+kill "$DEAD" 2>/dev/null; wait "$DEAD" 2>/dev/null
+OUT="$("$Q" status "$T1")"
+if ! grep -q "#1 of 2" <<<"$OUT"; then
+    fail "a dead waiter is still counted — everyone behind it is told the wrong position" "$OUT"
+else
+    pass "reaped on sight, so positions stay true"
+fi
+"$Q" drop "$T1"; "$Q" drop "$T2"; "$Q" released
+
+# ------------------------------------------------------------------------------------------------
+# The driver, against the stub provider, with the local-GPU flag forced on.
+
+export PATH="$REPO/bin:$PATH"
+export HANDOFF_GPU_POLL=1 HANDOFF_GPU_REPORT=2
+R="$(project locked)"
+cat > "$R/.handoff/plans/alpha.md" <<'PLAN'
+# make v return 7
+## Files to touch
+| Path | Action |
+| --- | --- |
+| `src/S.php` | modify |
+## Acceptance criteria
+- [ ] v returns 7
+## Verification
+```bash
+true
+```
+## Out of scope
+Anything else.
+PLAN
+( cd "$R" && printf '.handoff/runs/\n' >> .gitignore && git add -A && git commit -qm ig ) >/dev/null
+
+echo "==> 4/10 with the GPU free, a round says nothing about queues"
+OUT="$( cd "$R" && HANDOFF_USES_LOCAL_GPU=1 HANDOFF_PROVIDER=stub STUB_PATCH="true" \
+        handoff do alpha 2>&1 )"
+if grep -qi "busy\|waiting" <<<"$OUT"; then
+    fail "announced a queue when there was none" "$OUT"
+else
+    pass "silent when there is nothing to say"
+fi
+
+echo "==> 5/10 a busy GPU makes the next round wait, and say where it is"
+flock "$GPU_LOCK" sleep 6 &
+HOLDER=$!
+sleep 1
+OUT="$( cd "$R" && HANDOFF_USES_LOCAL_GPU=1 HANDOFF_PROVIDER=stub STUB_PATCH="true" \
+        timeout 60 handoff do alpha 2>&1 )"
+wait "$HOLDER" 2>/dev/null
+if ! grep -q "busy" <<<"$OUT"; then
+    fail "ran straight through a held lock — concurrent rounds misattribute tokens" "$OUT"
+elif ! grep -q "the model is free — starting" <<<"$OUT"; then
+    fail "waited but never reported acquiring it" "$OUT"
+else
+    pass "waited, said so, and started once free"
+fi
+
+echo "==> 6/10 the lock is released when the round ends"
+if flock -n "$GPU_LOCK" true 2>/dev/null; then
+    pass "free again after the round"
+else
+    fail "the lock outlived its round — every later round on this machine would block"
+fi
+
+# ------------------------------------------------------------------------------------------------
+# The spool.
+
+echo "==> 7/10 a slug with no plan is refused when it is queued"
+if "$SPOOL" add nosuchplan "$R" >/dev/null 2>&1; then
+    fail "queued a job that could never run — discovered at 2am instead of at 3pm"
+else
+    pass "refused at enqueue, while you are still there to fix it"
+fi
+
+echo "==> 8/10 jobs drain oldest first, each in its own repository"
+A="$(project alpharepo)"; B="$(project betarepo)"
+"$SPOOL" add alpha "$A" >/dev/null; "$SPOOL" add alpha "$B" >/dev/null
+cat > "$SANDBOX/fake-handoff" <<'FAKE'
+#!/bin/bash
+echo "RAN $2 IN $PWD"
+exit 0
+FAKE
+chmod +x "$SANDBOX/fake-handoff"
+OUT="$(HANDOFF_BIN="$SANDBOX/fake-handoff" "$SPOOL" drain 2>&1)"
+FIRST="$(grep -o "IN .*" <<<"$OUT" | head -1)"
+if [[ "$FIRST" != "IN $A" ]]; then
+    fail "drained out of order, or in the wrong repo — got '$FIRST', wanted 'IN $A'" "$OUT"
+elif ! grep -q "2 job(s) run" <<<"$OUT"; then
+    fail "did not run both jobs" "$OUT"
+else
+    pass "oldest first, each with its own working directory"
+fi
+
+echo "==> 9/10 a rejected job is a result, not a wedge"
+"$SPOOL" add alpha "$A" >/dev/null; "$SPOOL" add alpha "$B" >/dev/null
+printf '#!/bin/bash\nexit 1\n' > "$SANDBOX/failing"; chmod +x "$SANDBOX/failing"
+OUT="$(HANDOFF_BIN="$SANDBOX/failing" "$SPOOL" drain 2>&1)"
+if ! grep -q "2 job(s) run" <<<"$OUT"; then
+    fail "the queue stopped on a rejection, stranding everything behind it" "$OUT"
+elif ! grep -q "rejected" <<<"$OUT"; then
+    fail "a failed round was not recorded as rejected" "$OUT"
+else
+    pass "recorded and moved on"
+fi
+
+echo "==> 10/10 the callback fires with the verdict the gates reached"
+SEEN="$SANDBOX/callback.txt"
+OUT="$( cd "$R" && HANDOFF_USES_LOCAL_GPU=1 HANDOFF_PROVIDER=stub STUB_PATCH="true" \
+        HANDOFF_CALLBACK="cat > $SEEN" handoff do alpha 2>&1 )"
+if [[ ! -s "$SEEN" ]]; then
+    fail "no callback fired" "$OUT"
+elif ! grep -q '"event":"ai-run-end"' "$SEEN"; then
+    fail "the callback payload is not an ai-run-end event" "$(cat "$SEEN")"
+elif ! grep -q '"verdict":"accepted"' "$SEEN"; then
+    fail "the verdict did not reach the callback" "$(cat "$SEEN")"
+else
+    pass "ai-run-end delivered, carrying the gates' verdict"
+fi
+
+echo
+if [[ "$FAILURES" -eq 0 ]]; then echo "all checks passed"; else echo "$FAILURES check(s) failed"; fi
+exit $(( FAILURES > 0 ? 1 : 0 ))

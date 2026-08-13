@@ -33,6 +33,14 @@ source "$(dirname "${BASH_SOURCE[0]}")/opencode.sh"
 
 provider_name() { echo "ollama"; }
 
+# This provider drives the one local model server on this machine, so rounds using it must be
+# serialised. Two clients against one server interleave their lines in llamacpp.log, and the token
+# accounting above brackets a round by BYTE OFFSET into that file -- so concurrent rounds do not
+# merely contend for the GPU, they silently attribute each other's tokens. bin/handoff reads this
+# flag to decide whether to take the GPU lock.
+HANDOFF_USES_LOCAL_GPU=1
+
+
 _ollama_opencode_preflight() { :; }
 eval "_ollama_opencode_preflight() { $(declare -f provider_preflight | tail -n +2) }"
 

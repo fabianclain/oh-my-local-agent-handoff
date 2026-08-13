@@ -409,6 +409,7 @@ dishonest:
 | [DRIVING.md](DRIVING.md) | Who does what, how to size a task, how to read a failure |
 | [usage.md](usage.md) | The full command surface, provider table, settings with their evidence |
 | [how-it-works.md](how-it-works.md) | The gates, the four prompt layers, who decides what "verified" means |
+| [queueing.md](queueing.md) | Several projects, one model: the lock, your place in the queue, the spool, callbacks |
 | [answerability.md](answerability.md) | The three exit codes every gate uses, and what a check must do when it cannot answer |
 | [local-models.md](local-models.md) | Every measured finding, and the register of conclusions that turned out wrong |
 | [../bench/COMPARISON.md](../bench/COMPARISON.md) | Round-by-round results |

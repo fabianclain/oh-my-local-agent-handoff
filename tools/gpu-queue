@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""gpu-queue — who holds the local model, who is waiting, and how long it is likely to be.
+
+    tools/gpu-queue take <slug> <repo>      claim a ticket; prints the ticket id
+    tools/gpu-queue drop <ticket>           give it up
+    tools/gpu-queue holding <slug> <repo>   record that this process now holds the GPU
+    tools/gpu-queue released                clear the holder
+    tools/gpu-queue status [<ticket>]       one screenful: holder, your position, an estimate
+    tools/gpu-queue record <provider> <seconds>   add a completed round to the history
+    tools/gpu-queue history                 what the estimate is drawn from
+
+WHY THIS EXISTS SEPARATELY FROM THE LOCK
+
+`flock` is the right primitive for the lock itself: it releases when the process dies, which no
+pid file does reliably, and bin/handoff and bench/run both re-exec under it. What flock cannot
+tell you is anything a person wants to know while waiting — who is ahead, how many, how long.
+So the lock stays flock, and this keeps the register beside it.
+
+The register is advisory by construction. A ticket that is never dropped, because the waiter was
+killed, is ignored as soon as its pid is gone; nothing here can block a round or fail one. That is
+deliberate: a bookkeeping file that could wedge the GPU would be a worse bug than the queue it
+describes.
+
+ON THE ESTIMATE
+
+Drawn from the durations of real rounds on this machine, per provider, not from a guess. With
+fewer than three recorded rounds for that provider it says so and gives no number.
+
+That refusal matters more than the estimate does. "About 4 minutes" over one prior data point is
+the same failure this project keeps finding in its own gates: a plausible figure printed where the
+honest answer is "not enough to say". See docs/answerability.md.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pathlib
+import statistics
+import sys
+import time
+
+STATE = pathlib.Path(os.environ.get("HANDOFF_STATE")
+                     or pathlib.Path.home() / ".cache" / "agent-handoff")
+WAITING = STATE / "waiting"
+HOLDER = STATE / "gpu.holder"
+DURATIONS = STATE / "durations.tsv"
+MIN_SAMPLES = 3
+KEEP = 200
+
+
+def alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, ValueError):
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def tickets() -> list[tuple[float, int, str, str, pathlib.Path]]:
+    """Every live waiter, oldest first: (claimed_at, pid, slug, repo, path).
+
+    Dead waiters are unlinked on sight rather than filtered, so a queue nobody is watching does
+    not grow forever.
+    """
+    out = []
+    if not WAITING.is_dir():
+        return out
+    for path in WAITING.iterdir():
+        try:
+            body = dict(line.split("=", 1) for line in
+                        path.read_text().splitlines() if "=" in line)
+            pid = int(body.get("pid", "0"))
+        except (OSError, ValueError):
+            continue
+        if not alive(pid):
+            path.unlink(missing_ok=True)
+            continue
+        out.append((float(body.get("at", "0")), pid, body.get("slug", "?"),
+                    body.get("repo", "?"), path))
+    return sorted(out)
+
+
+def holder() -> dict | None:
+    try:
+        body = dict(line.split("=", 1) for line in
+                    HOLDER.read_text().splitlines() if "=" in line)
+    except OSError:
+        return None
+    try:
+        if not alive(int(body.get("pid", "0"))):
+            HOLDER.unlink(missing_ok=True)
+            return None
+    except ValueError:
+        return None
+    return body
+
+
+def durations(provider: str) -> list[float]:
+    if not DURATIONS.is_file():
+        return []
+    out = []
+    for line in DURATIONS.read_text(errors="replace").splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 3 and parts[1] == provider:
+            try:
+                out.append(float(parts[2]))
+            except ValueError:
+                continue
+    return out
+
+
+def human(seconds: float) -> str:
+    seconds = int(seconds)
+    if seconds < 90:
+        return f"{seconds}s"
+    minutes, rest = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m{rest:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
+
+
+def estimate(provider: str, ahead: int, elapsed: float) -> tuple[str, str]:
+    """(estimate, what it is based on). Returns ("", reason) when there is not enough history."""
+    samples = durations(provider)
+    if len(samples) < MIN_SAMPLES:
+        return "", (f"no estimate — {len(samples)} recorded round(s) for {provider}, "
+                    f"{MIN_SAMPLES} needed")
+    median = statistics.median(samples[-20:])
+    # The round in progress has already run for `elapsed`, so only the remainder of it counts.
+    remaining_current = max(0.0, median - elapsed)
+    total = remaining_current + median * ahead
+    return human(total), f"median round {human(median)} over the last {len(samples[-20:])}"
+
+
+def cmd_status(ticket: str | None) -> int:
+    live = tickets()
+    held = holder()
+    if held:
+        since = time.time() - float(held.get("at", time.time()))
+        print(f"    holder:   {held.get('slug', '?')} in {held.get('repo', '?')} "
+              f"(pid {held.get('pid', '?')}, {human(since)} so far)")
+    else:
+        since = 0.0
+        print("    holder:   nobody — the model is free")
+
+    position, ahead = None, len(live)
+    if ticket:
+        for index, (_, _, _, _, path) in enumerate(live):
+            if path.name == ticket:
+                position, ahead = index + 1, index
+                break
+    if position is not None:
+        print(f"    you are:  #{position} of {len(live)} waiting"
+              + (" — next up" if position == 1 else ""))
+    elif live:
+        print(f"    waiting:  {len(live)}")
+
+    provider = os.environ.get("HANDOFF_PROVIDER", "native")
+    guess, basis = estimate(provider, ahead if held else max(0, ahead - 1), since)
+    print(f"    estimate: ~{guess} ({basis})" if guess else f"    estimate: {basis}")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="command", required=True)
+    take = sub.add_parser("take"); take.add_argument("slug"); take.add_argument("repo")
+    # The ticket belongs to the WAITING PROCESS, not to this one. Defaulting to our own pid made
+    # every ticket stale the instant the command exited, so the queue was always empty and the
+    # position line never printed -- a register that silently recorded nothing.
+    take.add_argument("--pid", type=int, default=None)
+    drop = sub.add_parser("drop"); drop.add_argument("ticket")
+    hold = sub.add_parser("holding"); hold.add_argument("slug"); hold.add_argument("repo")
+    hold.add_argument("--pid", type=int, default=None)
+    sub.add_parser("released")
+    status = sub.add_parser("status"); status.add_argument("ticket", nargs="?")
+    rec = sub.add_parser("record"); rec.add_argument("provider"); rec.add_argument("seconds")
+    sub.add_parser("history")
+    args = parser.parse_args()
+
+    if args.command == "take":
+        WAITING.mkdir(parents=True, exist_ok=True)
+        owner = args.pid or os.getppid()
+        name = f"{time.time():.6f}-{owner}"
+        (WAITING / name).write_text(
+            f"at={time.time()}\npid={owner}\nslug={args.slug}\nrepo={args.repo}\n")
+        print(name)
+        return 0
+
+    if args.command == "drop":
+        (WAITING / args.ticket).unlink(missing_ok=True)
+        return 0
+
+    if args.command == "holding":
+        STATE.mkdir(parents=True, exist_ok=True)
+        HOLDER.write_text(f"at={time.time()}\npid={args.pid or os.getppid()}\n"
+                          f"slug={args.slug}\nrepo={args.repo}\n")
+        return 0
+
+    if args.command == "released":
+        HOLDER.unlink(missing_ok=True)
+        return 0
+
+    if args.command == "status":
+        return cmd_status(args.ticket)
+
+    if args.command == "record":
+        try:
+            seconds = float(args.seconds)
+        except ValueError:
+            return 64
+        # A round that died in seconds is not a round, and letting it into the median would drag
+        # every estimate down. A round that ran for hours was almost certainly hung.
+        if not 5 <= seconds <= 6 * 3600:
+            return 0
+        STATE.mkdir(parents=True, exist_ok=True)
+        with DURATIONS.open("a") as handle:
+            handle.write(f"{int(time.time())}\t{args.provider}\t{seconds:.0f}\n")
+        lines = DURATIONS.read_text(errors="replace").splitlines()
+        if len(lines) > KEEP:
+            DURATIONS.write_text("\n".join(lines[-KEEP:]) + "\n")
+        return 0
+
+    if args.command == "history":
+        provider = os.environ.get("HANDOFF_PROVIDER", "native")
+        samples = durations(provider)
+        if not samples:
+            print(f"no rounds recorded for {provider}")
+            return 0
+        print(f"{len(samples)} round(s) for {provider}: "
+              f"median {human(statistics.median(samples))}, "
+              f"fastest {human(min(samples))}, slowest {human(max(samples))}")
+        return 0
+    return 64
+
+
+if __name__ == "__main__":
+    sys.exit(main())
