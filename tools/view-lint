@@ -98,6 +98,9 @@ class Balance(HTMLParser):
         # How many elements the balance check actually applied to. Reported so the pass message
         # states its denominator instead of asserting a result that is vacuous at zero.
         self.checked = 0
+        # Headings in document order, as (level, line). Order is the whole point: a page can have
+        # an h1 and still read as a broken document if something outranks it on the way down.
+        self.headings: list[tuple[int, int]] = []
 
     def report(self, tag: str, message: str) -> None:
         (self.component_errors if is_component(tag) else self.errors).append(message)
@@ -108,6 +111,8 @@ class Balance(HTMLParser):
         for key, value in attrs:
             if key.lower() == "id" and value:
                 self.ids.append(value)
+        if tag in HEADINGS:
+            self.headings.append((int(tag[1]), self.getpos()[0]))
         if tag not in VOID:
             self.checked += 1
             self.stack.append((tag, self.getpos()[0]))
@@ -188,6 +193,31 @@ def check_structure(balance: Balance, text: str) -> list[str]:
         # A checklist prevents that; blame does not.
         findings.append("no heading element (h1-h6) — if the plan asked for one, this is a defect; "
                         "if it did not, the plan should have")
+    # The outline, which is not the same question as "is there an h1".
+    #
+    # Reported from real use: a document rendered <h2>Supplier, <h2>Client, then <h1>Offer no. 42.
+    # Tag balance is perfect, an h1 exists, every text assertion passes, and it reads as an HTML
+    # dump rather than a document — the title does not lead. Nothing in the harness saw it.
+    levels = [level for level, _ in balance.headings]
+    if levels:
+        first_h1 = next((i for i, level in enumerate(levels) if level == 1), None)
+        if first_h1 is None:
+            findings.append("headings start at h%d and there is no h1 — a document's title should "
+                            "lead, and screen readers use the first level as the outline root"
+                            % levels[0])
+        elif first_h1 > 0:
+            line = balance.headings[first_h1][1]
+            findings.append("the h1 on line %d is preceded by %d heading(s) at h%s — the title "
+                            "does not lead the outline"
+                            % (line, first_h1, "/h".join(str(l) for l in levels[:first_h1])))
+        if levels.count(1) > 1:
+            findings.append("%d h1 elements — a document has one title" % levels.count(1))
+        for (previous, _), (level, line) in zip(balance.headings, balance.headings[1:]):
+            if level > previous + 1:
+                findings.append("the outline skips from h%d to h%d on line %d"
+                                % (previous, level, line))
+                break
+
     duplicates = {i for i in balance.ids if balance.ids.count(i) > 1}
     if duplicates:
         findings.append("duplicate id(s): " + ", ".join(sorted(duplicates)))

@@ -122,6 +122,29 @@ SMALL_TEXT = LARGE_TEXT.replace("font-size: 30px", "font-size: 14px")
 VIEW_CASES = [
     # (name, file contents, suffix, must appear, must not appear, expected exit)
 
+    # The outline, not merely the presence of an h1. Reported from real use: a document rendered
+    # <h2>Supplier, <h2>Client, then <h1>Offer no. 42 — tag balance perfect, an h1 present, every
+    # text assertion passing, and it reads as an HTML dump because the title does not lead.
+    ("an h1 that does not lead the outline is reported",
+     "<html><body><h2>Furnizor</h2><h2>Client</h2><h1>Ofertă nr. 42</h1></body></html>",
+     ".html", ["does not lead the outline"], ["MALFORMED"], 0),
+
+    ("a correct outline is left alone",
+     "<html><body><h1>T</h1><h2>A</h2><h3>B</h3><h2>C</h2></body></html>",
+     ".html", ["well-formed"], ["outline", "does not lead"], 0),
+
+    ("a skipped level is reported",
+     "<html><body><h1>T</h1><h3>B</h3></body></html>",
+     ".html", ["skips from h1 to h3"], [], 0),
+
+    ("headings with no h1 at all are reported",
+     "<html><body><h2>A</h2><h3>B</h3></body></html>",
+     ".html", ["there is no h1"], [], 0),
+
+    ("two h1 elements are reported",
+     "<html><body><h1>T</h1><h1>U</h1></body></html>",
+     ".html", ["2 h1 elements"], [], 0),
+
     # A gate that certifies an absence is the failure this project keeps finding. view-lint
     # reported "every element that requires an end tag has one" over an EMPTY file and exited 0,
     # so a plan whose markup gate is this one would have passed an empty deliverable.

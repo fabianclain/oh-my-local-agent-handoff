@@ -116,6 +116,21 @@ mechanical remainder — and having done that, do not then expect it to fail.
 
 ## The procedure
 
+### 0. If anything is unproven, spike it — and spike the WHOLE toolchain
+
+Before specifying work that depends on something you have not seen succeed, prove it by hand:
+build the smallest thing that exercises it and watch it work.
+
+**One gate is not the toolchain.** Reported from real use: a spike proved `react-dom/server` bundles
+for Hermes, and the plan that followed asserted a typecheck the project could not pass — the app had
+`@types/react` and not `@types/react-dom`, and the plan's own rules forbade adding a dependency. The
+criterion was unsatisfiable under the constraints it shipped with, which is a specification defect
+and costs a whole round.
+
+So spike every gate the plan will assert: it bundles **and** it typechecks **and** it lints **and**
+its tests run. If a gate needs a package the project lacks, either add it before the round or leave
+that gate out — a criterion the constraints forbid can never pass.
+
 ### 1. Understand the request before specifying it
 
 Ask about anything that would change the code; stop when the answer would not. Boundary and zero
@@ -185,9 +200,15 @@ Name them in order: `<slug>-1-service`, `<slug>-2-view`. Write every plan up fro
 review the whole sequence, then run them one at a time.
 
 **Commit between steps.** This is mechanical, not stylistic: the implementer leaves changes
-uncommitted, and every plan asserts how many files changed. If step 1's changes are still sitting
-in the tree, step 2's file-count criterion counts them and fails. So after each accepted step, show
-the user the diff and have them commit before the next one starts.
+uncommitted, and the scope gate compares the tree against the plan's file list. If step 1's changes
+are still sitting in the tree, step 2's scope gate charges them to step 2. So after each accepted
+step, show the user the diff and have them commit before the next one starts.
+
+**And write the plans up front for the same reason, not only for review.** Writing step 2's plan
+*while step 1 is running* puts a new file in the tree mid-round, and it shows up under "changed by
+this run". It is harmless only when it lands somewhere excluded — `.handoff/plans/` is — and a
+scratch note anywhere else is charged to the model. Nothing should touch the tree between
+`handoff do` and its verdict. Reported from real use.
 
 **Stop on the first rejection.** Do not run step 4 because step 3 failed — fix step 3's plan and
 re-run it. Later steps usually assume the earlier ones landed.
