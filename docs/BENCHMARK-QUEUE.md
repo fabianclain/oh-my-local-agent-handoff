@@ -652,9 +652,10 @@ that failed a correct page earlier the same night, agreement between two impleme
 standard a failure has to meet before it is called the model's.
 
 So the plan is not saturated after all — it is a **1-in-16 instrument**, which is worth having and
-is not the ~50% one roadmap item 1 needs. Note also that the repair attempt did not recover it: the
-run failed, was told which commands failed, tried again, and still shipped 11 of 13. That is the
-repair loop exercised on a real failure for the first time tonight, and it did not help.
+is not the ~50% one roadmap item 1 needs. Note also that the repair attempt did not recover this one: the run failed, was told which
+commands failed, tried again, and still shipped 11 of 13.
+
+**That reading was corrected ten runs later, and it was a reading from n=1.** See below.
 
 ### Does `--max-turns 40` bind? Yes — 1 in 20, and the cause is not exploration
 
@@ -764,3 +765,27 @@ so a tree is never accepted on the model's say-so. What is lost is the model's a
 own mistake before submitting: a run that cannot execute the acceptance commands cannot iterate
 against them, and the repair loop has nothing to act on. A verification command the implementer can
 actually invoke is worth more than a clever one-liner.
+
+### The repair loop does work — 1 of 2, on the failure the plan was built to cause
+
+Run 26 failed `darkscheme` on its first attempt, was handed that failing command by the repair
+loop, and fixed it: 13 of 13 on the second attempt, accepted, 954 seconds.
+
+So the loop's record on a real failure is now **1 recovered of 2 exercised**, against the flat
+"it did not help" written after run 16 — which was a conclusion from a single data point, and
+should not have been phrased that firmly.
+
+Two is still nothing to build on, and it is worth being clear about what it does and does not
+touch. Rounds 7 and 8 asked whether giving the repair attempt MORE — a richer failure narrative,
+then git's account of the tree — improved it, and both made outcomes worse or no better. Nothing
+here bears on that. What these two runs show is the baseline working at all: the default
+`commands` feedback, one failing gate named, and the model fixing it.
+
+That is also the first evidence from this project that a repair attempt recovers a run, as opposed
+to re-deriving the first attempt or damaging it. It is worth having because the gate that failed
+was specific — `darkscheme` names the selectors that lack a dark colour — and a repair attempt can
+act on that in a way it cannot act on "the tests failed".
+
+**Which points at where the feedback experiments went wrong.** Rounds 7 and 8 varied how MUCH the
+attempt was told. The variable that looks live here is how SPECIFIC it is, and that is a property
+of the gate rather than of the renderer.
