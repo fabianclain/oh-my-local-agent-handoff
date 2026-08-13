@@ -747,7 +747,14 @@ could **not** resolve on every run; read that part.
 
 **`handoff view-lint`** checks tag balance. Unbalanced HTML renders and passes everything, which is why the
 malformed page above survived 85 tests. It also reports the `align-items: center` +
-`min-height: 100vh` trap, which clips the top of an over-tall card with nothing to scroll to.
+`min-height: 100vh` trap, which clips the top of an over-tall card with nothing to scroll to, the
+heading outline, and siblings indented to different columns.
+
+That last one arrived the way most of this tool's rules do: found by eye on real work, after both
+gates and 345 tests were green — a drag handle at 16 spaces among siblings at 8. `pint` does not
+format Blade, tag balance is unaffected, and every `assertSee` passes over it. It is advisory
+unless you pass `--strict`, because indentation that is wrong is a review comment and a cosmetic
+rule able to reject correct work would be the worse bug.
 
 **A view plan must ask for a heading element.** The missing `<h1>` was a spec gap, not a model
 error — the plan said "a centred card" and never said "heading", and the model was right to build

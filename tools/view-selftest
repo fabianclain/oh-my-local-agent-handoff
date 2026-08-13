@@ -122,6 +122,30 @@ SMALL_TEXT = LARGE_TEXT.replace("font-size: 30px", "font-size: 14px")
 VIEW_CASES = [
     # (name, file contents, suffix, must appear, must not appear, expected exit)
 
+    # Sibling indentation. Found by eye on real work, after both gates and 345 tests were green:
+    # a drag handle at 16 spaces among siblings at 8. pint does not format Blade, tag balance is
+    # unaffected, and every assertSee passes over it.
+    ("a sibling indented differently is reported",
+     "<div>\n    <span>a</span>\n                <button>b</button>\n    <span>c</span>\n</div>",
+     ".blade.php", ["indented differently", "column 4", "at 16"], ["MALFORMED"], 0),
+
+    # The case that keeps the rule honest. A cosmetic check that fires on correct markup is worse
+    # than no check, because the next real finding is read as more of the same.
+    ("evenly indented siblings are left alone",
+     "<div>\n    <span>a</span>\n    <button>b</button>\n    <span>c</span>\n</div>",
+     ".blade.php", [], ["indented differently"], 0),
+
+    # @foreach indents its body without being an element, so its children are legitimately deeper
+    # than their siblings. Flagging that would fire on most Blade files in existence.
+    ("siblings separated by a Blade directive are not reported",
+     "<div>\n    <span>a</span>\n    @foreach ($xs as $x)\n        <span>{{ $x }}</span>\n    @endforeach\n</div>",
+     ".blade.php", [], ["indented differently"], 0),
+
+    # Inside <pre>, leading whitespace is the content.
+    ("indentation inside <pre> is content, not a finding",
+     "<div>\n    <pre>\n<span>a</span>\n        <span>b</span>\n    </pre>\n</div>",
+     ".blade.php", [], ["indented differently"], 0),
+
     # The outline, not merely the presence of an h1. Reported from real use: a document rendered
     # <h2>Supplier, <h2>Client, then <h1>Offer no. 42 — tag balance perfect, an h1 present, every
     # text assertion passing, and it reads as an HTML dump because the title does not lead.
