@@ -137,10 +137,25 @@ def analyse(run: pathlib.Path) -> dict:
 
 
 def runs_under(target: pathlib.Path) -> list[pathlib.Path]:
+    """Every run directory at or below `target`, whichever level it names.
+
+    A results tree is <plan>/<arm>/<repetition>, and the analysis tools disagreed about which
+    level they took: this one and report-audit wanted the ARM, fuzz-all-semantic wanted the PLAN.
+    Handed the wrong one they behaved differently too — "no runs found" and exit 1 here, and a
+    silent exit 0 having checked nothing there, which is the worse of the two and was a real bug.
+
+    A queue author should not have to remember which tool takes which level. Getting it wrong
+    ended two analysis jobs of the 2026-08-13 night, in a queue file written by the person who had
+    fixed the sibling case an hour earlier.
+    """
     if (target / "provider.log").exists():
         return [target]
-    return sorted((p.parent for p in target.glob("*/provider.log")),
-                  key=lambda p: (len(p.name), p.name))
+    for pattern in ("*/provider.log", "*/*/provider.log", "*/*/*/provider.log"):
+        found = sorted((p.parent for p in target.glob(pattern)),
+                       key=lambda p: (len(p.parent.name), p.parent.name, len(p.name), p.name))
+        if found:
+            return found
+    return []
 
 
 def main() -> int:
