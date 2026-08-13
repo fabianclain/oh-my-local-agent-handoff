@@ -1,4 +1,4 @@
-# Build the SSMatic landing page, in both colour schemes
+# Build the Exemplu landing page, in both colour schemes
 
 ## What to do
 
@@ -33,7 +33,7 @@ button's text colour has to invert with the scheme, not stay put.
 
 ### The six landmarks, in this order, each with this exact `id`
 
-**1. `<header id="masthead">`** — the wordmark `SSMatic`, linking to `#hero`, and a nav with three
+**1. `<header id="masthead">`** — the wordmark `Exemplu`, linking to `#hero`, and a nav with three
 links:
 
 | Label | Target |
@@ -72,15 +72,15 @@ quote, with the attribution in a `<cite>` or `<footer>` inside it:
 
 | Quote | Attribution |
 | --- | --- |
-| `Am economisit peste 200 de ore de muncă în primul trimestru de utilizare.` | `Ing. Maria Popescu, Director HR, TechnoConstruct SRL` |
-| `Investiția s-a amortizat în prima lună. Nu mai plătim consultanți externi.` | `Andrei Ionescu, Administrator, Construct Plus SRL` |
-| `Suportul tehnic este excepțional și platforma extrem de ușor de folosit.` | `Elena Stoica, Șef Serviciu SSM, Industrial Group SA` |
+| `Am economisit peste 200 de ore de muncă în primul trimestru de utilizare.` | `Director HR, Alfa Construct SRL` |
+| `Investiția s-a amortizat în prima lună. Nu mai plătim consultanți externi.` | `Administrator, Beta Instal SRL` |
+| `Suportul tehnic este excepțional și platforma extrem de ușor de folosit.` | `Șef Serviciu SSM, Gamma Industrial SA` |
 
 **5. `<section id="cta">`** — an `<h2>` reading `Gata să Revoluționezi Protecția Muncii?` and one
 button-styled link reading `Începe Gratuit Acum`, pointing at `#cta`.
 
-**6. `<footer id="colophon">`** — the address `Str Tărnavelor, nr 34, Cluj-Napoca` and the phone
-number `0728-787-372`.
+**6. `<footer id="colophon">`** — the address `Str. Exemplu, nr 1, Cluj-Napoca` and the phone
+number `0700-000-000`.
 
 ## Do not change
 

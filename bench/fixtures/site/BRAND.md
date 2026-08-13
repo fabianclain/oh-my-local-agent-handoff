@@ -1,8 +1,8 @@
-# SSMatic brand sheet
+# Exemplu brand sheet
 
 Read-only. The plan that uses this fixture may not modify it.
 
-The palette is the live site's own (`ssmatic.ro/multiassets/assets/css/style.css`), and the
+The palette is the live site's own (`a production marketing site, kept because its mistakes are real`), and the
 contrast figures below are computed by `tools/css-contrast`, not estimated.
 
 ## Colours

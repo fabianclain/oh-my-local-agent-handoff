@@ -75,14 +75,14 @@ CASES = [
      ("<h3>Semnare prin SMS</h3>", "<h3>Modele de Documente</h3>")),
 
     ("a testimonial loses its attribution", "testimonials",
-     ("<cite>Andrei Ionescu, Administrator, Construct Plus SRL</cite>", "")),
+     ("<cite>Administrator, Beta Instal SRL</cite>", "")),
 
     ("an image with no alt", "alt",
-     ('<a class="wordmark" href="#hero">SSMatic</a>',
+     ('<a class="wordmark" href="#hero">Exemplu</a>',
       '<a class="wordmark" href="#hero"><img src="logo.png"></a>')),
 
     ("an unlabelled inline svg", "alt",
-     ('<a class="wordmark" href="#hero">SSMatic</a>',
+     ('<a class="wordmark" href="#hero">Exemplu</a>',
       '<a class="wordmark" href="#hero"><svg viewBox="0 0 10 10"></svg></a>')),
 
     ("the wrong language", "meta",
@@ -96,8 +96,8 @@ CASES = [
      ("<style>", '<link rel="stylesheet" href="https://cdn.example.com/x.css">\n<style>')),
 
     ("a remote image", "selfcontained",
-     ('<a class="wordmark" href="#hero">SSMatic</a>',
-      '<a class="wordmark" href="#hero"><img alt="SSMatic" src="//cdn.example.com/l.png"></a>')),
+     ('<a class="wordmark" href="#hero">Exemplu</a>',
+      '<a class="wordmark" href="#hero"><img alt="Exemplu" src="//cdn.example.com/l.png"></a>')),
 ]
 
 
