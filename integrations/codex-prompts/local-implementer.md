@@ -304,18 +304,30 @@ Plans go where `.handoff/config.sh` says. Shape from `templates/plan.md`.
    is lost is the repair loop having anything to act on. Prefer a command the implementer can run
    over a clever one that only the harness will.
 
-   **Scope criteria must exclude what the harness excludes.** A criterion that counts changed
-   files with
+   **Do not hand-roll a changed-file count. The harness already answers that question.**
+
+   A criterion like
 
    ```bash
    test "$(git status --porcelain --untracked-files=all -- . ':(exclude).handoff')" -eq 1
    ```
 
-   is narrower than the harness's own scope check, which also excludes `.omc`, `vendor`,
-   `node_modules` and `storage`. Any agent state written into the worktree is then counted as the
-   model's work and the plan fails for something it granted. Exclude the same paths, and use
-   `--untracked-files=all`: plain `--porcelain` collapses an untracked DIRECTORY to one line, so a
-   file count written without it stops guarding the moment the model creates a folder.
+   looks like a scope guard and is a worse one than the gate you already have, for three reasons
+   that each cost a round in a real project:
+
+   - It is narrower than the harness's own exclusions, which also cover `.omc`, `vendor`,
+     `node_modules` and `storage`. Agent state written into the tree is then charged to the model.
+   - It cannot tell a file the model created from one that was **already** untracked. The harness
+     can: it snapshots untracked files before the round and compares. `handoff init` itself writes
+     a `.gitignore`, and a plan counting files failed on it while the harness's scope gate — which
+     knew the file predated the run — correctly passed.
+   - Plain `--porcelain` collapses an untracked DIRECTORY to one line, so the count stops guarding
+     the moment the model creates a folder.
+
+   The `scope` gate in the evidence bundle already reports every changed file the plan did not
+   name, with pre-existing untracked files excluded, and it rejects the round on its own. Name the
+   files in `## Files to touch` and let it do the work. If you want a criterion that says so out
+   loud, assert the CONTENT you expect rather than a count of paths.
 
 ### 6. Check it
 
