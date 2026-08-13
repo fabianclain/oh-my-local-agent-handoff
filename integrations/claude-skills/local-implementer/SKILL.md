@@ -189,6 +189,25 @@ So size a step by the conversation it will produce, not by the window it has ava
 needs the model to read six files before it can write one is a deep conversation regardless of how
 few files it changes.
 
+**Editing inside a big file.** `read_files` returns about 20,000 bytes at a time. A file past that
+is read in windows — `{"path": ..., "start": 871, "end": 930}`, 1-based and inclusive, taking the
+line numbers straight from a `search` match. That works, and it is still two round trips before
+the model has seen the code it must edit, on top of the search that located it.
+
+The cost is worth stating plainly, because it was paid: a step whose two insertion anchors sat at
+lines 871 and 914 of a 1,052-line component ran three times and wrote nothing. Once the anchors
+are quoted verbatim in the plan, none of those trips are needed — so quote them, with their line
+numbers, whenever the target file is over a few hundred lines:
+
+```
+Insert immediately after this line (currently line 914):
+
+    private function moveOption(int $optionId, int $direction): void
+```
+
+A line number goes stale the moment anything above it changes, which is why the quoted text is
+what the model anchors on and the number is only a hint about where to look.
+
 **Be honest about what this buys.** It does *not* make the model more likely to succeed per step —
 the six-file plan actually scored slightly better on first attempt (87%) than the four-file one
 (80%). What it buys is:
@@ -223,6 +242,17 @@ step, show the user the diff and have them commit before the next one starts.
 this run". It is harmless only when it lands somewhere excluded — `.handoff/plans/` is — and a
 scratch note anywhere else is charged to the model. Nothing should touch the tree between
 `handoff do` and its verdict. Reported from real use.
+
+**That includes another agent session.** `handoff do` and `handoff resume` now take a lock on
+`.handoff/.lock` and refuse to start while a round is running in the same checkout, because the
+rule above was written and then broken the same day: two sessions drove this harness at one
+repository, one reverted the file the other was patching, and both got verdicts about each other's
+edits. If you see `refusing to start: a round is already running`, that is the mechanism working —
+find the other round rather than deleting the lock. A lock whose owner has exited is cleared
+automatically and says so.
+
+Before starting a sequence in a repository you do not have to yourself, check: `ls -la
+.handoff/.lock` and whether anything else is holding the tree.
 
 **Stop on the first rejection.** Do not run step 4 because step 3 failed — fix step 3's plan and
 re-run it. Later steps usually assume the earlier ones landed.
@@ -553,13 +583,37 @@ judgement. Keep it on your side.
 | The code is a stub that satisfies weaker criteria | The criteria were too coarse | Sharpen the assertions — the commonest case in view work |
 | The code attempts the right thing and gets it wrong | A genuine model error | Narrow the step until the mistake has nowhere to hide |
 | A criterion that could not pass over any tree — greps coloured output, asserts a path that moved | Your acceptance command is unsatisfiable | Read the command's own log first. A broken criterion and a broken implementation look identical from the verdict |
-| Empty diff, `files` 0, often a report claiming success | Infrastructure failed; the plan was never exercised | **Re-run the same plan once**, then fix the adapter. Do not re-specify |
+| Empty diff, `files` 0, ends in **seconds** on a few hundred tokens, often a report claiming success | Infrastructure failed; the plan was never exercised | **Re-run the same plan once**, then fix the adapter. Do not re-specify |
+| Empty diff, `files` 0, ends on the **turn limit** after many searches and repeated identical reads | The model was asked and could not reach the target | Read the tool arguments. Do not re-run, and do not re-specify until you know what it could not reach |
+| Empty diff, `files` 0, but the log shows writes that **succeeded** | Something else edited the tree mid-round | Nothing to diagnose about the plan. Find the other writer; the verdict is void |
 
-That last row is the exception to "never re-run the same plan", and it matters because the default
-is exactly wrong when the plan was never asked. Recognise it by the tool calls, not the report: one
-round made 44 calls, every one a read or a search, not a single write, finished in 35 seconds on
-1336 output tokens, and reported `"status": "partial"`. Check `.handoff/runs/<slug>/stdout.log` for
-tool-call format errors before concluding anything about the plan.
+Those two rows look identical in the verdict — no writes, no diff — and their remedies are
+opposite. The clock separates them. Infrastructure that never asked the question finishes in 35
+seconds on 1,336 output tokens; a model that was asked and could not answer burns its whole turn
+budget. Check `.handoff/runs/<slug>/stdout.log` for tool-call format errors before concluding
+anything about the plan.
+
+**When it is the second row, read the tool ARGUMENTS, not the counts.** A round that searches 66
+times looks like a model flailing, and the same log read one level down showed it was not: the same
+`read_files` call returning the same 20,028 bytes three times, and searches for a declaration the
+tool had already reported at line 914. Both anchors were past the read cap, so no available tool
+could show them; the model's own reasoning asked for the missing capability by name. Three rounds
+and ~25 minutes of GPU went to a loop that could not terminate, and two of those rounds were spent
+because the table above said to re-run.
+
+```bash
+python3 - .handoff/runs/<slug>/stdout.log <<'PY'
+import json, sys
+for line in open(sys.argv[1], errors="replace"):
+    if not line.startswith("{"): continue
+    e = (json.loads(line).get("event") or {})
+    if e.get("contentType") == "tool" and e.get("type") == "content_end":
+        print(e.get("toolName"), json.dumps(e.get("args"))[:120])
+PY
+```
+
+The tell is **repetition with no progress**: the same arguments, or a search whose answer the model
+already has. A model repeating itself is telling you a tool did not give it what it asked for.
 
 **Re-specify, do not re-ask.** Write a *new, smaller* plan covering only what failed — often a
 single criterion. If step 3 of 5 failed one of its four criteria, the retry is a one-criterion step,

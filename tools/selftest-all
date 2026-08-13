@@ -14,6 +14,8 @@
 #   patch-shape-selftest the order and hunk-count checks
 #   shim-selftest        the tool-call shim (needs no model either)
 #   native-retry-selftest the native loop against a scripted server that returns parse faults
+#   native-tools-selftest can the model reach a file past the read cap, and is a failed search
+#                         reported as a failure rather than as an absence
 #   turn-economy-selftest the redundancy counters, against a log built to trip them
 #   report-audit-selftest which channel each round's report came through, and why not
 #   journal-selftest      the two columns a person reads: files touched, and errors
@@ -39,7 +41,7 @@ REPO="$(cd "$HERE/.." && pwd)"
 cd "$REPO"
 FAILED=()
 
-for suite in smoke-e2e harness-selftest verifier-selftest feedback-selftest patch-shape-selftest shim-selftest native-retry-selftest turn-economy-selftest report-audit-selftest journal-selftest roundup-selftest plan-lint-selftest view-selftest site-audit-selftest overnight-selftest docblock-anchor-selftest; do
+for suite in smoke-e2e harness-selftest verifier-selftest feedback-selftest patch-shape-selftest shim-selftest native-retry-selftest native-tools-selftest turn-economy-selftest report-audit-selftest journal-selftest roundup-selftest plan-lint-selftest view-selftest site-audit-selftest overnight-selftest docblock-anchor-selftest; do
     # Suites live in tools/, except the ones that test a bench fixture and belong beside it.
     # Resolving only tools/ made a real suite report `SKIP (missing)` — which this file's own next
     # comment calls the failure it exists to avoid, one line before failing to avoid it.

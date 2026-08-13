@@ -16,7 +16,18 @@
 # The event log is written in Cline's shape deliberately, so tools/journal, tools/final-turn-shape
 # and tools/replay-final-turn keep working against native runs without changes.
 : "${HANDOFF_MODEL:=gpt-oss-20b}"
-: "${NATIVE_MAX_TURNS:=40}"
+# 40 was a bench number. On the bench it binds about 1 round in 20; on the first real feature it
+# was tried against it bound on 4 rounds out of 4, including one whose reasoning had already
+# worked out the complete correct implementation and simply ran out of iterations before it could
+# finish writing. A cap that binds on every real round is measuring the cap, not the model.
+#
+# Raising it is not free — the parse fault this stack has runs at 0% below 8k, 4.0-4.5% between 8k
+# and 32k, and 2.55-6.06% above 48k, and more turns means more depth. It is still the right trade:
+# a turn limit reached is a certain loss, while the fault is a risk that the loop already retries.
+#
+# If rounds are hitting this, the better fix is usually to reduce what the model must read before
+# it can write — quote the anchors in the plan — rather than to raise it again.
+: "${NATIVE_MAX_TURNS:=80}"
 : "${NATIVE_TEMP:=0.8}"
 export HANDOFF_MODEL
 

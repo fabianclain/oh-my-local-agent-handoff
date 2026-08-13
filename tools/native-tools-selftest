@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""native-tools-selftest — can the model reach the code it is asked to edit, and is it told
+the truth when a tool fails?
+
+    tools/native-tools-selftest
+
+Both questions come from the same round. A real step asked for two insertions into a 1,052-line
+Livewire component, at lines 871 and 914. Three rounds ran; all three ended with zero writes and
+zero files changed:
+
+    round 1   40 turns, all reads and searches
+    round 2   66 searches, 8 whole-file reads
+    round 3   23 searches, 5 whole-file reads, killed once the cause was found
+
+None of that was the model being poor at the task. Its own reasoning had the design right
+throughout, and asked out loud for the one thing it did not have: "it's defined earlier but not
+visible due to truncated, let's open around 860-900 lines again". Two tool-layer defects made the
+work impossible rather than hard.
+
+    THE FILE WAS UNREACHABLE.  read_files took a path and nothing else, and clamped its output at
+    OUTPUT_CAP. The file is 38,204 bytes. Every byte past 20,000 — including both anchors — could
+    not be read by any tool the model had. The truncation note said `[... 18204 bytes truncated]`,
+    which names a loss and no remedy, so the identical call was re-issued three times.
+
+    AN ERROR WAS REPORTED AS AN ABSENCE.  `search` passes `query` to `grep -rnE` and returned
+    `stdout or "no matches"`. `moveOption(` is an invalid regex; grep exits 2, writes nothing to
+    stdout, and the model was told "no matches for 'private function moveOption('" — a confident
+    negative about a search that never ran. It believed it and searched around the answer.
+
+That second one is this project's oldest failure family wearing a new hat: absence of evidence
+converted into evidence of absence. It is worth a guard for that reason alone.
+
+Cases 3 and 6 are the ones that make the rest trustworthy — a small file must still come back
+whole and unannotated, and a genuinely absent match must still say "no matches". A tool that
+cried wolf on every search would be no better than one that never did.
+"""
+
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import pathlib
+import subprocess
+import sys
+import tempfile
+
+HERE = pathlib.Path(__file__).resolve().parent
+AGENT = HERE / "native-agent"
+
+spec = importlib.util.spec_from_loader(
+    "native_agent", importlib.machinery.SourceFileLoader("native_agent", str(AGENT)))
+native = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(native)
+
+FAILURES = 0
+
+
+def pas(what: str) -> None:
+    print(f"    PASS: {what}")
+
+
+def bad(what: str, detail: str = "") -> None:
+    global FAILURES
+    FAILURES += 1
+    print(f"    FAIL: {what}")
+    if detail:
+        for line in detail.splitlines()[:4]:
+            print(f"        {line}")
+
+
+work = pathlib.Path(tempfile.mkdtemp())
+# Deliberately past OUTPUT_CAP, with a unique marker near the end where the recorded failure was.
+BIG = work / "Big.php"
+lines = ["<?php"] + [f"    // filler line {n} {'x' * 60}" for n in range(2, 1053)]
+lines[870] = "    private function moveItem(int $itemId, int $direction): void"
+lines[913] = "    private function moveOption(int $optionId, int $direction): void"
+BIG.write_text("\n".join(lines) + "\n")
+SMALL = work / "Small.php"
+SMALL.write_text("<?php\nclass Small {}\n")
+
+assert BIG.stat().st_size > native.OUTPUT_CAP, "the fixture must exceed the cap or nothing is tested"
+
+print("==> 1/6 a file past the cap says how many lines it has and how to reach them")
+out = native.run_tool(work, "read_files", {"files": [{"path": "Big.php"}]})
+if "of 1052" not in out:
+    bad("the truncated read does not say how long the file is", out[-300:])
+elif "start" not in out or "end" not in out:
+    bad("the truncation note names a loss but no remedy — this is the loop that cost three rounds",
+        out[-300:])
+elif "moveOption" in out:
+    bad("the whole file came back, so the cap is not being exercised")
+else:
+    pas("truncated, with the total line count and a concrete follow-up call")
+
+print("==> 2/6 the unreachable region is reachable with start/end")
+out = native.run_tool(work, "read_files", {"files": [{"path": "Big.php", "start": 860, "end": 920}]})
+if "moveOption" not in out or "moveItem" not in out:
+    bad("a windowed read did not return the lines it was asked for", out[:300])
+elif "lines 860-920 of 1052" not in out:
+    bad("the window does not state which lines it is", out.splitlines()[0] if out else "")
+else:
+    pas("lines 871 and 914 — the two anchors three rounds could not see — come back")
+
+print("==> 3/6 a small file is still returned whole, with no window furniture")
+out = native.run_tool(work, "read_files", {"files": [{"path": "Small.php"}]})
+if out != "--- Small.php ---\n<?php\nclass Small {}\n":
+    bad("an ordinary read changed shape; every plan and log in the archive assumes it did not",
+        repr(out[:200]))
+else:
+    pas("unchanged for the case that was never broken")
+
+print("==> 4/6 a window running past the end is clamped, not an error")
+out = native.run_tool(work, "read_files", {"files": [{"path": "Big.php", "start": 1040, "end": 9999}]})
+if "lines 1040-1052 of 1052" not in out:
+    bad("an over-long window was not clamped to the file", out.splitlines()[0] if out else "")
+elif "not shown" in out:
+    bad("the last line of the file was read and it still claims something remains")
+else:
+    pas("clamped to the last line, and does not claim there is more")
+
+print("==> 5/6 an invalid pattern is reported as an error, never as 'no matches'")
+out = native.run_tool(work, "search", {"query": "private function moveOption(", "path": "Big.php"})
+# Matched on the opening words, not anywhere in the text: the error deliberately contains the
+# phrase "This is NOT 'no matches'", and a substring test would fail the correct behaviour.
+if out.startswith("no matches"):
+    bad("grep failed and the model was told the thing is absent — the exact recorded fault", out[:300])
+elif not out.startswith("error:"):
+    bad("an invalid pattern did not produce an error", out[:300])
+elif "moveOption\\(" not in out:
+    bad("the error does not offer the escaped pattern that would have worked", out[:300])
+else:
+    pas("named as a pattern error, with the working alternative to copy")
+
+print("==> 6/6 a pattern that is valid and genuinely absent still says 'no matches'")
+out = native.run_tool(work, "search", {"query": "thisAppearsNowhere", "path": "Big.php"})
+if not out.startswith("no matches"):
+    bad("a real absence stopped being reported as an absence", out[:200])
+else:
+    pas("a true negative is still a negative")
+
+print()
+print("all checks passed" if not FAILURES else f"{FAILURES} check(s) failed")
+subprocess.run(["rm", "-rf", str(work)])
+sys.exit(1 if FAILURES else 0)

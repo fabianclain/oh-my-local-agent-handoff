@@ -19,3 +19,12 @@ RULES
 # Optional: override where plans and run artifacts live.
 # HANDOFF_PLANS_DIR="$REPO_ROOT/.handoff/plans"
 # HANDOFF_RUNS_DIR="$REPO_ROOT/.handoff/runs"
+
+# Optional: how many tool-calling iterations the local model gets before a round is cut off.
+#
+# Raise this if rounds end on the turn limit with the work half-written — check the round's last
+# reasoning block before deciding, because a model that was still searching needs a better plan
+# rather than more turns, and one that was mid-implementation needs exactly this.
+#
+# Large existing files are what usually exhausts it. A codebase of 1,000-line classes may want 120.
+# NATIVE_MAX_TURNS=80

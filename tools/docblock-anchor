@@ -38,6 +38,19 @@ With `--base`, every docblock/declaration PAIR in the base must still be adjacen
 file. A method inserted between them breaks the pair and is named. That is the diff-aware question,
 and it is the one worth asking: whether an edit landed somewhere it should not have.
 
+A FILE THAT DOES NOT PARSE GETS NO VERDICT
+
+Both modes read the file with regular expressions, which is fine over valid PHP and worthless over
+invalid PHP: a missing brace moves every declaration this tool thinks it can see. The first version
+returned `pass` in exactly that case, and it was reported from real use — a model had orphaned a
+docblock onto its new method, which is precisely the defect this exists to catch, and the gate
+exited 0 because the file no longer parsed.
+
+That is the worst shape a gate can take. It was blind exactly when the syntax gate was already red,
+which is when a displaced docblock is MOST likely, so the two checks failed together and one of
+them said everything was fine. Now a file that does not parse exits non-zero and says it could not
+check, rather than reporting an absence of findings as an absence of problems.
+
 WHAT IT DOES NOT CHECK
 
 Whether the docblock's CONTENT matches the declaration. A block saying `@param int $minor` above a
@@ -51,6 +64,8 @@ from __future__ import annotations
 import argparse
 import pathlib
 import re
+import shutil
+import subprocess
 import sys
 
 # What a docblock may legitimately sit above.
@@ -140,6 +155,32 @@ def check_against_base(path: pathlib.Path, base_text: str) -> list[str]:
     return problems
 
 
+def parses(path: pathlib.Path) -> bool | None:
+    """True, False, or None when there is no PHP to ask.
+
+    None is a real answer and is treated as one by the caller. A machine without `php` cannot
+    establish that a file parses, and reporting `pass` on that basis would be the same fault this
+    function exists to fix, one level up.
+    """
+    if path.suffix != ".php" or not shutil.which("php"):
+        return None
+    try:
+        done = subprocess.run(["php", "-l", str(path)], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.returncode == 0
+
+
+def unparseable(path: pathlib.Path) -> bool:
+    """Report and return True when the file cannot be trusted to be read by regex."""
+    if parses(path) is False:
+        print(f"FAIL  {path} — the file does not parse, so the docblocks cannot be checked")
+        print("        Every declaration this gate can see may be wrong. Fix the parse error, "
+              "then run it again.")
+        return True
+    return False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -148,12 +189,14 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.base:
-        import subprocess
         status = 0
         for path in args.files:
             if not path.is_file():
                 print(f"cannot read {path}", file=sys.stderr)
                 return 2
+            if unparseable(path):
+                status = 1
+                continue
             shown = subprocess.run(["git", "show", f"{args.base}:{path}"],
                                    capture_output=True, text=True)
             if shown.returncode != 0:
@@ -174,6 +217,9 @@ def main() -> int:
         if not path.is_file():
             print(f"cannot read {path}", file=sys.stderr)
             return 2
+        if unparseable(path):
+            status = 1
+            continue
         checked, problems = check(path)
         if problems:
             status = 1

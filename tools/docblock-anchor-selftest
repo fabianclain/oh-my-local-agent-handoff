@@ -37,7 +37,7 @@ git -c user.email=selftest@example.invalid -c user.name=selftest commit -qm base
 
 restore() { git checkout -q Ledger.php; }
 
-echo "==> 1/4 a method inserted between a docblock and its method is caught"
+echo "==> 1/6 a method inserted between a docblock and its method is caught"
 python3 - <<'PY'
 import pathlib
 p = pathlib.Path("Ledger.php"); src = p.read_text()
@@ -63,7 +63,7 @@ else
 fi
 restore
 
-echo "==> 2/4 the same method added in the right place passes"
+echo "==> 2/6 the same method added in the right place passes"
 python3 - <<'PY'
 import pathlib
 p = pathlib.Path("Ledger.php"); src = p.read_text()
@@ -88,14 +88,14 @@ else
 fi
 restore
 
-echo "==> 3/4 an unchanged file is unchanged"
+echo "==> 3/6 an unchanged file is unchanged"
 if "$GATE" --base HEAD Ledger.php >/dev/null 2>&1; then
     pass "no edit, no finding"
 else
     fail "an untouched file was flagged"
 fi
 
-echo "==> 4/4 without --base, an orphaned docblock is still caught"
+echo "==> 4/6 without --base, an orphaned docblock is still caught"
 # The single-file mode is narrower and still worth having: a docblock left above a closing brace
 # documents nothing, and no other gate reports it.
 python3 - <<'PY'
@@ -121,6 +121,47 @@ if "$GATE" Ledger.php >/dev/null 2>&1; then
     fail "a docblock above a closing brace passed the single-file check"
 else
     pass "a docblock documenting nothing is reported without needing a base"
+fi
+restore
+
+# Reported from real use, and the worst shape a gate can take: a model had orphaned a docblock onto
+# its new method — the exact defect this file exists for — and the gate exited 0, because the file
+# no longer parsed and the regexes silently matched nothing useful. It was blind precisely when the
+# syntax gate was already red, which is when a displaced docblock is most likely.
+echo "==> 5/6 a file that does not parse gets no verdict, in --base mode"
+python3 - <<'PY2'
+import pathlib
+p = pathlib.Path("Ledger.php"); src = p.read_text()
+# Steal the docblock AND break the parse, which is what the reported round actually produced.
+marker = "    public function postCredit(string $memo, int $minor): int"
+p.write_text(src.replace(marker, """    public function postBonus(string $memo, int $minor): int
+    {
+        $this->balance += $minor;
+""" + marker, 1))
+PY2
+if command -v php >/dev/null && php -l Ledger.php >/dev/null 2>&1; then
+    fail "the fixture still parses, so this case does not test what it claims"
+elif "$GATE" --base HEAD Ledger.php >"$WORK/out5" 2>&1; then
+    fail "a file that does not parse was reported as pass — absence of findings sold as absence of problems"
+elif ! grep -q "does not parse" "$WORK/out5"; then
+    fail "rejected, but does not say the verdict is unavailable rather than negative"
+else
+    pass "refuses to give a verdict it cannot support, and says why"
+fi
+restore
+
+echo "==> 6/6 the same, in single-file mode"
+python3 - <<'PY2'
+import pathlib
+p = pathlib.Path("Ledger.php")
+p.write_text(p.read_text().replace("    public function balance(): int\n    {", "    public function balance(): int\n    {\n        if (true) {", 1))
+PY2
+if command -v php >/dev/null && php -l Ledger.php >/dev/null 2>&1; then
+    fail "the fixture still parses, so this case does not test what it claims"
+elif "$GATE" Ledger.php >"$WORK/out6" 2>&1; then
+    fail "single-file mode passed a file that does not parse"
+else
+    pass "both modes refuse rather than guess"
 fi
 restore
 

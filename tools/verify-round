@@ -578,7 +578,14 @@ if regressed:
               "> usually damaging the tree rather than fixing it — the commonest cause here is a",
               "> partial edit that truncates a file the previous round had nearly finished.",
               "> Stop resuming. Read the diff, keep whatever is genuinely complete, and write a",
-              "> narrow follow-up for the remaining delta, or take the round over by hand.", ""]
+              "> narrow follow-up for the remaining delta, or take the round over by hand.",
+              # Hedged because this note has already been confidently wrong once. A round scored
+              # 2 of 7 REGRESSED and was told it had damaged the tree; what had actually happened
+              # was a second agent session writing a non-parsing file into the same checkout
+              # mid-round. `handoff do` now locks the repository, so that particular cause is
+              # gone, but a person with an editor open is not covered by any lock.
+              "> If nothing in the diff looks like the work of this round, check whether anything",
+              "> else — an editor, another session — wrote to the tree while it ran.", ""]
 
 lines += [
          "Produced by running commands against the working tree. The implementer's own report was",

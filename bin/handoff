@@ -353,6 +353,75 @@ run_verification() {
     return "$verdict"
 }
 
+# One round at a time per repository, enforced rather than requested.
+#
+# The rule "nothing should touch the tree between `handoff do` and its verdict" was written into
+# the skill and then broken the same day, by two agent sessions driving this harness at the same
+# checkout. Their rounds interleaved: one wrote four patches into a 1,052-line component while the
+# other, following the skill's own "revert and re-run" step, ran `git checkout --` over it. The
+# verdict that came back said `no-op`, "the working tree is unchanged; nothing was implemented" —
+# a true statement about the tree and a false one about the round, and there was nothing in the
+# artifacts to tell the difference. Five rounds of evidence were void before anyone noticed, and
+# what noticed was a plan file appearing on disk that neither session had written.
+#
+# A verdict over a tree someone else is editing is not a weaker measurement, it is not a
+# measurement. So this refuses rather than warns.
+#
+# mkdir is the atomic primitive: it either creates the directory or fails, with no window between
+# testing and taking. A lock file written after a test has that window, and two rounds starting
+# together is exactly the case worth being careful about.
+#
+# The lock lives OUTSIDE the repository, keyed by the checkout's absolute path. Putting it in
+# `.handoff/` seemed natural and was wrong: the first full suite run after that change failed
+# harness-selftest, because a lock directory in the tree is an untracked file the plan never named
+# — the scope gate read it as litter and downgraded a `patch-incomplete` round to `patch-damaged`.
+# A guard that changes the verdicts it is supposed to be protecting is worse than the fault it
+# guards against. Out of tree it cannot interact with any gate, and it still finds every session
+# on the same checkout however each has configured HANDOFF_RUNS_DIR.
+LOCK_ROOT="${XDG_RUNTIME_DIR:-/tmp}/agent-handoff-locks"
+LOCK_DIR="$LOCK_ROOT/$(printf '%s' "$REPO_ROOT" | tr '/' '%')"
+LOCK_HELD=""
+
+release_lock() {
+    [[ -n "$LOCK_HELD" ]] && rm -rf "$LOCK_DIR"
+    LOCK_HELD=""
+}
+
+acquire_lock() {
+    mkdir -p "$LOCK_ROOT"
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+        local holder_pid holder_slug holder_since
+        holder_pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+        holder_slug="$(cat "$LOCK_DIR/slug" 2>/dev/null || echo '?')"
+        holder_since="$(cat "$LOCK_DIR/since" 2>/dev/null || echo '?')"
+        # A lock whose owner is gone is litter, not a conflict — a round killed with SIGKILL leaves
+        # one behind, and a harness that then refuses to run until someone deletes a file by hand
+        # would be a worse failure than the one it is preventing.
+        if [[ -z "$holder_pid" ]] || ! kill -0 "$holder_pid" 2>/dev/null; then
+            echo "==> NOTE: clearing a stale lock from '$holder_slug' (pid ${holder_pid:-unknown}" \
+                 "is gone, held since $holder_since)"
+            rm -rf "$LOCK_DIR"
+            mkdir "$LOCK_DIR" 2>/dev/null || { echo "cannot create $LOCK_DIR" >&2; exit 70; }
+        else
+            echo "refusing to start: a round is already running in this repository." >&2
+            echo "    slug:    $holder_slug" >&2
+            echo "    pid:     $holder_pid" >&2
+            echo "    since:   $holder_since" >&2
+            echo >&2
+            echo "    lock:    $LOCK_DIR" >&2
+            echo >&2
+            echo "Two rounds sharing one working tree produce verdicts about each other's edits," >&2
+            echo "not about either plan. Wait for that one to finish, or stop it." >&2
+            exit 69
+        fi
+    fi
+    echo "$$" >"$LOCK_DIR/pid"
+    echo "$SLUG" >"$LOCK_DIR/slug"
+    date -u +%Y-%m-%dT%H:%M:%SZ >"$LOCK_DIR/since"
+    LOCK_HELD=1
+    trap release_lock EXIT INT TERM
+}
+
 case "$MODE" in
 diff)
     if [[ ! -f "$RUN_DIR/tree-before" || ! -f "$RUN_DIR/tree-after" ]]; then
@@ -370,6 +439,7 @@ do)
         echo "write it first — see $HANDOFF_HOME/templates/plan.md" >&2
         exit 1
     }
+    acquire_lock
     mkdir -p "$RUN_DIR"
     snapshot_tree >"$RUN_DIR/tree-before"
     # Which files were ALREADY untracked, before the model ran.
@@ -416,6 +486,10 @@ work, and do not change anything the plan did not ask for."
 resume)
     [[ -f "$RUN_DIR/feedback.md" ]] || { echo "no feedback at $RUN_DIR/feedback.md" >&2; exit 1; }
     [[ -s "$RUN_DIR/session-id" ]] || { echo "no session id for '$SLUG' — run 'handoff do' first" >&2; exit 1; }
+    # A resume writes to the same tree as a `do`, so it takes the same lock. Locking only `do`
+    # would leave the commonest pairing — one session resuming while another starts fresh —
+    # exactly as unprotected as before.
+    acquire_lock
     SESSION_ID="$(cat "$RUN_DIR/session-id")"
     PROMPT="Review feedback on your implementation. Address every point, then re-run the verification commands.
 

@@ -69,6 +69,13 @@ FORBIDDEN = re.compile(
 
 TOOL_TIMEOUT = 120
 OUTPUT_CAP = 20000
+# A file bigger than the cap is not readable in one call, and for three rounds there was no second
+# call that could reach the rest of it: `read_files` took a path and nothing else, so every byte
+# past OUTPUT_CAP was unreachable by any tool the model had. A 1,052-line component whose insertion
+# anchors sat at lines 871 and 914 cost three rounds and ~25 minutes of GPU to an unsatisfiable
+# loop — 66 searches, 8 whole-file reads, 0 writes — while the model's own reasoning asked for the
+# thing that did not exist: "let's open around 860-900 lines again". `start`/`end` are that thing.
+READ_WINDOW = 400
 # Held back from the loop so a round that runs long still ends with a report rather than an
 # overflow. A usable tree with an account beats a full window every time.
 RESERVE_FOR_REPORT = 4096
@@ -109,13 +116,22 @@ def tool_schemas(include_report: bool, schema: dict) -> list[dict]:
     tools = [
         {"type": "function", "function": {
             "name": "read_files",
-            "description": "Read files from the repository.",
+            "description": ("Read files from the repository. A large file is truncated unless "
+                            "you window it: pass `start` and `end` (1-based, inclusive) to read "
+                            "one part of it. Line numbers printed by `search` can be used "
+                            "directly, so search for a declaration and then read around it."),
             "parameters": {"type": "object", "required": ["files"], "properties": {
                 "files": {"type": "array", "items": {"type": "object", "properties": {
-                    "path": {"type": "string"}}}}}}}},
+                    "path": {"type": "string"},
+                    "start": {"type": "integer",
+                              "description": "first line to read, 1-based and inclusive"},
+                    "end": {"type": "integer",
+                            "description": "last line to read, inclusive"}}}}}}}},
         {"type": "function", "function": {
             "name": "search",
-            "description": "Search the repository for a regular expression.",
+            "description": ("Search the repository for a regular expression, printing "
+                            "file:line:text. `query` is a REGEX: escape ( ) [ ] . * + ? | with a "
+                            "backslash to match them literally — `moveItem\\(`, not `moveItem(`."),
             "parameters": {"type": "object", "required": ["query"], "properties": {
                 "query": {"type": "string"}, "path": {"type": "string"}}}}},
         {"type": "function", "function": {
@@ -308,6 +324,66 @@ def clamp(text: str) -> str:
     return text[:OUTPUT_CAP] + f"\n[... {len(text) - OUTPUT_CAP} bytes truncated]"
 
 
+def plain(query: str) -> str:
+    """The same search, with the regex metacharacters escaped.
+
+    Offered in the error rather than applied silently: a model that meant `moveItem\\(int` gets a
+    working alternative to copy, and one that meant a real pattern is not second-guessed.
+    """
+    return re.sub(r"([(){}\[\].*+?|^$\\])", r"\\\1", query)
+
+
+def read_window(item: dict, label: str, body: str) -> str:
+    """One file, whole or windowed, with a truncation note that names the remedy.
+
+    `start` and `end` are 1-based and inclusive, matching what `search` prints, so a model can
+    take a line number straight from a match and read around it.
+
+    The note matters as much as the window. The old one said `[... 18204 bytes truncated]`, which
+    tells a model it lost something but not that anything can be done about it — and nothing
+    could, so it re-issued the identical call three times over. A truncation notice that does not
+    name a remedy trains exactly that loop.
+    """
+    lines = body.splitlines()
+    total = len(lines)
+    start, end = item.get("start"), item.get("end")
+    windowed = isinstance(start, int) or isinstance(end, int)
+
+    if windowed:
+        first = max(1, start if isinstance(start, int) else 1)
+        last = min(total, end if isinstance(end, int) else first + READ_WINDOW - 1)
+        if first > total:
+            return (f"--- {label} ---\n(start {first} is past the end; the file has "
+                    f"{total} lines)")
+        text = "\n".join(lines[first - 1:last])
+        head = f"--- {label} (lines {first}-{last} of {total}) ---"
+        note = ""
+        if last < total:
+            note = f"\n[lines {last + 1}-{total} not shown; read them with start/end]"
+        return f"{head}\n{text}{note}"
+
+    if len(body) <= OUTPUT_CAP:
+        return f"--- {label} ---\n{body}"
+
+    # Cut on a line boundary so the window's last line is whole, and so the number in the note is
+    # a line a follow-up call can actually ask for. The budget is short of OUTPUT_CAP by more than
+    # the note's own length, because the note is appended and then the whole result passes through
+    # clamp(): filling the cap with content deletes the very sentence that says what to do next.
+    # The selftest caught this on the first run, which is the case for writing it first.
+    shown, size = 0, 0
+    for line in lines:
+        if size + len(line) + 1 > OUTPUT_CAP - 700:
+            break
+        size += len(line) + 1
+        shown += 1
+    return (f"--- {label} (lines 1-{shown} of {total}) ---\n"
+            + "\n".join(lines[:shown])
+            + f"\n[{total - shown} more lines. This file is too big to read at once: call "
+              f"read_files again with start and end to see any part of it, for example "
+              f'{{"path": "{label}", "start": {shown + 1}, "end": {min(total, shown + READ_WINDOW)}}}.'
+              f" Line numbers from `search` can be used directly.]")
+
+
 def run_tool(repo: pathlib.Path, name: str, args: dict) -> str:
     try:
         if name == "read_files":
@@ -320,7 +396,7 @@ def run_tool(repo: pathlib.Path, name: str, args: dict) -> str:
                 # Deliberately NOT line-numbered. The rented loop returns numbered lines, and a
                 # model wrote the gutter back into a file — `  1 | # Add a discount` — corrupting
                 # it. Content in, content out.
-                out.append(f"--- {item.get('path')} ---\n{read_text_strict(path)}")
+                out.append(read_window(item, item.get("path"), read_text_strict(path)))
             return clamp("\n\n".join(out) or "(no files requested)")
 
         if name == "search":
@@ -328,6 +404,18 @@ def run_tool(repo: pathlib.Path, name: str, args: dict) -> str:
             where = str(args.get("path") or ".")
             proc = subprocess.run(["grep", "-rnE", "--", query, where], cwd=repo,
                                   capture_output=True, text=True, timeout=TOOL_TIMEOUT)
+            # grep exits 1 for "no matches" and 2+ for "I could not run that". Collapsing both
+            # into "no matches" is how an unbalanced paren in a query — `moveOption(`, an invalid
+            # regex — was reported to the model as a definitive absence. It believed it, searched
+            # around the answer for ten turns, and never learned the tool had failed. An error
+            # returned as a negative result is the same fault this whole harness exists to refuse.
+            if proc.returncode >= 2:
+                detail = (proc.stderr or "").strip().splitlines()
+                return (f"error: the search pattern is not valid: "
+                        f"{detail[0] if detail else f'grep exited {proc.returncode}'}\n"
+                        f"This is NOT 'no matches' — the search never ran. `query` is a regular "
+                        f"expression, so ( ) [ ] . * + ? | need a backslash to be matched "
+                        f"literally. This query would work: {plain(query)}")
             return clamp(proc.stdout or f"no matches for {query!r}")
 
         if name == "write_file":
@@ -397,6 +485,13 @@ def analysable_args(name: str, parsed: dict) -> dict:
     if isinstance(files, list):
         args["paths"] = [f.get("path") for f in files
                          if isinstance(f, dict) and isinstance(f.get("path"), str)]
+        # Whether a read was windowed is the difference between "read the file again" and "read
+        # the part it could not reach before". Three rounds of identical whole-file reads looked
+        # like ordinary repetition in the logs precisely because this was not recorded.
+        windows = [f"{f.get('start', '')}-{f.get('end', '')}" for f in files
+                   if isinstance(f, dict) and (f.get("start") or f.get("end"))]
+        if windows:
+            args["windows"] = windows
     if name in ("search", "search_codebase") and isinstance(parsed.get("query"), str):
         args["query"] = parsed["query"]
     commands = parsed.get("commands")

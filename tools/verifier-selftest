@@ -35,7 +35,9 @@ REPO="$(cd "$HERE/.." && pwd)"
 V="$HERE/verify-round"
 SANDBOX="$(mktemp -d)"
 FAILURES=0
-trap 'rm -rf "$SANDBOX"' EXIT
+# The lock cases plant locks by hand, and a planted lock has no owning process to release it.
+# Sandbox paths are unique, so without this the lock root grows by one directory per suite run.
+trap 'rm -rf "$SANDBOX" "${XDG_RUNTIME_DIR:-/tmp}"/agent-handoff-locks/%tmp%*' EXIT
 
 pass() { echo "    PASS: $1"; }
 fail() { echo "    FAIL: $1"; FAILURES=$(( FAILURES + 1 )); }
@@ -64,7 +66,7 @@ d=json.load(open(sys.argv[1]))
 print(next((g['status'] for g in d['gates'] if g['gate']==sys.argv[2]), 'absent'))" "$1" "$2"
 }
 
-echo "==> 1/11 a non-ASCII filename the plan names is not 'invented'"
+echo "==> 1/14 a non-ASCII filename the plan names is not 'invented'"
 R="$(new_project ascii)"
 mkdir -p "$R/resources/views/pages"
 printf '<div>x</div>\n' > "$R/resources/views/pages/⚡rankings.blade.php"
@@ -90,7 +92,7 @@ else
     fail "a ⚡ path the plan names was rejected — core.quotePath regression"
 fi
 
-echo "==> 2/11 editing a tracked read-only file fails the round"
+echo "==> 2/14 editing a tracked read-only file fails the round"
 R="$(new_project ro_tracked)"
 printf '<?php require "src/S.php"; exit((new S)->v()===7?0:1);\n' > "$R/tests/t.php"
 ( cd "$R" && git add -A && git commit --quiet -m tests )
@@ -122,7 +124,7 @@ else
     fail "the model could edit the test that judges it"
 fi
 
-echo "==> 3/11 an UNTRACKED read-only file left alone passes"
+echo "==> 3/14 an UNTRACKED read-only file left alone passes"
 R="$(new_project ro_untracked)"
 printf '<?php require "src/S.php"; exit((new S)->v()===7?0:1);\n' > "$R/tests/t.php"
 cp "$SANDBOX/ro_tracked/.handoff/plans/p.md" "$R/.handoff/plans/p.md"
@@ -135,7 +137,7 @@ else
     fail "an untracked read-only file was reported modified when it was not"
 fi
 
-echo "==> 4/11 with no baseline the gate says skipped, not pass"
+echo "==> 4/14 with no baseline the gate says skipped, not pass"
 R="$(new_project ro_nobase)"
 printf '<?php exit(0);\n' > "$R/tests/t.php"
 cp "$SANDBOX/ro_tracked/.handoff/plans/p.md" "$R/.handoff/plans/p.md"
@@ -147,7 +149,7 @@ else
     fail "claimed a read-only verdict it had no baseline for"
 fi
 
-echo "==> 5/11 a regenerated file advises, and does not reject"
+echo "==> 5/14 a regenerated file advises, and does not reject"
 R="$(new_project advisory)"
 cat > "$R/.handoff/plans/p.md" <<'PLAN'
 # make v return 7
@@ -174,7 +176,7 @@ else
     fail "the advisory split regressed — verdict $(verdict_of "$V_JSON")"
 fi
 
-echo "==> 6/11 handoff exit status follows the gates in both directions"
+echo "==> 6/14 handoff exit status follows the gates in both directions"
 export PATH="$REPO/bin:$PATH"
 R="$(new_project exitstatus)"
 cp "$SANDBOX/advisory/.handoff/plans/p.md" "$R/.handoff/plans/p.md"
@@ -191,7 +193,7 @@ else
     fail "exit status wrong: good tree gave $GOOD, bad tree gave $BAD"
 fi
 
-echo "==> 7/11 init never ignores a path the project tracks"
+echo "==> 7/14 init never ignores a path the project tracks"
 R="$(new_project inits)"
 mkdir -p "$R/.claude/plans" && echo "# a tracked plan" > "$R/.claude/plans/x.md"
 ( cd "$R" && git add -A && git commit --quiet -m plans )
@@ -204,7 +206,7 @@ else
     fail "init added nothing at all"
 fi
 
-echo "==> 8/11 resume verifies instead of exiting 0 blindly"
+echo "==> 8/14 resume verifies instead of exiting 0 blindly"
 if grep -qE '"\$MODE" == "do" \|\| "\$MODE" == "resume"' "$REPO/bin/handoff"; then
     pass "resume runs the gates"
 else
@@ -237,7 +239,7 @@ PLAN
     echo "$root"
 }
 
-echo "==> 9/11 editing a file that was untracked before the run counts as a change"
+echo "==> 9/14 editing a file that was untracked before the run counts as a change"
 R="$(untracked_project untracked_edited)"
 SNAP="$(snapshot "$R")"
 printf 'one\ntwo\nthree\n' > "$R/notes.md"
@@ -251,7 +253,7 @@ else
     fail "an edited untracked file read as 'nothing was implemented' — correct work would be redone"
 fi
 
-echo "==> 10/11 a pre-existing untracked file left alone is still not counted"
+echo "==> 10/14 a pre-existing untracked file left alone is still not counted"
 R="$(untracked_project untracked_untouched)"
 SNAP="$(snapshot "$R")"
 HANDOFF_UNTRACKED_BEFORE="$R/.handoff/untracked-before" \
@@ -262,7 +264,7 @@ else
     fail "someone's stray file now counts as the model's work — the original false accusation"
 fi
 
-echo "==> 11/11 an edited untracked file out of scope is not called 'invented'"
+echo "==> 11/14 an edited untracked file out of scope is not called 'invented'"
 R="$(untracked_project untracked_scope src/S.php)"
 SNAP="$(snapshot "$R")"
 printf 'one\ntwo\nthree\n' > "$R/notes.md"
@@ -274,6 +276,83 @@ elif grep -q 'notes.md' "$R/.handoff/e/scope.log" 2>/dev/null; then
     pass "reported out of scope, and named as an edit rather than as litter"
 else
     fail "an out-of-scope edit to an untracked file was not reported at all"
+fi
+
+# ------------------------------------------------------------------------------------------------
+# The lock. Two agent sessions once drove this harness at one checkout: rounds interleaved, one
+# session reverted the file the other was patching, and the verdict came back "the working tree is
+# unchanged; nothing was implemented" — true about the tree, false about the round, and nothing in
+# the artifacts distinguished the two. Case 13 is the one that keeps the cure from being worse than
+# the disease: a killed round must not leave a repository that refuses to run until someone deletes
+# a directory by hand.
+
+echo "==> 12/14 a second round refuses while the first holds the lock"
+export PATH="$REPO/bin:$PATH"
+R="$(new_project locking)"
+cp "$SANDBOX/advisory/.handoff/plans/p.md" "$R/.handoff/plans/p.md"
+( cd "$R" && printf '.handoff/runs/\n' >> .gitignore && git add -A && git commit --quiet -m ig )
+# The lock lives outside the tree, keyed by the checkout path — see acquire_lock in bin/handoff.
+LOCKD="${XDG_RUNTIME_DIR:-/tmp}/agent-handoff-locks/$(printf '%s' "$(cd "$R" && pwd -P)" | tr '/' '%')"
+# Held by a process that is genuinely alive: `sleep` in the background, its real pid in the lock.
+mkdir -p "$LOCKD"
+sleep 30 & HOLDER=$!
+echo "$HOLDER" > "$LOCKD/pid"
+echo "other-slug" > "$LOCKD/slug"
+echo "2026-08-13T16:00:00Z" > "$LOCKD/since"
+OUT="$( cd "$R" && HANDOFF_PROVIDER=stub STUB_PATCH="sed -i 's/return 1;/return 7;/' src/S.php" \
+        handoff do p 2>&1 )"; RC=$?
+kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+if [[ "$RC" -eq 0 ]]; then
+    fail "a second round ran while another held the lock — this is the incident, reproduced"
+elif ! grep -q "other-slug" <<<"$OUT"; then
+    fail "refused without naming the round that holds it, so there is nothing to act on"
+elif ! git -C "$R" diff --quiet -- src/S.php; then
+    fail "refused, but the stub patch still landed — the refusal came after the tree was touched"
+else
+    pass "refused, named the holder, and left the tree alone"
+fi
+
+echo "==> 13/14 a lock whose owner is gone is cleared, not fatal"
+R="$(new_project stalelock)"
+cp "$SANDBOX/advisory/.handoff/plans/p.md" "$R/.handoff/plans/p.md"
+( cd "$R" && printf '.handoff/runs/\n' >> .gitignore && git add -A && git commit --quiet -m ig )
+LOCKD="${XDG_RUNTIME_DIR:-/tmp}/agent-handoff-locks/$(printf '%s' "$(cd "$R" && pwd -P)" | tr '/' '%')"
+mkdir -p "$LOCKD"
+# A pid that has certainly exited: start one and reap it.
+sleep 0.1 & DEAD=$!; wait "$DEAD" 2>/dev/null
+echo "$DEAD" > "$LOCKD/pid"
+echo "killed-round" > "$LOCKD/slug"
+echo "2026-08-13T16:00:00Z" > "$LOCKD/since"
+OUT="$( cd "$R" && HANDOFF_PROVIDER=stub STUB_PATCH="sed -i 's/return 1;/return 7;/' src/S.php" \
+        STUB_REPORT='{"status":"complete","summary":"s","files_changed":[],"tests_run":[],"deviations":[],"blockers":[],"follow_ups":[]}' \
+        handoff do p 2>&1 )"; RC=$?
+if [[ "$RC" -ne 0 ]]; then
+    fail "a stale lock blocked the round; a SIGKILLed run would wedge the repository"
+    sed -n '1,3p' <<<"$OUT" | sed 's/^/        /'
+elif ! grep -q "stale lock" <<<"$OUT"; then
+    fail "took the lock silently — a cleared lock is worth one line, in case it was not stale"
+else
+    pass "cleared it, said so, and ran"
+fi
+
+echo "==> 14/14 the lock is released when a round ends, so the next one runs"
+R="$(new_project lockrelease)"
+cp "$SANDBOX/advisory/.handoff/plans/p.md" "$R/.handoff/plans/p.md"
+( cd "$R" && printf '.handoff/runs/\n' >> .gitignore && git add -A && git commit --quiet -m ig )
+( cd "$R" && HANDOFF_PROVIDER=stub STUB_PATCH="sed -i 's/return 1;/return 7;/' src/S.php" \
+    handoff do p >/dev/null 2>&1 )
+LOCKD="${XDG_RUNTIME_DIR:-/tmp}/agent-handoff-locks/$(printf '%s' "$(cd "$R" && pwd -P)" | tr '/' '%')"
+if [[ -d "$LOCKD" ]]; then
+    fail "the lock outlived the round — every later round in this repository would refuse"
+else
+    ( cd "$R" && git checkout --quiet -- src/S.php )
+    ( cd "$R" && HANDOFF_PROVIDER=stub STUB_PATCH="sed -i 's/return 1;/return 7;/' src/S.php" \
+        handoff do p >/dev/null 2>&1 ); SECOND=$?
+    if [[ "$SECOND" -eq 0 ]]; then
+        pass "released on exit, and a second round runs normally"
+    else
+        fail "the lock was gone but the second round still failed (exit $SECOND)"
+    fi
 fi
 
 echo
