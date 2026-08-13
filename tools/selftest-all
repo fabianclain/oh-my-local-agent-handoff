@@ -23,6 +23,8 @@
 #   site-audit-selftest   every structural gate of the site plan, each mutation-tested
 #   overnight-selftest    the queue runner: resume, deadline, timeout, orphans
 #
+# Then two consistency checks the suites cannot make individually.
+#
 # smoke-e2e runs first and takes two seconds. It is the one to read when something is broken: the
 # others tell you a unit misbehaves, it tells you the pieces are no longer wired together.
 #

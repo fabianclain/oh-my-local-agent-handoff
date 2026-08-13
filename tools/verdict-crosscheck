@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""verdict-crosscheck — do bench/run and verify-round still agree?
+
+    tools/verdict-crosscheck [results-dir ...]
+    tools/verdict-crosscheck bench/results
+
+Exit 0 when every run with an evidence bundle agrees, 1 when any disagrees, 2 when there is
+nothing to compare.
+
+WHY THIS EXISTS
+
+Two implementations of "is this tree acceptable" have grown side by side. `bench/run` scores the
+round; `tools/verify-round` writes the evidence bundle a reviewer reads. They parse the same plan
+with expressions that were copied, and the copy is the risk — `tools/selftest-all` already guards
+the plan-parsing literals for the same reason.
+
+The roadmap put it plainly: two implementations agreeing is evidence, one implementation is an
+assumption. This turns that into a report rather than a belief.
+
+WHAT COUNTS AS AGREEMENT
+
+They answer deliberately different questions, and collapsing that would make this cry wolf:
+
+    bench/run's `outcome`   folds in the REPORT — is this a round I would accept
+    verify-round's verdict  reads only the TREE — is this a patch a reviewer could take
+
+So `patch-ok-no-report` beside ACCEPT is agreement: the tree is fine and the envelope is missing.
+What must match is whether the TREE was acceptable, which is the column mapped below.
+
+WHAT IT FOUND WHEN IT WAS FIRST RUN
+
+166 runs agreed and 5 disagreed, all five `patch-damaged` against ACCEPT, all from one arm of
+2026-08-10. Every one was flagged for `.handoff/scratch/verify.sh` — a directory
+templates/agent-rules.md explicitly grants the model. verify-round already excluded it; bench/run
+learned to nine hours later, in 9a59661. The disagreements were the historical residue of a fixed
+defect, and this check rediscovered it without being told.
+
+That is the useful shape of a negative result: no live drift, and the one population that differs
+explains itself.
+"""
+
+from __future__ import annotations
+
+import argparse
+import pathlib
+import re
+import sys
+from collections import Counter
+
+# outcome -> was the TREE acceptable, which is the question verify-round answers
+TREE_OK = {
+    "accepted": True,
+    "patch-ok-no-report": True,
+    "patch-incomplete": False,
+    "patch-damaged": False,
+    "fabricated": False,
+    "no-op": False,
+    "protocol-failed": False,
+}
+
+
+def verdict_of(evidence: pathlib.Path) -> str:
+    text = evidence.read_text(errors="replace")
+    if re.search(r"\bACCEPT\b", text):
+        return "ACCEPT"
+    if re.search(r"\bREJECT\b", text):
+        return "REJECT"
+    return "?"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("targets", nargs="*", type=pathlib.Path,
+                        default=[pathlib.Path("bench/results")])
+    args = parser.parse_args()
+
+    agree: Counter[str] = Counter()
+    disagreements: list[tuple[str, str, str]] = []
+    no_bundle = 0
+
+    for target in args.targets:
+        for metrics in sorted(target.rglob("metrics")):
+            run = metrics.parent
+            evidence = run / "evidence.log"
+            if not evidence.exists():
+                no_bundle += 1
+                continue
+            fields = dict(line.split("=", 1) for line in metrics.read_text().splitlines()
+                          if "=" in line)
+            outcome = fields.get("outcome", "?")
+            verdict = verdict_of(evidence)
+            expected = TREE_OK.get(outcome)
+            if expected is None or verdict == "?":
+                disagreements.append((str(run), outcome, f"{verdict} (unclassifiable)"))
+            elif expected != (verdict == "ACCEPT"):
+                disagreements.append((str(run), outcome, verdict))
+            else:
+                agree[f"{outcome} / {verdict}"] += 1
+
+    total = sum(agree.values()) + len(disagreements)
+    if not total:
+        print("no runs with an evidence bundle — nothing to compare", file=sys.stderr)
+        print("Runs from before verify-round was wired in carry no bundle at all.", file=sys.stderr)
+        return 2
+
+    print(f"{sum(agree.values())} agree, {len(disagreements)} disagree, "
+          f"{no_bundle} without an evidence bundle\n")
+    for combo, count in sorted(agree.items(), key=lambda kv: -kv[1]):
+        print(f"  {count:>4}  {combo}")
+
+    if not disagreements:
+        print("\nNo disagreement. Where the two labels differ they are answering different")
+        print("questions: bench/run folds in the report, verify-round reads only the tree.")
+        return 0
+
+    print("\nDISAGREEMENT — the same question, answered two ways:")
+    for run, outcome, verdict in disagreements:
+        print(f"  {run}")
+        print(f"      bench/run={outcome}   verify-round={verdict}")
+    print("\nCheck the run's scope and litter files against the exclusion list in bench/run before")
+    print("reading this as drift. The first five ever found were sanctioned scratch files that")
+    print("one implementation excluded nine hours before the other did.")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
