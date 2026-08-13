@@ -24,10 +24,22 @@ something fails.
 
 **Split it especially** — greenfield work, and anything mixing a service with a view.
 The measured figures below come from a six-file *refactor*; creating new files from a spec is a
-different shape with more freedom and far more surface to fake. Views are the worst case: a
-three-line template can satisfy a text assertion while containing nothing real. Do the pure,
-testable part as one round gated on its own tests, then the view as a second round gated on
-rendering tests.
+different shape with more freedom and far more surface to fake.
+
+Views were long called the worst case, on the grounds that a three-line template can satisfy a
+text assertion while containing nothing real. That is true of TEXT assertions and it is not true
+of views: 32 rounds building a self-contained page were accepted 30 times, gated on things that
+are arithmetic rather than opinion —
+
+    handoff view-lint <file>          tag balance; malformed HTML renders and passes everything
+    handoff contrast <file> --min 4.5 WCAG is a defined function of two colours
+    a structural check                landmarks present and in order, every in-page anchor
+                                      resolving to an id that exists, every image labelled
+
+The anchor check is the one to copy: `href="#features"` against `id="feature"` renders correctly,
+reads correctly, satisfies every text assertion, and is broken. Only a join between the two sets
+sees it. Split a service from its view when they are different KINDS of work, not because a view
+cannot be checked.
 
 **Do it yourself instead** — and say so:
 
@@ -73,11 +85,30 @@ symmetric in the thing it tests cannot test it.** Vary the thing you are checkin
 remainders, more than one leftover cent, different lengths — and take the case from an observed
 failure where you can, because an invented one usually fails to discriminate.
 
-**On greenfield work, expect much worse.** One real feature — new service, new Livewire view,
-aggregate SQL — went **0 accepted in 7 rounds**, best round 9 of 12 criteria. The reviewer then
-wrote the same service by hand and it passed 8/8 first run. The difference is not difficulty, it is
-who decides: the model executes a complete specification well and invents a poor one. On greenfield
-design, write the decisions yourself and hand over the mechanical remainder.
+**Its twin, found later and the same shape: an example that discriminates one DIRECTION of an
+error does not discriminate the other.** A third implementation wrote `intdiv($sum + intdiv($D+1,
+2), $D)` where the specification says `intdiv($D, 2)` — ceil of half instead of floor. Identical
+for even periods, different for odd ones, wrong on 285 of 4,000 fuzzed trials, and accepted at 10
+of 10.
+
+It had been reasoned that odd periods were safe, and that reasoning was correct about a *different*
+wrong formula. Ruling out one way of getting a term wrong says nothing about the other. When a
+criterion pins down a rounding rule, a tie-break or a boundary, ask which way a plausible
+implementation could be wrong — then check that your example separates BOTH.
+
+**On greenfield work carrying DESIGN DECISIONS, expect much worse.** One real feature — new
+service, new Livewire view, aggregate SQL — went **0 accepted in 7 rounds**, best round 9 of 12
+criteria. The reviewer then wrote the same service by hand and it passed 8/8 first run.
+
+That was read for months as "greenfield is hard", and the qualifier is the whole finding. Measured
+against a greenfield task with the decisions already made — a self-contained page, every section,
+string and colour dictated — the same model produced **30 accepted of 32 runs, at 12 or 13 of 13
+criteria, nearly all on the first attempt, in about three minutes each**. It writes the page in one
+edit and four tool calls.
+
+So the variable is not novelty, it is who decides. The model executes a complete specification well
+and invents a poor one. On greenfield design, write the decisions yourself and hand over the
+mechanical remainder — and having done that, do not then expect it to fail.
 
 ## The procedure
 
@@ -228,6 +259,31 @@ Plans go where `.handoff/config.sh` says. Shape from `templates/plan.md`.
    `- [unverifiable] dark theme contrast`. `handoff roundup` then prints it next to the score, so
    the round-up never implies coverage the gates did not provide. Saying so out loud is worth more
    than a 6/6 that quietly means 6 of 10.
+
+   **Write commands the implementer can actually run.** A verification block is not only the
+   harness's; the model runs it too, and that is the only way it catches its own mistake before
+   submitting. One round reported `blocked` — *"unable to execute the plan's verification commands
+   due to shell quoting issues"* — over a tree the harness then scored 10 of 10. The code was
+   right, the model could not check it, and it said so honestly rather than claiming a pass.
+
+   That plan verified with eight `php -r '...'` one-liners carrying nested single and double
+   quotes. A sibling plan using thirteen plain commands had half the rate of non-complete
+   statuses. Correctness never depended on it, because the harness verifies independently — what
+   is lost is the repair loop having anything to act on. Prefer a command the implementer can run
+   over a clever one that only the harness will.
+
+   **Scope criteria must exclude what the harness excludes.** A criterion that counts changed
+   files with
+
+   ```bash
+   test "$(git status --porcelain --untracked-files=all -- . ':(exclude).handoff')" -eq 1
+   ```
+
+   is narrower than the harness's own scope check, which also excludes `.omc`, `vendor`,
+   `node_modules` and `storage`. Any agent state written into the worktree is then counted as the
+   model's work and the plan fails for something it granted. Exclude the same paths, and use
+   `--untracked-files=all`: plain `--porcelain` collapses an untracked DIRECTORY to one line, so a
+   file count written without it stops guarding the moment the model creates a folder.
 
 ### 6. Check it
 
