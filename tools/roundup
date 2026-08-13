@@ -97,7 +97,11 @@ def ungated_states(record: dict, repo: pathlib.Path) -> tuple[list[str], list[st
             text = candidate.read_text(errors="replace")
         except OSError:
             continue
-        wanted, declared = lint.state_names(text)
+        # Three lists now: states the plan expects a criterion for, states it declared
+        # unverifiable, and states it says another check already gates. The round-up reports the
+        # second and the ungated remainder; a state whose gate the plan NAMES is covered, and
+        # printing it under "what the score does not cover" would be false.
+        wanted, declared, _gated = lint.state_names(text)
         if not wanted and not declared:
             return [], []
         haystack = " ".join(lint.criteria(text) + lint.verification_commands(text)).lower()

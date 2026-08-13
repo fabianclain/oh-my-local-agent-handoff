@@ -191,6 +191,20 @@ CASES: list[tuple[str, str, list[str], list[str]]] = [
     # the Files-to-touch table, and it excludes files that were already untracked, which a
     # criterion cannot. This note used to fire on every such plan and the advice it implied cost a
     # real round — a plan counting paths failed because `handoff init` had written a .gitignore.
+    # Matching a state's words against the criteria's is blind to a state covered by a test
+    # suite: the criterion says "the suite passes", the state says "an empty cart returns 0". Ten
+    # states gated by one command all read as ungated, and the only ways out were inflating the
+    # criteria or writing [unverifiable] about something that HAD been verified.
+    ("a state that names the check covering it is not called ungated",
+     plan("npx vitest run",
+          "\n## States to handle\n\n- [gated by criterion 1] an empty cart returns zero\n"),
+     ["gated-states"], ["ungated-states"]),
+
+    ("a state with no criterion and no gate is still flagged",
+     plan("npx vitest run",
+          "\n## States to handle\n\n- **Wormhole** — nothing anywhere mentions this\n"),
+     ["ungated-states"], []),
+
     ("a plan naming files is not asked to count them",
      plan("php tests/t.php"),
      [], ["unenforced-scope"]),

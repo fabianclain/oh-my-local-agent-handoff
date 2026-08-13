@@ -148,17 +148,36 @@ def check_porcelain(report: Report, commands: list[str], paths, repo: pathlib.Pa
 TEMPLATE_STATES = {"zero", "one", "maximum", "absent optional fields", "failed upstream",
                    "unauthenticated context"}
 UNVERIFIABLE = re.compile(r"^\s*[-*]\s*[\[(]unverifiable[\])]\s*", re.IGNORECASE)
+# `- [gated by criterion 1] ...`, `- [gated by the vitest run] ...`. Anything after "gated by" is
+# taken as the reason and echoed back, so the plan says which check covers the state rather than
+# the linter guessing from shared vocabulary.
+GATED = re.compile(r"^\s*[-*]\s*[\[(]gated by ([^\])]+)[\])]\s*", re.IGNORECASE)
 
 
-def state_names(text: str) -> tuple[list[tuple[str, str]], list[str]]:
-    """([(display name, whole bullet)], states declared unverifiable)."""
+def state_names(text: str) -> tuple[list[tuple[str, str]], list[str], list[tuple[str, str]]]:
+    """([(display name, whole bullet)], declared unverifiable, [(name, what gates it)]).
+
+    The third list exists because the check below matches a state's WORDS against the criteria's
+    words, and that is blind to a state covered by a test suite: the criterion says "the suite
+    passes" and the state says "an empty cart returns 0", so ten states gated by one command all
+    read as ungated. Reported from real use, where four states covered by one vitest run were
+    flagged, and the only ways out were inflating the criteria or writing `[unverifiable]` about
+    something that had in fact been verified.
+
+    `- [gated by criterion 1] An empty cart returns 0.` says it instead.
+    """
     wanted: list[tuple[str, str]] = []
     declared: list[str] = []
+    gated: list[tuple[str, str]] = []
     for line in sections(text).get("states to handle", []):
         if not re.match(r"^\s*[-*]\s+\S", line):
             continue
         if UNVERIFIABLE.match(line):
             declared.append(UNVERIFIABLE.sub("", line).strip().strip("*").strip())
+            continue
+        gate = GATED.match(line)
+        if gate:
+            gated.append((GATED.sub("", line).strip().strip("*").strip(), gate.group(1).strip()))
             continue
         body = re.sub(r"^\s*[-*]\s+", "", line).strip()
         bold = re.match(r"\*\*(.+?)\*\*", body)
@@ -166,7 +185,7 @@ def state_names(text: str) -> tuple[list[tuple[str, str]], list[str]]:
         name = name.strip().strip("*").strip()
         if name:
             wanted.append((name, body))
-    return wanted, declared
+    return wanted, declared, gated
 
 
 # Words that carry no signal about WHICH state a bullet describes. Trimming this list makes the
@@ -196,8 +215,11 @@ def distinctive(bullet: str) -> list[str]:
 
 
 def check_states(report: Report, text: str) -> None:
-    wanted, declared = state_names(text)
-    if not wanted and not declared:
+    wanted, declared, gated = state_names(text)
+    # `gated` counts here too. A plan whose states are ALL gated has an empty `wanted` and an empty
+    # `declared`, and the early return below then swallowed the note that says so — the one case
+    # this form was added for.
+    if not wanted and not declared and not gated:
         if "states to handle" not in sections(text):
             report.note("states", "no '## States to handle' section",
                         "Every defect this pipeline has shipped came from a state the plan did not",
@@ -225,8 +247,19 @@ def check_states(report: Report, text: str) -> None:
                     "A 6/6 over ungated states reads as full coverage. Four viewport and theme",
                     "states were named and none gated; the page shipped with two contrast",
                     "failures and an unscrollable overflow, and scored 6/6.",
-                    "Either add a criterion, or write `- [unverifiable] <state>` so the round-up",
-                    "says so out loud.")
+                    "Three ways out, and only the first two used to exist:",
+                    "  - add a criterion that names it",
+                    "  - `- [gated by criterion 3] <state>` when a check already covers it and",
+                    "    this match cannot see that — a test suite is the usual case",
+                    "  - `- [unverifiable] <state>` when nothing checks it, so the round-up says",
+                    "    so out loud rather than implying coverage.")
+    if gated:
+        report.note("gated-states",
+                    f"{len(gated)} state(s) name the check that covers them",
+                    *[f"  - {name} — {why}" for name, why in gated],
+                    "Taken at the plan's word. The linter matches a state's words against the",
+                    "criteria's, which cannot see a state covered by a test suite, so this is the",
+                    "form for saying it rather than inflating the criteria to make it visible.")
     if declared:
         report.note("declared-unverifiable",
                     f"{len(declared)} state(s) declared unverifiable — the round-up will say so",

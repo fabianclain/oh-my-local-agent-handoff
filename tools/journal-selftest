@@ -23,6 +23,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import pathlib
+import subprocess
 import sys
 import tempfile
 from importlib.machinery import SourceFileLoader
@@ -115,6 +116,38 @@ def check_files_column(journal) -> tuple[int, int]:
     return len(cases), failures
 
 
+def check_empty_journal(journal) -> tuple[int, int]:
+    """An empty journal beside run directories is not an empty project.
+
+    `no runs recorded yet` is true of the journal and false of the project, and a reader uses this
+    view to tell "the model failed" from "the round never happened". Reported from real use: four
+    run directories sat beside a journal that said nothing had ever run, and nothing said why.
+    """
+    failures = 0
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = pathlib.Path(tmp)
+        (repo / ".handoff" / "runs" / "ship").mkdir(parents=True)
+        (repo / ".handoff" / "runs" / "ship" / "result.json").write_text("{}")
+        out = subprocess.run([sys.executable, str(JOURNAL), "--repo", str(repo), "list"],
+                             capture_output=True, text=True).stdout
+        if "ship" in out and "no journal entry" in out:
+            print("pass  empty: an unjournalled run directory is named, not reported as nothing")
+        else:
+            print(f"FAIL  empty: a run directory beside an empty journal said only "
+                  f"{out.strip()[:70]!r}")
+            failures += 1
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out = subprocess.run([sys.executable, str(JOURNAL), "--repo", tmp, "list"],
+                             capture_output=True, text=True).stdout
+        if "no journal entry" not in out:
+            print("pass  empty: a genuinely empty project gets no phantom explanation")
+        else:
+            print("FAIL  empty: an empty project was told about run directories it does not have")
+            failures += 1
+    return 2, failures
+
+
 def main() -> int:
     if not JOURNAL.exists():
         print("journal not found", file=sys.stderr)
@@ -122,7 +155,7 @@ def main() -> int:
     journal = load()
     total = 0
     failures = 0
-    for check in (check_errors, check_files_column):
+    for check in (check_errors, check_files_column, check_empty_journal):
         n, f = check(journal)
         total += n
         failures += f

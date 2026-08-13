@@ -525,12 +525,41 @@ def fmt_row(r: dict) -> str:
             f"  {','.join(sorted((act.get('errors') or {}).keys()))}")
 
 
+def unjournalled(repo: Path) -> list[str]:
+    """Run directories with no journal entry — rounds that happened before this file existed.
+
+    `no runs recorded yet` is true of the journal and false of the project, and the difference
+    matters: a reader uses this column to tell "the model failed" from "the round never happened".
+    Reported from real use — four run directories sat beside a journal that said nothing had ever
+    run, and nothing said why.
+    """
+    runs = repo / ".handoff" / "runs"
+    if not runs.is_dir():
+        return []
+    return sorted(d.name for d in runs.iterdir()
+                  if d.is_dir() and (d / "result.json").exists() or
+                  (d.is_dir() and (d / "tree-after").exists()))
+
+
+def say_empty(repo: Path) -> None:
+    print("no runs recorded yet")
+    orphans = unjournalled(repo)
+    if orphans:
+        print()
+        noun = "run directory exists" if len(orphans) == 1 else "run directories exist"
+        print(f"But {len(orphans)} {noun} with no journal entry: {', '.join(orphans[:6])}"
+              + (" ..." if len(orphans) > 6 else ""))
+        print("Those rounds ran before the journal did. Their evidence is still in")
+        print(".handoff/runs/<slug>/, and this view cannot summarise them — it reads")
+        print("runs.jsonl, which they never wrote to. Not 'nothing happened'.")
+
+
 def cmd_list(args: argparse.Namespace) -> int:
     rows = load_records(Path(args.repo).resolve())
     if args.slug:
         rows = [r for r in rows if r.get("slug") == args.slug]
     if not rows:
-        print("no runs recorded yet")
+        say_empty(Path(args.repo).resolve())
         return 0
     print(f"{'when':<21}{'slug':<29}{'outcome':<20}{'score':>7}{'time':>8}{'files':>7}  errors")
     for r in rows[-args.limit:]:
@@ -551,7 +580,7 @@ def cmd_show(args: argparse.Namespace) -> int:
 def cmd_stats(args: argparse.Namespace) -> int:
     rows = load_records(Path(args.repo).resolve())
     if not rows:
-        print("no runs recorded yet")
+        say_empty(Path(args.repo).resolve())
         return 0
 
     outcomes = collections.Counter(r.get("outcome") for r in rows)

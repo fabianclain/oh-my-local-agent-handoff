@@ -287,6 +287,13 @@ Plans go where `.handoff/config.sh` says. Shape from `templates/plan.md`.
    only when the states are gated. A page listing four viewport and theme states, none of them
    gated, scored 6/6 while shipping two contrast failures and an unscrollable overflow.
 
+   If a check already covers the state but the linter cannot see it, say which one:
+   `- [gated by criterion 1] an empty cart returns zero`. The match is between the state's words
+   and the criteria's words, so a state covered by a TEST SUITE is invisible to it — the criterion
+   says "the suite passes" and the state says "an empty cart returns zero". Ten states gated by one
+   command all read as ungated, and without this form the only ways out were inflating the criteria
+   to make them visible or writing `[unverifiable]` about something you had in fact verified.
+
    If a state genuinely cannot be checked from the command line, write it as
    `- [unverifiable] dark theme contrast`. `handoff roundup` then prints it next to the score, so
    the round-up never implies coverage the gates did not provide. Saying so out loud is worth more
