@@ -789,3 +789,60 @@ act on that in a way it cannot act on "the tests failed".
 **Which points at where the feedback experiments went wrong.** Rounds 7 and 8 varied how MUCH the
 attempt was told. The variable that looks live here is how SPECIFIC it is, and that is a property
 of the gate rather than of the renderer.
+
+### A second wrong answer that passed every gate — and it breaks where the docs said it was safe
+
+`semantic/native/31`, accepted at 10 of 10, disagrees with the specification on **285 of 4,000**
+fuzzed trials. That is the second instance ever recorded here of the thing the whole verification
+discipline exists to catch, and the subtlest: the earlier two disagreed on 28% and 57% of trials,
+this one on 7%.
+
+The arithmetic, reduced:
+
+    specification    intdiv($sum + intdiv($D, 2), $D)        floor of half
+    native/31        intdiv($sum + intdiv($D + 1, 2), $D)    ceil of half
+
+with a comment above it reading `// Half up rounding: add ceil(days/2) before integer division`.
+The intent is right and the direction of the rounding term is wrong.
+
+| Period | The two formulas |
+| --- | --- |
+| even days | **identical** — `intdiv(D+1, 2) == intdiv(D, 2)` |
+| odd days | **differ**, at exactly the point the fraction is one half |
+
+Smallest witness: `D = 3`, one line whose fee times active days is 1. The specification gives 0;
+this gives 1. At `D = 31` it is `sum = 15`.
+
+**Why the existing criteria could not see it.** Round 13 recorded the reassurance that every
+implementation "gets the odd-`D` half-up case right", reasoning that `intdiv($sum + intdiv($D,2),
+$D)` differs from `floor(sum/D + 1/2)` "only when `sum/D` has fractional part exactly one half,
+which requires `D` even, where the two coincide."
+
+That reasoning is sound and it is about a **different** wrong formula. It rules out one way of
+getting the half term wrong and says nothing about the other. This implementation got it wrong from
+the opposite side, and lands precisely on the case the note concluded was safe. A worked example
+that discriminates one direction of an error does not discriminate the other.
+
+**The discriminating case, taken from the observed failure rather than invented** — which is the
+rule this project has already paid to learn twice:
+
+    a period with an ODD number of days, and a line whose fee x active-days is exactly (D-1)/2
+    D = 3, fee x days = 1   ->  subtotal 0, not 1
+
+Both the plan's existing worked examples use `D = 30` and `D = 11`. Thirty is even, so the formulas
+coincide there by construction. Eleven is odd but its values never land on the half.
+
+Adding this criterion changes the plan, so the 32 runs of 2026-08-13 were measured without it and
+do not pool with anything measured after.
+
+### The rate, and what it is not
+
+Two wrong of 41 implementations across all nights — **4.9%**, where before tonight it was 1 of 9.
+More runs did not make the number better; they made it real. The interval was 2%-43% and is now
+roughly 1%-16%.
+
+Read it as a property of THESE PLAN CRITERIA rather than of the model. Every one of these was a
+criteria gap: the plan's examples could not tell the right answer from the wrong one, and the
+implementer built something defensible from a specification that did not pin the case down. That is
+this project's founding observation — every defect that shipped originated in a specification —
+measured rather than asserted.
