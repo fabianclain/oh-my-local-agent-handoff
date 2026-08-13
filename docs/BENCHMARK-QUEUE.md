@@ -846,3 +846,60 @@ criteria gap: the plan's examples could not tell the right answer from the wrong
 implementer built something defensible from a specification that did not pin the case down. That is
 this project's founding observation — every defect that shipped originated in a specification —
 measured rather than asserted.
+
+### `ledger` calibrated: n=8, and it is the instrument roadmap item 1 has needed since round 7
+
+Both site plans sit at or near ceiling, so neither can test the repair loop — the feature only
+executes on runs that fail once. `ledger` is the editing shape instead: three methods added to a
+196-line fixture whose six existing `post*` methods are near-identical by construction.
+
+| | `site` + `site-dark` | `ledger` |
+| --- | ---: | ---: |
+| runs | 32 | 8 |
+| green on the first attempt | 29 (91%) | **5 (63%)** |
+| reached a second attempt | 2 | **3** |
+| outcomes other than accepted | 2 | **3** |
+
+Same model, same harness, same day. The variable is the shape of the work, and it is the first
+plan here that reliably produces the failures the repair loop exists for.
+
+    1   0/10  att=2   no-op                 changed nothing, twice
+    2  10/10  att=1   accepted
+    3  10/10  att=1   patch-ok-no-report
+    4  10/10  att=1   accepted
+    5  10/10  att=2   accepted              failed once, repaired
+    6   5/10  att=2   patch-incomplete      one method of three, twice
+    7  10/10  att=1   accepted
+    8  10/10  att=1   patch-ok-no-report
+
+Four distinct outcomes against the site plans' two, and the repair loop exercised in 3 of 8 rounds
+rather than 2 of 32. **A feedback A/B on this plan would spend its repetitions on the feature**,
+which is precisely what round 7 could not do: twelve runs there bought six informative points,
+because only runs that fail once exercise the thing being varied.
+
+### The docblock gate did not fire, and that is the useful part
+
+`ledger` was built around a trap: three insertions anchored on method names rather than docblocks,
+which steals a docblock from the method it documents. The trap solution scores **9 of 10** — it
+parses, every value is right, both `patch-shape` bounds pass — and only `docblock-anchor --base`
+rejects it. The gate demonstrably works.
+
+**In eight live rounds it never fired.** Criterion 7 passed every time. The model does not
+mis-anchor here; it either does the work or does not start it. Run 1 produced a **zero-line diff**
+across two attempts, and run 6 added one method of three.
+
+So the recorded failure has not been reproduced, and the difference is worth naming precisely. The
+original was *"files over 150 lines being edited a SECOND time"* — a second ROUND against a file
+an earlier round had already changed. This plan does three insertions inside ONE round, from a
+clean base. The line count is right and the repetition is not.
+
+Reproducing it needs a plan whose second round edits what its first round wrote — which the ladder
+can express and this plan cannot. Until then `docblock-anchor` is a gate with a validated trap and
+no observed catch, and it should be described that way rather than as a proven guard.
+
+### What the failures actually were
+
+Not near-misses. Both hard failures failed criteria 1 through 5 on the first attempt, meaning the
+methods were not declared at all — a `no-op` and a one-of-three. The repair loop recovered one of
+the three runs that reached it, which matches `site-dark`'s 1-of-2 and is still too few to read as
+a rate.

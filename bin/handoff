@@ -16,6 +16,8 @@
 #   handoff doctor          can this machine run a round right now? read-only
 #   handoff contrast <file> WCAG contrast for every colour pair a view declares
 #   handoff view-lint <file>  tag balance, the 100vh overflow trap, missing heading
+#   handoff docblock-anchor --base <ref> <file>   every docblock still on its own declaration
+#   handoff patch-shape <ref> <file> [--max-hunks N] [--max-added N]   the shape of the change
 #
 # `do` verifies automatically when it finishes. HANDOFF_NO_VERIFY=1 suppresses that, for
 # callers running the same gates themselves.
@@ -151,9 +153,20 @@ fi
 # installing `handoff` on PATH is that a project never needs to know where the harness lives. A
 # criterion naming a path the project does not have is a criterion that fails for the wrong reason,
 # which is the exact failure mode this repository keeps finding.
-if [[ "$MODE" == "contrast" || "$MODE" == "view-lint" ]]; then
+# One table, not a chain of special cases. Every gate a plan may name lives here; adding one is a
+# line, and forgetting to add one is how `ledger` shipped with `tools/docblock-anchor` in its
+# verification block — which resolves inside this checkout and nowhere else, and would have failed
+# for the wrong reason in the first real project that used it.
+case "$MODE" in
+    contrast)        GATE_TOOL="css-contrast" ;;
+    view-lint)       GATE_TOOL="view-lint" ;;
+    docblock-anchor) GATE_TOOL="docblock-anchor" ;;
+    patch-shape)     GATE_TOOL="patch-shape" ;;
+    *)               GATE_TOOL="" ;;
+esac
+if [[ -n "$GATE_TOOL" ]]; then
     HANDOFF_HOME="$(cd "$(dirname "$(_handoff_real_self)")/.." && pwd)"
-    TOOL="$HANDOFF_HOME/tools/$([[ "$MODE" == "contrast" ]] && echo css-contrast || echo view-lint)"
+    TOOL="$HANDOFF_HOME/tools/$GATE_TOOL"
     [[ -x "$TOOL" ]] || { echo "no $MODE gate at $TOOL" >&2; exit 1; }
     shift
     exec "$TOOL" "$@"
@@ -162,7 +175,7 @@ fi
 if [[ -z "$MODE" || -z "$SLUG" ]]; then
     echo "usage: handoff {do|prepare|check|resume|diff|verify|retro|auto} <slug>" >&2
     echo "       handoff {init|log|stats|doctor}" >&2
-    echo "       handoff {contrast|view-lint} <file>" >&2
+    echo "       handoff {contrast|view-lint|docblock-anchor|patch-shape} <file>" >&2
     exit 64
 fi
 

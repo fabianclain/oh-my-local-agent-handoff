@@ -50,6 +50,24 @@ are arithmetic rather than opinion —
     a structural check                landmarks present and in order, every in-page anchor
                                       resolving to an id that exists, every image labelled
 
+For editing an existing file, two more, and they answer questions `php -l` cannot:
+
+    handoff patch-shape <ref> <file> --max-hunks 3 --max-added 70
+        The change has the SHAPE the plan asked for. --max-hunks bounds where edits land, because
+        a change scattered across a dozen places is not the change you described. --max-added
+        bounds how much arrives at each: a file appended to itself is ONE hunk, every original
+        line surviving in order, and it passes everything else.
+
+    handoff docblock-anchor --base <ref> <file>
+        Every docblock still sits on the declaration it sat on before. A method inserted between a
+        docblock and its method is valid PHP, a clean `php -l`, and leaves the docblock describing
+        something else. This is the failure that ended the two most promising rounds of a real
+        feature, and nothing else in the harness sees it.
+
+Write them as `handoff <gate>`, never as a path. `tools/docblock-anchor` resolves inside the
+harness checkout and nowhere else, so a criterion naming it fails for the wrong reason in your
+project — which is the whole reason these are subcommands.
+
 The anchor check is the one to copy: `href="#features"` against `id="feature"` renders correctly,
 reads correctly, satisfies every text assertion, and is broken. Only a join between the two sets
 sees it. Split a service from its view when they are different KINDS of work, not because a view
