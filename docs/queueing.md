@@ -71,9 +71,32 @@ start one while the other is running.
 **A typo is refused when you queue it**, not when it runs. The same mistake found at 2am is a job
 that silently did nothing.
 
-**A rejected job is a result, not a wedge.** The queue records it and moves on. It is not retried:
-the harness already retried it internally up to three times, and the response to a rejection is a
-new, smaller plan written by a person.
+**A rejected job holds back that project, and only that project.** The skill's rule — *do not run
+step 4 because step 3 failed* — applied per repository, so one project's rejection cannot stall
+three others. What is left stays queued rather than being deleted, because the fix is a new,
+smaller plan and that is a person's job. It is never retried: the harness already retried it
+internally up to three times.
+
+---
+
+## The one thing this queue will not let you do
+
+Queue two steps of one sequence and walk away. It is the obvious use and it cannot work:
+
+```
+$ handoff queue 02-view
+'01-service' is already queued for /home/you/dev/app.
+Two uncommitted rounds in one tree do not work: the implementer leaves its changes
+in place, so the second round's scope gate is charged with the first round's files.
+Run and commit that one first. --force if these genuinely do not share files.
+```
+
+That is the same trap a reviewer avoided by hand on real work — committing step 1 first "so the
+scope gate measures only step 2's changes". A queue that quietly skipped that step would have
+turned a correct habit into a silent failure, so the habit is enforced here instead of documented.
+
+`--force` exists for the case the check cannot distinguish: two genuinely independent plans in one
+repository that share no files. It is rare, and it is on you to be right about it.
 
 ---
 

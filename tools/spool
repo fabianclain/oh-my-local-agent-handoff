@@ -76,6 +76,18 @@ def cmd_add(args) -> int:
     if args.mode == "do" and not plan.is_file():
         print(f"no plan at {plan}", file=sys.stderr)
         return 2
+    inflight = [j for j in (read_job(p) for p in jobs(PENDING) + jobs(RUNNING))
+                if j.get("repo") == str(repo)]
+    if inflight and not args.force:
+        other = inflight[0].get("slug", "?")
+        print(f"'{other}' is already queued for {repo}.", file=sys.stderr)
+        print("Two uncommitted rounds in one tree do not work: the implementer leaves its changes",
+              file=sys.stderr)
+        print("in place, so the second round's scope gate is charged with the first round's files.",
+              file=sys.stderr)
+        print("Run and commit that one first. --force if these genuinely do not share files.",
+              file=sys.stderr)
+        return 3
     name = f"{time.time():.6f}-{args.slug}.job"
     write_job(PENDING / name, {
         "slug": args.slug, "repo": str(repo), "mode": args.mode,
@@ -146,19 +158,31 @@ def cmd_drain(args) -> int:
             deadline += dt.timedelta(days=1)
         print(f"draining until {deadline:%Y-%m-%d %H:%M}")
 
-    ran = 0
+    ran, blocked = 0, set()
     while True:
-        pending = jobs(PENDING)
+        pending = [p for p in jobs(PENDING)
+                   if read_job(p).get("repo") not in blocked]
         if not pending:
             break
         if deadline and dt.datetime.now() >= deadline:
             print(f"deadline reached; {len(pending)} job(s) left queued")
             break
-        run_one(pending[0], handoff)
+        job = read_job(pending[0])
+        if run_one(pending[0], handoff) == "rejected":
+            # "Do not run step 4 because step 3 failed" — the skill's rule, applied per repository
+            # so one project's rejection cannot stall three others. What is left stays queued
+            # rather than being deleted: the fix is a new, smaller plan, and that is a person's job.
+            repo = job.get("repo", "")
+            blocked.add(repo)
+            waiting = len([p for p in jobs(PENDING) if read_job(p).get("repo") == repo])
+            if waiting:
+                print(f"    {waiting} more job(s) for {repo} left queued — fix this one first",
+                      flush=True)
         ran += 1
         if args.once:
             break
-    print(f"{ran} job(s) run, {len(jobs(PENDING))} still queued")
+    print(f"{ran} job(s) run, {len(jobs(PENDING))} still queued"
+          + (f" ({len(blocked)} project(s) held back by a rejection)" if blocked else ""))
     return 0
 
 
@@ -183,6 +207,8 @@ def main() -> int:
     add.add_argument("slug"); add.add_argument("repo")
     add.add_argument("--provider"); add.add_argument("--mode", default="do",
                                                      choices=["do", "resume"])
+    add.add_argument("--force", action="store_true",
+                     help="queue it anyway when the repo already has one in flight")
     sub.add_parser("list")
     drain = sub.add_parser("drain")
     drain.add_argument("--once", action="store_true"); drain.add_argument("--until")

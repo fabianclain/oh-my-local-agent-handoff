@@ -24,6 +24,8 @@
 #   8  drain order         jobs run oldest first, in their own repository
 #   9  a rejected job      is a result, not a wedge: the queue moves on
 #  10  the callback        fires with the verdict the gates reached
+#  11  one per repository   two uncommitted rounds in one tree cannot both be scoped correctly
+#  12  blast radius         a rejection holds that project's queue, and nobody else's
 #
 # Cases 4 and 9 are the ones that keep the rest honest. A queue that announced itself when there is
 # no queue would be noise, and noise is how a real message gets skimmed past; a queue that stopped
@@ -56,7 +58,7 @@ project() {  # a throwaway repo with one plan
     echo "$root"
 }
 
-echo "==> 1/10 an estimate is not invented from too little history"
+echo "==> 1/12 an estimate is not invented from too little history"
 OUT="$("$Q" status 2>&1)"
 if grep -qE "~[0-9]" <<<"$OUT"; then
     fail "printed a number with no rounds recorded" "$OUT"
@@ -66,7 +68,7 @@ else
     pass "says how many rounds it has and how many it needs"
 fi
 
-echo "==> 2/10 position and estimate scale with the queue"
+echo "==> 2/12 position and estimate scale with the queue"
 for s in 300 300 300; do "$Q" record native "$s"; done
 T1="$("$Q" take alpha /a --pid $$)"; T2="$("$Q" take beta /b --pid $$)"
 "$Q" holding running /c --pid $$
@@ -82,7 +84,7 @@ else
     pass "#1 waits one round, #2 waits two — from recorded durations, not a guess"
 fi
 
-echo "==> 3/10 a dead waiter's ticket does not inflate the queue"
+echo "==> 3/12 a dead waiter's ticket does not inflate the queue"
 bash -c 'sleep 30' & DEAD=$!
 DEADTICKET="$("$Q" take zombie /z --pid $DEAD)"
 kill "$DEAD" 2>/dev/null; wait "$DEAD" 2>/dev/null
@@ -117,7 +119,7 @@ Anything else.
 PLAN
 ( cd "$R" && printf '.handoff/runs/\n' >> .gitignore && git add -A && git commit -qm ig ) >/dev/null
 
-echo "==> 4/10 with the GPU free, a round says nothing about queues"
+echo "==> 4/12 with the GPU free, a round says nothing about queues"
 OUT="$( cd "$R" && HANDOFF_USES_LOCAL_GPU=1 HANDOFF_PROVIDER=stub STUB_PATCH="true" \
         handoff do alpha 2>&1 )"
 if grep -qi "busy\|waiting" <<<"$OUT"; then
@@ -126,7 +128,7 @@ else
     pass "silent when there is nothing to say"
 fi
 
-echo "==> 5/10 a busy GPU makes the next round wait, and say where it is"
+echo "==> 5/12 a busy GPU makes the next round wait, and say where it is"
 flock "$GPU_LOCK" sleep 6 &
 HOLDER=$!
 sleep 1
@@ -141,7 +143,7 @@ else
     pass "waited, said so, and started once free"
 fi
 
-echo "==> 6/10 the lock is released when the round ends"
+echo "==> 6/12 the lock is released when the round ends"
 if flock -n "$GPU_LOCK" true 2>/dev/null; then
     pass "free again after the round"
 else
@@ -151,14 +153,14 @@ fi
 # ------------------------------------------------------------------------------------------------
 # The spool.
 
-echo "==> 7/10 a slug with no plan is refused when it is queued"
+echo "==> 7/12 a slug with no plan is refused when it is queued"
 if "$SPOOL" add nosuchplan "$R" >/dev/null 2>&1; then
     fail "queued a job that could never run — discovered at 2am instead of at 3pm"
 else
     pass "refused at enqueue, while you are still there to fix it"
 fi
 
-echo "==> 8/10 jobs drain oldest first, each in its own repository"
+echo "==> 8/12 jobs drain oldest first, each in its own repository"
 A="$(project alpharepo)"; B="$(project betarepo)"
 "$SPOOL" add alpha "$A" >/dev/null; "$SPOOL" add alpha "$B" >/dev/null
 cat > "$SANDBOX/fake-handoff" <<'FAKE'
@@ -177,7 +179,7 @@ else
     pass "oldest first, each with its own working directory"
 fi
 
-echo "==> 9/10 a rejected job is a result, not a wedge"
+echo "==> 9/12 a rejected job is a result, not a wedge"
 "$SPOOL" add alpha "$A" >/dev/null; "$SPOOL" add alpha "$B" >/dev/null
 printf '#!/bin/bash\nexit 1\n' > "$SANDBOX/failing"; chmod +x "$SANDBOX/failing"
 OUT="$(HANDOFF_BIN="$SANDBOX/failing" "$SPOOL" drain 2>&1)"
@@ -189,7 +191,7 @@ else
     pass "recorded and moved on"
 fi
 
-echo "==> 10/10 the callback fires with the verdict the gates reached"
+echo "==> 10/12 the callback fires with the verdict the gates reached"
 SEEN="$SANDBOX/callback.txt"
 OUT="$( cd "$R" && HANDOFF_USES_LOCAL_GPU=1 HANDOFF_PROVIDER=stub STUB_PATCH="true" \
         HANDOFF_CALLBACK="cat > $SEEN" handoff do alpha 2>&1 )"
@@ -201,6 +203,46 @@ elif ! grep -q '"verdict":"accepted"' "$SEEN"; then
     fail "the verdict did not reach the callback" "$(cat "$SEEN")"
 else
     pass "ai-run-end delivered, carrying the gates' verdict"
+fi
+
+echo "==> 11/12 a second job for a repo already in flight is refused"
+"$SPOOL" add alpha "$A" >/dev/null
+OUT="$("$SPOOL" add alpha "$A" 2>&1)"; RC=$?
+if [[ "$RC" -eq 0 ]]; then
+    fail "queued two rounds against one tree — step 2's scope gate would be charged step 1's files"
+elif ! grep -q "already queued" <<<"$OUT"; then
+    fail "refused without saying what is already there" "$OUT"
+elif ! "$SPOOL" add alpha "$A" --force >/dev/null 2>&1; then
+    fail "--force does not override, so genuinely independent work cannot be queued"
+else
+    pass "refused, named the holder, and --force still works"
+fi
+"$SPOOL" clear >/dev/null
+
+echo "==> 12/12 a rejection holds that project's queue, and nobody else's"
+# Two jobs for A, one for B. A's first is rejected, so A's second must not run — and B's must.
+"$SPOOL" add alpha "$A" >/dev/null
+"$SPOOL" add alpha "$A" --force >/dev/null
+"$SPOOL" add alpha "$B" >/dev/null
+# It must announce the ATTEMPT before deciding the outcome. The first version only printed on
+# success, so a second attempt against the rejected repo left no trace and the case passed over a
+# mutant that removed the guard entirely — a test that could not see the thing it was testing.
+cat > "$SANDBOX/fail-a" <<FAILA
+#!/bin/bash
+echo "TRIED IN \$PWD"
+[[ "\$PWD" == "$A" ]] && exit 1
+exit 0
+FAILA
+chmod +x "$SANDBOX/fail-a"
+OUT="$(HANDOFF_BIN="$SANDBOX/fail-a" "$SPOOL" drain 2>&1)"
+if ! grep -q "TRIED IN $B" <<<"$OUT"; then
+    fail "one project's rejection stalled another project's work" "$OUT"
+elif [[ "$(grep -c "TRIED IN $A" <<<"$OUT")" -ne 1 ]]; then
+    fail "the second job for the rejected repo ran anyway — step 2 over step 1's tree" "$OUT"
+elif ! grep -q "left queued" <<<"$OUT"; then
+    fail "held it back without saying so, so the work looks finished when it is not" "$OUT"
+else
+    pass "held back only the project that failed, and said what is left"
 fi
 
 echo

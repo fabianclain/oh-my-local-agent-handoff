@@ -257,11 +257,28 @@ this run". It is harmless only when it lands somewhere excluded — `.handoff/pl
 scratch note anywhere else is charged to the model. Nothing should touch the tree between
 `handoff do` and its verdict. Reported from real use.
 
-**Several projects at once.** `handoff do` also takes a machine-wide lock on the local model, and
-waits rather than refusing when another project is mid-round — printing who holds it, your position
-and an estimate drawn from real round durations. Concurrent rounds do not fail; they silently
-misattribute each other's tokens, which is worse. For fire-and-forget across projects there is
-`handoff queue <slug>` and `handoff drain`. See `docs/queueing.md`.
+**Several projects at once.** `handoff do` takes a machine-wide lock on the local model and waits
+rather than refusing when another project is mid-round, printing who holds it, your position, and
+an estimate drawn from real round durations. You do not have to do anything to get this. Concurrent
+rounds do not fail — they silently misattribute each other's tokens, which is worse.
+
+**Queue across projects; never queue a sequence.** For work in a DIFFERENT repository, enqueue it
+and walk away:
+
+```bash
+cd ~/dev/other-project && handoff queue 01-service
+handoff drain                    # runs everything queued, one at a time, oldest first
+```
+
+Queueing steps 1 and 2 of one sequence looks like the obvious use and is the one thing that cannot
+work. The implementer leaves its changes uncommitted, so step 2's scope gate is charged with step
+1's files and fails for a reason that has nothing to do with step 2. Both rules that prevent that —
+*commit between steps* and *stop on the first rejection* — are enforced by the queue rather than
+requested: a second job for a repo that already has one is **refused**, and a rejected job holds
+back that repository's remaining jobs and no other project's.
+
+So the shape that works is one job per project, drained while you do something else, with you
+reading each verdict and committing before the next step of anything. See `docs/queueing.md`.
 
 **That includes another agent session.** `handoff do` and `handoff resume` now take a lock on
 `.handoff/.lock` and refuse to start while a round is running in the same checkout, because the
