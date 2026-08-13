@@ -22,6 +22,7 @@
 #   view-selftest         the contrast and markup gates, against the page they come from
 #   site-audit-selftest   every structural gate of the site plan, each mutation-tested
 #   overnight-selftest    the queue runner: resume, deadline, timeout, orphans
+#   docblock-anchor-selftest  an edit that steals a docblock, which parses cleanly
 #
 # Then two consistency checks the suites cannot make individually.
 #
@@ -38,7 +39,7 @@ REPO="$(cd "$HERE/.." && pwd)"
 cd "$REPO"
 FAILED=()
 
-for suite in smoke-e2e harness-selftest verifier-selftest feedback-selftest patch-shape-selftest shim-selftest native-retry-selftest turn-economy-selftest report-audit-selftest journal-selftest roundup-selftest plan-lint-selftest view-selftest site-audit-selftest overnight-selftest; do
+for suite in smoke-e2e harness-selftest verifier-selftest feedback-selftest patch-shape-selftest shim-selftest native-retry-selftest turn-economy-selftest report-audit-selftest journal-selftest roundup-selftest plan-lint-selftest view-selftest site-audit-selftest overnight-selftest docblock-anchor-selftest; do
     # Suites live in tools/, except the ones that test a bench fixture and belong beside it.
     # Resolving only tools/ made a real suite report `SKIP (missing)` — which this file's own next
     # comment calls the failure it exists to avoid, one line before failing to avoid it.

@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""docblock-anchor — every docblock still sits on the thing it documents.
+
+    tools/docblock-anchor <file.php> [...]
+    tools/docblock-anchor --base <ref> <file.php> [...]
+
+Exit 0 when every docblock is immediately followed by a declaration, 1 when one is orphaned or
+separated from it, 2 when a file cannot be read.
+
+WHY
+
+The two most promising rounds of a real feature ended the same way: "a docblock running into a
+method body, parse error, both times on files over 150 lines being edited a second time." That is
+the #1 observed failure on real work in this project, and nothing in the harness targets it.
+
+The gates that exist cannot. `tools/patch-shape` says so itself: an insertion BETWEEN two lines
+altering neither passes the order check, and case 5 of its selftest asserts that it passes so the
+limit stays visible. `--max-hunks` bounds where edits land and `--max-added` how much arrives, but
+an insertion in exactly the wrong place is one hunk of a few lines. And when the split does not
+break the parse — a docblock separated from its method by a blank line and another method — `php
+-l` is silent too.
+
+WHAT IT CHECKS
+
+A `/** ... */` block must be followed, ignoring blank lines and attributes, by something it can
+document: a class, interface, trait, enum, function, method, property, constant or `use`. What it
+must not be followed by is another docblock, a closing brace, or a statement.
+
+--base IS THE MODE THAT CATCHES THE RECORDED FAILURE
+
+Without it this checks one file in isolation, and that turned out to be the wrong shape. Inserting
+a whole method between a docblock and the method it documents leaves the docblock followed by
+`public function` — structurally perfect, `php -l` clean, and the docblock now describes the wrong
+method. The first version of this tool passed exactly that case, which is how the limitation was
+found rather than argued.
+
+With `--base`, every docblock/declaration PAIR in the base must still be adjacent in the working
+file. A method inserted between them breaks the pair and is named. That is the diff-aware question,
+and it is the one worth asking: whether an edit landed somewhere it should not have.
+
+WHAT IT DOES NOT CHECK
+
+Whether the docblock's CONTENT matches the declaration. A block saying `@param int $minor` above a
+method taking a string is wrong and this will not notice, in either mode. A content check needs a
+real PHP parser. Stated here rather than left for someone to discover, because a gate whose limits
+are not written down gets trusted past them.
+"""
+
+from __future__ import annotations
+
+import argparse
+import pathlib
+import re
+import sys
+
+# What a docblock may legitimately sit above.
+DOCUMENTABLE = re.compile(
+    r"^\s*(#\[|abstract\s|final\s|readonly\s|public\s|protected\s|private\s|static\s|"
+    r"function\s|class\s|interface\s|trait\s|enum\s|const\s|var\s|use\s|\$)"
+)
+OPENS = re.compile(r"/\*\*")
+CLOSES = re.compile(r"\*/")
+
+
+def check(path: pathlib.Path) -> tuple[int, list[str]]:
+    lines = path.read_text(errors="replace").splitlines()
+    problems: list[str] = []
+    checked = 0
+    index = 0
+    while index < len(lines):
+        if not OPENS.search(lines[index]) or "*/" in lines[index]:
+            index += 1
+            continue
+        # Walk to the end of the block.
+        end = index
+        while end < len(lines) and not CLOSES.search(lines[end]):
+            end += 1
+        if end >= len(lines):
+            problems.append(f"line {index + 1}: docblock is never closed")
+            break
+        checked += 1
+        # The first line with content after it decides.
+        following = end + 1
+        while following < len(lines) and not lines[following].strip():
+            following += 1
+        if following >= len(lines):
+            problems.append(f"line {index + 1}: docblock at end of file, documenting nothing")
+        elif OPENS.search(lines[following]):
+            problems.append(f"line {index + 1}: docblock followed by another docblock at line "
+                            f"{following + 1} — the declaration between them is gone or moved")
+        elif not DOCUMENTABLE.match(lines[following]):
+            problems.append(f"line {index + 1}: docblock followed by "
+                            f"{lines[following].strip()[:60]!r} at line {following + 1}, "
+                            f"which is not a declaration")
+        index = end + 1
+    return checked, problems
+
+
+def pairs(text: str) -> list[tuple[str, str]]:
+    """(last line of each docblock's summary, the declaration it sits on).
+
+    Keyed on the docblock's whole text rather than its position, so an unchanged pair matches
+    wherever it has moved to. Position would report every pair below an insertion as broken.
+    """
+    lines = text.splitlines()
+    out: list[tuple[str, str]] = []
+    index = 0
+    while index < len(lines):
+        if not OPENS.search(lines[index]) or "*/" in lines[index]:
+            index += 1
+            continue
+        end = index
+        while end < len(lines) and not CLOSES.search(lines[end]):
+            end += 1
+        if end >= len(lines):
+            break
+        block = "\n".join(l.strip() for l in lines[index:end + 1])
+        following = end + 1
+        while following < len(lines) and not lines[following].strip():
+            following += 1
+        declaration = lines[following].strip() if following < len(lines) else "<end of file>"
+        out.append((block, declaration))
+        index = end + 1
+    return out
+
+
+def check_against_base(path: pathlib.Path, base_text: str) -> list[str]:
+    was = dict(pairs(base_text))
+    now = dict(pairs(path.read_text(errors="replace")))
+    problems = []
+    for block, declaration in was.items():
+        if block not in now:
+            continue                      # the docblock itself was edited or removed; not this gate
+        if now[block] != declaration:
+            summary = next((l for l in block.splitlines()[1:] if l.strip("* ")), block)[:60]
+            problems.append(f"a docblock now sits on a different declaration\n"
+                            f"          docblock: {summary.strip()}\n"
+                            f"          was on:   {declaration[:70]}\n"
+                            f"          now on:   {now[block][:70]}")
+    return problems
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--base", help="git ref to compare against")
+    parser.add_argument("files", nargs="+", type=pathlib.Path)
+    args = parser.parse_args()
+
+    if args.base:
+        import subprocess
+        status = 0
+        for path in args.files:
+            if not path.is_file():
+                print(f"cannot read {path}", file=sys.stderr)
+                return 2
+            shown = subprocess.run(["git", "show", f"{args.base}:{path}"],
+                                   capture_output=True, text=True)
+            if shown.returncode != 0:
+                print(f"note  {path} — not in {args.base}, so there are no pairs to preserve")
+                continue
+            problems = check_against_base(path, shown.stdout)
+            if problems:
+                status = 1
+                print(f"FAIL  {path} — {len(problems)} docblock(s) moved to another declaration")
+                for problem in problems:
+                    print(f"        {problem}")
+            else:
+                print(f"pass  {path} — every docblock still sits on the declaration it did")
+        return status
+
+    status = 0
+    for path in args.files:
+        if not path.is_file():
+            print(f"cannot read {path}", file=sys.stderr)
+            return 2
+        checked, problems = check(path)
+        if problems:
+            status = 1
+            print(f"FAIL  {path} — {len(problems)} orphaned docblock(s) of {checked}")
+            for problem in problems:
+                print(f"        {problem}")
+        elif checked:
+            print(f"pass  {path} — all {checked} docblock(s) sit on a declaration")
+        else:
+            # No docblocks is not a pass over a file that should have them, and not a failure over
+            # one that never did. Say which happened rather than printing a verdict either way.
+            print(f"note  {path} — no docblocks found, so nothing was checked")
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main())

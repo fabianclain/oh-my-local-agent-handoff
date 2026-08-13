@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+#
+# docblock-anchor-selftest — the gate for the #1 observed failure on real work.
+#
+#   tools/docblock-anchor-selftest
+#
+# The failure: "a docblock running into a method body, parse error, both times on files over 150
+# lines being edited a second time." The version of that which nothing else catches is the one
+# where the parse still succeeds — a method inserted between a docblock and the method it
+# documents. `php -l` is clean, patch-shape passes it by its own documented limit, and the docblock
+# now describes something else.
+#
+# Case 1 is the reason this file exists. Case 2 is the reason it is trustworthy: the same method,
+# added in the right place, must pass — a gate that rejects correct work is worse than none.
+
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$HERE/.." && pwd)"
+GATE="$HERE/docblock-anchor"
+FIXTURE="$REPO/bench/fixtures/ledger/Ledger.php"
+WORK="$(mktemp -d)"
+FAILURES=0
+
+trap 'rm -rf "$WORK"' EXIT
+pass() { echo "    PASS: $1"; }
+fail() { echo "    FAIL: $1"; FAILURES=$(( FAILURES + 1 )); }
+
+[[ -x "$GATE" ]] || { echo "docblock-anchor not found" >&2; exit 2; }
+[[ -f "$FIXTURE" ]] || { echo "ledger fixture not found" >&2; exit 2; }
+
+cp "$FIXTURE" "$WORK/Ledger.php"
+cd "$WORK" || exit 2
+git init -q .
+git add -A
+git -c user.email=selftest@example.invalid -c user.name=selftest commit -qm base
+
+restore() { git checkout -q Ledger.php; }
+
+echo "==> 1/4 a method inserted between a docblock and its method is caught"
+python3 - <<'PY'
+import pathlib
+p = pathlib.Path("Ledger.php"); src = p.read_text()
+marker = "    public function postCredit(string $memo, int $minor): int"
+p.write_text(src.replace(marker, """    public function postBonus(string $memo, int $minor): int
+    {
+        $this->balance += $minor;
+
+        return $this->balance;
+    }
+
+""" + marker, 1))
+PY
+if command -v php >/dev/null && ! php -l Ledger.php >/dev/null 2>&1; then
+    fail "the fixture no longer parses, so this case tests the parse check and not the gate"
+elif "$GATE" --base HEAD Ledger.php >"$WORK/out1" 2>&1; then
+    fail "a stolen docblock passed"
+    sed -n '1,4p' "$WORK/out1" | sed 's/^/        /'
+elif ! grep -q "postBonus" "$WORK/out1"; then
+    fail "rejected, but the message does not name what the docblock moved onto"
+else
+    pass "the parse is clean, the docblock moved, and the gate says which declaration it moved to"
+fi
+restore
+
+echo "==> 2/4 the same method added in the right place passes"
+python3 - <<'PY'
+import pathlib
+p = pathlib.Path("Ledger.php"); src = p.read_text()
+anchor = "    /**\n     * Post a adjustment"
+p.write_text(src.replace(anchor, """    /**
+     * Post a bonus of the given minor units.
+     */
+    public function postBonus(string $memo, int $minor): int
+    {
+        $this->balance += $minor;
+
+        return $this->balance;
+    }
+
+""" + anchor, 1))
+PY
+if "$GATE" --base HEAD Ledger.php >/dev/null 2>&1; then
+    pass "correct placement is not flagged — the gate does not reject good work"
+else
+    fail "a correctly placed method was rejected"
+    "$GATE" --base HEAD Ledger.php 2>&1 | sed -n '1,4p' | sed 's/^/        /'
+fi
+restore
+
+echo "==> 3/4 an unchanged file is unchanged"
+if "$GATE" --base HEAD Ledger.php >/dev/null 2>&1; then
+    pass "no edit, no finding"
+else
+    fail "an untouched file was flagged"
+fi
+
+echo "==> 4/4 without --base, an orphaned docblock is still caught"
+# The single-file mode is narrower and still worth having: a docblock left above a closing brace
+# documents nothing, and no other gate reports it.
+python3 - <<'PY'
+import pathlib
+p = pathlib.Path("Ledger.php"); src = p.read_text()
+p.write_text(src.replace("""    /**
+     * A one-line summary, used by the reporting layer.
+     */
+    public function summary(): string""", """    /**
+     * A one-line summary, used by the reporting layer.
+     */
+    public function summary(): string""").replace("""        return sprintf('%s ledger: %d entries, balance %d', $this->currency, count($this->entries), $this->balance);
+    }
+}""", """        return sprintf('%s ledger: %d entries, balance %d', $this->currency, count($this->entries), $this->balance);
+    }
+
+    /**
+     * Left behind by an edit that removed what it documented.
+     */
+}"""))
+PY
+if "$GATE" Ledger.php >/dev/null 2>&1; then
+    fail "a docblock above a closing brace passed the single-file check"
+else
+    pass "a docblock documenting nothing is reported without needing a base"
+fi
+restore
+
+echo
+if [[ "$FAILURES" -eq 0 ]]; then
+    echo "all checks passed"
+else
+    echo "$FAILURES check(s) failed"
+fi
+exit $(( FAILURES > 0 ? 1 : 0 ))
