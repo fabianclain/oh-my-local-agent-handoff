@@ -687,3 +687,44 @@ at all — there is no existing content to regenerate.
 
 The arm-wide 23% edit-failure rate is the number to watch. At 4.5 edits per run it is survivable;
 this run took 11 and it was not.
+
+### The missing report is largely solved, and the residual has two causes, not one
+
+Across 40 runs of `site-dark` and `semantic` on the native loop, `report-audit` says:
+
+    reported          36/40 (90%)
+    peg faults        76, of which 71 retried and recovered (93%)
+    missing           4 — two `turn limit reached`, one `peg fault ended the call`
+
+The retry is doing the work. This project spent several rounds on `patch-ok-no-report` when the
+adapter could not ask twice: `--id` was incompatible with `--json` plus a prompt, so the
+prompt-validate retry died instantly and 16 byte-correct trees were scored down for want of an
+envelope. On the native loop the retry runs, and 71 of 76 parse faults never reach the harness.
+
+**The cross-era comparison is confounded and should not be quoted.** The historical ~27% came from
+Cline on `wide` under a different harness; this is the native loop on two other plans. What can be
+said is what was measured here: 90% reported, and the residual is small enough that its causes are
+individually diagnosable — which they now are, and they differ:
+
+| Cause | n | The fix it points at |
+| --- | ---: | --- |
+| turn limit reached | 2 | not a report problem at all — the tree was finished and the budget was gone. Failed edits, see above |
+| peg fault ended the call | 1 | the retry, which already recovers 93% and missed this one |
+
+Two failures wearing one label, again — the same shape as `patch-damaged`. A single
+`patch-ok-no-report` rate would have averaged them into a number pointing at neither fix.
+
+### No depth gradient, on a third independent measurement
+
+    below 9k    12/13 reported (92%)
+    9k-20k      16/18 (89%)
+    above 20k    8/9  (89%)
+
+Flat. The recorded finding is that this fault tracks conversation depth — "0 failures in 99
+completions below 16k, 2 in 33 above 48k" — and tonight is the third measurement that does not
+reproduce it, after the pre-reboot real-use log and the shallow-clustered faults in the first
+`site` runs. None of tonight's runs go deep enough to test the 48k+ claim, so the original may
+still hold up there; what is now doubtful is the reading that depth is the *general* mechanism.
+
+The step-size advice in the skill rests on that mechanism. It is not yet wrong, but it is no longer
+supported by the only evidence anyone has re-checked.
