@@ -187,12 +187,23 @@ CASES: list[tuple[str, str, list[str], list[str]]] = [
      plan("php tests/t.php").replace("## Out of scope\n\nAnything else.\n", ""),
      ["out-of-scope"], []),
 
-    ("nothing asserts how many files changed",
+    # A plan naming FILES needs no file count of its own: the scope gate reports anything outside
+    # the Files-to-touch table, and it excludes files that were already untracked, which a
+    # criterion cannot. This note used to fire on every such plan and the advice it implied cost a
+    # real round — a plan counting paths failed because `handoff init` had written a .gitignore.
+    ("a plan naming files is not asked to count them",
      plan("php tests/t.php"),
+     [], ["unenforced-scope"]),
+
+    # A directory is the case the gate genuinely cannot settle: everything inside it is permitted,
+    # so only the plan can say how many files belong there.
+    ("a plan permitting a whole directory is asked what landed in it",
+     plan("php tests/t.php").replace("| `src/a.php` | modify |", "| `src/generated/` | create |"),
      ["unenforced-scope"], []),
 
-    ("a plan that asserts a file count",
-     plan("test \"$(git status --porcelain --untracked-files=all | wc -l)\" -eq 1"),
+    ("a directory plan that does count is left alone",
+     plan("test \"$(find src/generated -type f | wc -l)\" -eq 3")
+        .replace("| `src/a.php` | modify |", "| `src/generated/` | create |"),
      [], ["unenforced-scope"]),
 ]
 

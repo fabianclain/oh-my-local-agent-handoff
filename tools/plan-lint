@@ -459,17 +459,35 @@ def check_worked_example(report: Report, text: str) -> None:
 
 # --- 7. what check-plan warns about, so one command covers it --------------------------------
 
-def check_shape(report: Report, text: str, commands: list[str]) -> None:
+def check_shape(report: Report, text: str, commands: list[str],
+                paths: list[tuple[str, str]] | None = None) -> None:
     if "out of scope" not in sections(text):
         report.note("out-of-scope", "no '## Out of scope' section",
                     "Everything not written in the plan is out of scope, and saying which nearby",
                     "work is deliberately excluded is what stops it being done anyway.")
-    if commands and not any(re.search(r"git\s+(status|diff)", c) for c in commands):
+    # Only when the plan names a DIRECTORY, which is the one case the scope gate cannot settle.
+    #
+    # This used to fire on every plan that had no `git status` in its criteria, and the advice it
+    # implied — count the changed files yourself — is worse than the gate already running. It is
+    # narrower than the harness's exclusions, it cannot tell a file the model created from one
+    # that was already untracked, and `--porcelain` collapses an untracked directory to one line.
+    # Reported from real use: a plan counting paths failed because `handoff init` had written a
+    # .gitignore, while the scope gate — which snapshots untracked files first — correctly passed.
+    #
+    # Where the table names files, the gate reports anything outside them and there is nothing
+    # left to assert. Where it names a directory, every file inside is permitted and only the plan
+    # can say how many belong there.
+    directories = [p for p, _ in (paths or [])
+                   if p.endswith("/") or "." not in pathlib.PurePosixPath(p).name]
+    if directories and commands and not any(
+            re.search(r"git\s+(status|diff)|\bfind\b|\bls\b", c) for c in commands):
         report.note("unenforced-scope",
-                    "nothing asserts how many files changed",
-                    "The scope gate uses the Files-to-touch table, but nothing in the plan's own",
-                    "criteria notices a file the model added inside a directory it was allowed to",
-                    "create.")
+                    f"the plan permits a whole directory ({directories[0]}) and nothing counts "
+                    "what landed in it",
+                    "The scope gate reports files outside the Files-to-touch table, so where that",
+                    "table names FILES it already covers this and no criterion is needed. A",
+                    "directory is different: everything inside it is permitted, and only the plan",
+                    "can say how many files belong there.")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -480,14 +498,15 @@ CHECKS_RUN = 7
 def lint(path: pathlib.Path, repo: pathlib.Path) -> Report:
     text = path.read_text(errors="replace")
     commands = verification_commands(text)
+    paths = touched_paths(text)
     report = Report()
-    check_porcelain(report, commands, touched_paths(text), repo)
+    check_porcelain(report, commands, paths, repo)
     check_states(report, text)
     check_colour(report, commands)
     check_whitespace(report, commands)
     check_zero_assertions(report, commands, repo)
     check_worked_example(report, text)
-    check_shape(report, text, commands)
+    check_shape(report, text, commands, paths)
     return report
 
 
