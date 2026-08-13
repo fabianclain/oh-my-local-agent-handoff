@@ -248,6 +248,50 @@ assert something specific.
 Cut pure logic away from anything that renders. A service class is close to an ideal fit; a view is
 the easiest thing in a codebase to satisfy with three lines that mean nothing.
 
+### Using it in any repository on this machine
+
+Everything above runs from inside this checkout. To use `handoff` in an unrelated project:
+
+```bash
+tools/install-local                    # or: tools/install-local --check
+```
+
+Two things, and neither touches a repository or the model server:
+
+1. **`handoff` goes on PATH**, as a symlink in `~/.local/bin`. Adding this repository's `bin/` to
+   PATH in `~/.bashrc` looks equivalent and is not — Ubuntu's stock `~/.bashrc` returns at line 5
+   for non-interactive shells, so `bash -c handoff`, cron, ssh commands and anything an agent
+   spawns never see it. That cost a benchmark night its first launch. `~/.profile` adds
+   `~/.local/bin` for login shells and it is already in the systemd user environment, so the
+   symlink works where the PATH export does not.
+
+2. **`~/.config/agent-handoff/config.sh` is written** with the provider, model and port, which sets
+   the implementer for **every project at once**. Without it `bin/handoff` defaults to `codex`, a
+   hosted CLI, and driving a local model elsewhere means `HANDOFF_PROVIDER=native` on every
+   invocation or a config file committed into every repository you touch.
+
+Configuration is read in three layers, each overriding the one before:
+
+| Layer | Where | Scope |
+| --- | --- | --- |
+| user | `~/.config/agent-handoff/config.sh` | every project on the machine |
+| project | `<repo>/.handoff/config.sh` | that repository, written by `handoff init` |
+| environment | `HANDOFF_PROVIDER=...` and friends | the single invocation |
+
+So a machine-wide default is one file, a repository with its own opinions overrides it, and a
+one-off experiment overrides both without editing anything.
+
+Then, in the other repository:
+
+```bash
+cd ~/dev/some-project
+handoff init          # idempotent; safe to re-run on a configured project
+```
+
+`tools/setup` does all of this at once — `install-local` for PATH and the user config,
+`build-integrations` for the skills, `setup-local-implementer` for the model stack, and `doctor` to
+state what is actually true at the end. Each refuses rather than half-succeeding.
+
 ### Or drive it from Claude Code
 
 `integrations/claude-skills/local-implementer/SKILL.md` is a Claude Code skill that does all of the

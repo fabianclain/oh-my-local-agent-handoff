@@ -99,6 +99,10 @@ and ask for *only* the plan, hand it to the local one, then read the gaps rather
 **[docs/START-HERE.md](docs/START-HERE.md)** — the same thing at walking pace, including how to
 read a verdict.
 
+**[docs/logging.md](docs/logging.md)** — what gets recorded and where: the per-run artifacts, the
+serving log the token accounting is measured against, the queue's own record, and which tool reads
+which. Also the three ways to misread it.
+
 **[docs/DRIVING.md](docs/DRIVING.md)** — the three seats. Claude plans with `/local-implementer`,
 Codex runs the loop with `/local-drive`, the local model writes the code. Whoever writes the plan
 must not be whoever decides a rejected round was fine.
