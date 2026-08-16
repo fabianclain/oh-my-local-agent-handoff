@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+#
+# stage-usage-judge — the reviewer's test for one local-usage step, committed before that step runs.
+#
+#   bench/stage-usage-judge <slug>     # called by: handoff sequence --before-step
+#
+# The local-usage plans have no shipped commits to stage a test out of: the page was built
+# directly and the plans were written backwards from it, describing an architecture (a
+# UsageReport service) that does not exist in master, where every figure is computed inline in a
+# 916-line Blade component. So each judge lives beside its plan under .claude/plans/judges/ —
+# outside `tests/`, so the monolith's own suite does not try to run a test for a class nobody has
+# written yet — and is copied into place here.
+#
+# Committed rather than dropped in the tree, for the same reason as bench/stage-graph-test: an
+# untracked file left behind stops the sequence after the step it judged, and it belongs in the
+# round's BASE so the scope gate knows it is not the model's work.
+
+set -uo pipefail
+
+SLUG="${1:?usage: stage-usage-judge <slug>}"
+JUDGES="$(git rev-parse --show-toplevel)/.claude/plans/judges/local-usage"
+
+case "$SLUG" in
+local-usage-3-figures) FILE=tests/Feature/LocalModel/UsageReportTest.php; SRC="$JUDGES/UsageReportTest.php" ;;
+local-usage-1-schema)  FILE=tests/Feature/LocalModel/RunModelTest.php;    SRC="$JUDGES/RunModelTest.php" ;;
+local-usage-2-import)  FILE=tests/Feature/LocalModel/ImportTest.php;      SRC="$JUDGES/ImportTest.php" ;;
+local-usage-4-page)    FILE=tests/Feature/LocalModel/UsagePageTest.php;   SRC="$JUDGES/UsagePageTest.php" ;;
+local-usage-5-sorting) FILE=tests/Feature/LocalModel/UsageSortingTest.php; SRC="$JUDGES/UsageSortingTest.php" ;;
+*) echo "stage-usage-judge: no judge mapped for '$SLUG'" >&2; exit 1 ;;
+esac
+
+[[ -f "$SRC" ]] || {
+    echo "stage-usage-judge: no judge written yet for $SLUG ($SRC)" >&2
+    echo "  A plan whose judge does not exist fails every round for a reason that is not the" >&2
+    echo "  model's. Write it, and mutation-test it, before spending GPU on this step." >&2
+    exit 1
+}
+
+mkdir -p "$(dirname "$FILE")"
+cp "$SRC" "$FILE"
+git add -- "$FILE" || exit 1
+git -c user.name=reviewer -c user.email=reviewer@bench \
+    commit --quiet --no-verify -m "test: the criterion for ${SLUG#local-usage-}" -- "$FILE" || exit 1
+
+echo "   staged: $(basename "$FILE") (reviewer's test, committed)"
