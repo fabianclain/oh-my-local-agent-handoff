@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+#
+# sequence-selftest — the advance loop, against the things it must never get wrong.
+#
+#   tools/sequence-selftest
+#
+# This is the only tool in the harness that commits, so its failure modes are the expensive kind.
+# Every case below is about the boundary between "advance" and "judge":
+#
+#   1. two accepted steps    commit in order, each with its own subject, clean tree at the end
+#   2. a rejected step       stops there, keeps the earlier commits, and leaves the rejected
+#                            work in the tree to be read — reverting it would destroy the only
+#                            copy of what the model did
+#   3. a dirty start         refuses, because step 1 would otherwise be charged with someone
+#                            else's changes and rejected for them
+#   4. a destructive plan    refused in pre-flight, before any step runs — the whole point of
+#                            checking every plan up front rather than one at a time
+#   5. no verdict            a round that never reached the gates must not be committed
+#
+# Runs against the stub provider, so nothing here touches the GPU or a real model.
+
+set -uo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+REPO="$(cd "$HERE/.." && pwd)"
+HANDOFF="$REPO/bin/handoff"
+SANDBOX="$(mktemp -d)"
+FAILURES=0
+trap 'rm -rf "$SANDBOX"' EXIT
+
+pass() { echo "    PASS: $1"; }
+fail() { echo "    FAIL: $1"; FAILURES=$(( FAILURES + 1 )); }
+
+new_project() {
+    local root="$SANDBOX/$1"
+    mkdir -p "$root/src" "$root/.handoff/plans"
+    ( cd "$root" && git init --quiet . && git config user.email a@b.c && git config user.name t
+      printf '<?php\n// seed\n' > src/seed.php
+      git add -A && git commit --quiet -m init ) >/dev/null
+    echo "$root"
+}
+
+# A plan whose whole content is one created file and one criterion about it.
+write_plan() {
+    local root="$1" slug="$2" title="$3" path="$4" criterion="$5"
+    cat > "$root/.handoff/plans/$slug.md" <<PLAN
+# $title
+## Files to touch
+| Path | Action |
+| --- | --- |
+| \`$path\` | create |
+## Acceptance criteria
+- [ ] the file is there and says what it should
+## Verification
+\`\`\`bash
+$criterion
+\`\`\`
+## Out of scope
+Anything else.
+PLAN
+}
+
+# Step 1 writes A, step 2 writes B. The stub cannot see which plan it is running, so the patch
+# decides from the tree — which is enough, and keeps the two steps genuinely distinct files.
+PATCH_AB='if [ ! -f src/A.php ]; then printf "<?php\nconst A = 1;\n" > src/A.php; else printf "<?php\nconst B = 1;\n" > src/B.php; fi'
+
+run_sequence() {   # run_sequence <root> <slug>... ; echoes output, returns its status
+    ( cd "$1" && shift
+      HANDOFF_PROVIDER=stub STUB_PATCH="$PATCH_AB" "$HANDOFF" sequence "$@" 2>&1 )
+}
+
+# ---------------------------------------------------------------------------------------------
+echo "==> 1/5 two accepted steps commit in order and leave a clean tree"
+R="$(new_project accepted)"
+write_plan "$R" s1 "add A" src/A.php 'test -f src/A.php'
+write_plan "$R" s2 "add B" src/B.php 'test -f src/B.php'
+OUT="$(run_sequence "$R" s1 s2)"; RC=$?
+SUBJECTS="$( cd "$R" && git log --format=%s -2 | tac | tr '\n' '|' )"
+if (( RC != 0 )); then
+    fail "a sequence of two satisfiable steps exited $RC"
+    echo "$OUT" | tail -12 | sed 's/^/        /'
+elif [[ "$SUBJECTS" != "add A|add B|" ]]; then
+    fail "expected commits 'add A' then 'add B', got: $SUBJECTS"
+elif [[ -n "$( cd "$R" && git status --porcelain -- . ':(exclude).handoff/**' )" ]]; then
+    # Deliberately NOT asking with the tool's own exclusion list — a test that reuses the code
+    # under test agrees with it by construction. The question here is the one that matters:
+    # is any of the MODEL's work still uncommitted? `.handoff` is the harness's own bookkeeping
+    # and `handoff init` gitignores it in a real project.
+    fail "the model's work was left uncommitted after every step was accepted"
+    ( cd "$R" && git status --short -- . ':(exclude).handoff/**' | sed 's/^/        /' )
+elif ! ( cd "$R" && git show --stat --format= HEAD~1 | grep -q 'src/A.php' ); then
+    fail "step 1's commit does not contain the file step 1 created"
+else
+    pass "two commits, in order, subjects from the plans, clean tree"
+fi
+
+# ---------------------------------------------------------------------------------------------
+echo "==> 2/5 a rejected step stops the sequence and keeps its work in the tree"
+R="$(new_project rejected)"
+write_plan "$R" s1 "add A" src/A.php 'test -f src/A.php'
+# Satisfiable by nothing the stub writes: the file appears, the assertion about it does not hold.
+write_plan "$R" s2 "add B" src/B.php 'grep -q NEVER src/B.php'
+OUT="$(run_sequence "$R" s1 s2)"; RC=$?
+COMMITS="$( cd "$R" && git log --format=%s | grep -c 'add ' )"
+if (( RC == 0 )); then
+    fail "a sequence containing a rejected step exited 0"
+elif (( COMMITS != 1 )); then
+    fail "expected exactly step 1 committed, found $COMMITS step commit(s)"
+elif [[ ! -f "$R/src/B.php" ]]; then
+    fail "the rejected step's work was destroyed — it is the only copy of what the model did"
+elif ! grep -q 'handoff diff s2' <<<"$OUT"; then
+    fail "the stop did not say how to read the rejected round"
+else
+    pass "stopped at step 2, kept step 1's commit, left step 2's work to be read"
+fi
+
+# ---------------------------------------------------------------------------------------------
+echo "==> 3/5 a dirty tree is refused before anything runs"
+R="$(new_project dirty)"
+write_plan "$R" s1 "add A" src/A.php 'test -f src/A.php'
+printf '<?php\n// someone else\n' > "$R/src/other.php"
+OUT="$(run_sequence "$R" s1)"; RC=$?
+if (( RC == 0 )); then
+    fail "a sequence started on a dirty tree and its verdicts would be meaningless"
+elif [[ -f "$R/src/A.php" ]]; then
+    fail "it ran a step despite refusing"
+elif ! grep -qi 'not clean' <<<"$OUT"; then
+    fail "refused for an unclear reason"
+else
+    pass "refused, and ran nothing"
+fi
+
+# ---------------------------------------------------------------------------------------------
+echo "==> 4/5 a destructive criterion in ANY step is refused in pre-flight"
+R="$(new_project destructive)"
+write_plan "$R" s1 "add A" src/A.php 'test -f src/A.php'
+write_plan "$R" s2 "add B" src/B.php 'php artisan migrate:fresh'
+OUT="$(run_sequence "$R" s1 s2)"; RC=$?
+if (( RC == 0 )); then
+    fail "a plan with a destructive acceptance command was allowed to run"
+elif [[ -f "$R/src/A.php" ]]; then
+    fail "step 1 ran before step 2's destructive command was caught — pre-flight checks every plan up front precisely so this cannot happen"
+elif ! grep -qi 'destructive' <<<"$OUT"; then
+    fail "refused without naming the reason"
+else
+    pass "caught step 2's command before step 1 ran"
+fi
+
+# ---------------------------------------------------------------------------------------------
+echo "==> 5/5 a round that produces no verdict is not committed"
+R="$(new_project noverdict)"
+write_plan "$R" s1 "add A" src/A.php 'test -f src/A.php'
+# An unknown provider fails before the gates ever run, so there is no verdict to read. Committing
+# on a verdict nobody wrote is the one mistake this tool could make that nothing else would catch.
+OUT="$( cd "$R" && HANDOFF_PROVIDER=nosuchprovider "$HANDOFF" sequence s1 2>&1 )"; RC=$?
+if (( RC == 0 )); then
+    fail "a round that never reached the gates was treated as a pass"
+elif [[ -n "$( cd "$R" && git log --format=%s | grep 'add A' )" ]]; then
+    fail "committed a step that produced no verdict"
+else
+    pass "no verdict, no commit"
+fi
+
+echo
+if (( FAILURES > 0 )); then
+    echo "$FAILURES case(s) failed."
+    exit 1
+fi
+echo "sequence: all checks passed"

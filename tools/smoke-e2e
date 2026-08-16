@@ -898,10 +898,26 @@ pass "peg-audit classifies each parse-failure class and buckets it by context de
 # differ elsewhere: bench/run excludes the one plan under test rather than all of them, so a run
 # that edits a *different* plan is still caught. A guard that demanded whole-list equality would
 # fail on that difference and get deleted, which is worse than no guard.
+#
+# Asked of the EFFECTIVE list rather than the tool's own text. verify-round now sources its
+# exclusions from tools/lib/harness-paths.sh, shared with tools/sequence — which is the same
+# anti-drift move this check exists to enforce, and which broke the check the first time, because
+# grepping a file for a string is only ever a proxy for what the tool does. bench/run still
+# declares its own, so both are searched.
+effective_excludes() {
+    case "$1" in
+    tools/verify-round)
+        ( source "$REPO/tools/lib/harness-paths.sh" && harness_excludes ) ;;
+    *)
+        grep -oE ':\(exclude\)[^"'"'"']*' "$REPO/$1" ;;
+    esac
+}
+
 GRANTED_OK=1
 for tool in bench/run tools/verify-round; do
+    EXCLUDED="$(effective_excludes "$tool")"
     for path in scratch journal; do
-        grep -qF -- ":(exclude).handoff/$path/**" "$REPO/$tool" || {
+        grep -qF -- ":(exclude).handoff/$path/**" <<<"$EXCLUDED" || {
             GRANTED_OK=0
             fail "$tool does not exclude .handoff/$path/** — the model is granted that directory,
           so counting it charges the model for following its instructions"

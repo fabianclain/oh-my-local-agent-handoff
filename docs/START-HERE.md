@@ -235,9 +235,16 @@ worth much:
 ### Prefer a sequence of small steps to one large plan
 
 A step should be one to two files, three to six criteria, one coherent behaviour. Write the whole
-sequence up front, run them one at a time, and **commit between steps** — the implementer leaves
-changes uncommitted and every plan asserts how many files changed, so step 1's leftovers will fail
-step 2's file count.
+sequence up front, then run it:
+
+```bash
+handoff sequence <slug>-1-service <slug>-2-view
+```
+
+It commits each accepted step and stops at the first rejection. The commit is not housekeeping —
+the implementer leaves changes uncommitted and every plan asserts how many files changed, so step
+1's leftovers would fail step 2's file count. That is the whole reason a person used to sit at
+every step boundary, and the reason a tool can sit there instead.
 
 Be clear about what this buys, because it is not what it looks like. Smaller steps are **not**
 measurably more likely to succeed: the six-file plan scored 87% on first attempt against the

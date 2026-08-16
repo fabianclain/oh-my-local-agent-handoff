@@ -106,37 +106,11 @@ CHANGED="$OUT_DIR/changed-files.txt"
 #
 # Deliberately NOT excluding .handoff wholesale: a model once wrote three verification scripts
 # straight into .handoff/, and that is real littering that must still be caught.
-EXCLUDES=(
-    ':(exclude).handoff/runs/**'
-    ':(exclude).handoff/evidence/**'
-    ':(exclude).handoff/plans/**'
-    # Harness territory, not the implementer's work. The driver reads it and the setup guide tells
-    # the user to write it; a plan has no reason to name it.
-    ':(exclude).handoff/config.sh'
-    # The run journal — the harness's own records of previous rounds. Counting these as the
-    # implementer's work fails every verification after the first, which is exactly what happened
-    # the first time the journal was wired in.
-    ':(exclude).handoff/journal/**'
-    # The sanctioned scratch directory. Two of seven rounds in one real feature left scratch files
-    # behind, in rounds whose prose explicitly forbade them, and both were the model wanting to
-    # inspect a value with no legitimate way to do it. One of those scripts booted the whole
-    # application against the live database, which is also the most plausible cause of the database
-    # corruption that session. Prose has now failed at this twice; a permitted place to work is
-    # more likely to be used than a prohibition is to be obeyed, and it keeps the mess somewhere
-    # the round is not judged on and `handoff init` already ignores.
-    ':(exclude).handoff/scratch/**'
-    # Not the implementer's work, and blaming it for these is a false rejection. The first
-    # end-to-end run of `handoff do` in a fresh project was rejected for three "invented" files
-    # that were the agent framework's own state directory. bench/run had excluded these for
-    # months; verify-round had not, and the two disagreeing is exactly the drift that keeps
-    # costing this project findings.
-    ':(exclude).omc/**'
-    ':(exclude).claude/**'
-    ':(exclude)node_modules/**'
-    ':(exclude)vendor/**'
-    ':(exclude)storage/logs/**'
-    ':(exclude)storage/framework/**'
-)
+# The list itself lives in tools/lib/harness-paths.sh, shared with tools/sequence, which has to
+# answer the same question about the same tree. See that file for why each entry is there.
+# shellcheck source=lib/harness-paths.sh
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/lib/harness-paths.sh"
+mapfile -t EXCLUDES < <(harness_excludes)
 [[ -z "$OUT_REL" ]] || EXCLUDES+=(":(exclude)$OUT_REL/**")
 
 # Also exclude any *other* verifier output already in the tree.

@@ -239,9 +239,29 @@ Mann-Whitney, and — for a variable that only acts on repair — scores attempt
 the arms are identical by construction. One comparison showed a 27-point gap of which 20 points
 were already present before the variable applied.
 
+## Running a sequence
+
+```bash
+handoff sequence <slug>-1-service <slug>-2-view <slug>-3-page
+```
+
+Checks every plan first, runs them in order, commits each accepted step, and stops at the first
+rejection with the tree exactly as the gates left it.
+
+It automates the *advance* and deliberately not the *retry*. The advance was never a decision — a
+field report of nine hand-driven rounds counted five approvals, none of which decided anything,
+because the human in the loop was there to run `git commit` between steps and nothing else. The
+retry is entirely decision: in that same report, two of the four failed rounds failed on criteria
+no honest implementation could satisfy, and the model's answer to an impossible criterion was to
+write `Carbon::setTestNow()` into production code to force the assertion true. A retry loop cannot
+see that, and a planner asked to re-specify tends to harden the bad criterion rather than doubt it.
+
 ```bash
 handoff auto <slug>   # local implements ×2 → a hosted planner re-specifies → local retries ×2 → stop
 ```
+
+`auto` is the other half — use it on a step you have already specified well and expect to need a
+retry or two, not on one whose criteria you have not read since writing them.
 
 Three seats, three different jobs: you (or Claude Code) drive, `codex` and `glm` alternate as the
 planner that re-specifies after a rejection, and the local model implements. The ladder refuses to

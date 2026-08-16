@@ -13,6 +13,8 @@
 #   handoff stats           how the local model is actually performing, across runs
 #   handoff retro <slug>    ask the model what it thinks went wrong, and record the answer
 #   handoff auto <slug>     the ladder: local tries, a hosted planner re-specifies, local retries
+#   handoff sequence <slug>...  run steps in order, commit each accepted one, stop at the first
+#                               rejection. Automates the advance; never the retry.
 #   handoff queue [<slug>]  add a round to the machine-wide queue, or list what is queued
 #   handoff drain [--once]  run the queued rounds, one at a time
 #   handoff doctor          can this machine run a round right now? read-only
@@ -127,6 +129,17 @@ if [[ "$MODE" == "auto" ]]; then
     HANDOFF_HOME="$(cd "$(dirname "$(_handoff_real_self)")/.." && pwd)"
     shift
     exec "$HANDOFF_HOME/tools/escalate" "$@"
+fi
+
+# An ordered set of plans in THIS repository, committing each accepted step. Outside the mode
+# switch because it takes many slugs rather than one, and because it invokes `handoff do` itself.
+#
+# Not the same thing as `queue`, which is one job per project across several projects and cannot
+# commit. The rule "never queue a sequence" is about that limitation, not about sequences.
+if [[ "$MODE" == "sequence" ]]; then
+    HANDOFF_HOME="$(cd "$(dirname "$(_handoff_real_self)")/.." && pwd)"
+    shift
+    exec "$HANDOFF_HOME/tools/sequence" "$@"
 fi
 
 # A queue of jobs, run unattended. Outside the mode switch for the same reason as `auto`: it
@@ -759,7 +772,7 @@ retro)
     ;;
 
 *)
-    echo "unknown mode: $MODE (expected do|prepare|contrast|view-lint|check|resume|diff|verify|retro|auto|overnight|log|stats|init|doctor)" >&2
+    echo "unknown mode: $MODE (expected do|prepare|contrast|view-lint|check|resume|diff|verify|retro|auto|sequence|overnight|log|stats|init|doctor)" >&2
     exit 64
     ;;
 esac

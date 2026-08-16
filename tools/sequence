@@ -1,0 +1,288 @@
+#!/usr/bin/env bash
+#
+# sequence — run an ordered set of plans, committing each accepted step, stopping at the first
+# step the gates do not accept.
+#
+#   handoff sequence chart-1-schema chart-2-collect chart-3-series
+#   handoff sequence --dry-run <slug>...        say what it would do, run nothing
+#   handoff sequence --check <slug>...          pre-flight every plan and stop
+#
+# ## What this removes, and what it deliberately does not
+#
+# A sequence of one-file steps is the shape that works here — creates pass on the first attempt
+# roughly four times as often as edits, and splitting a mixed step into a create and an edit is
+# what makes a verdict mean something. But running one used to stop after every step and wait for
+# a human, and a field report of nine rounds found what that human was actually contributing:
+# five approvals, none of which decided anything. Every one was "continue".
+#
+# They were not approvals. They were COMMITS. The implementer leaves its changes uncommitted, and
+# the scope gate charges the tree to whichever round is running — so step 1's files, still sitting
+# there, are counted against step 2 and it fails for a reason unrelated to itself. Someone had to
+# commit between steps, nothing but a person could, and so a person was in the loop at every step
+# boundary to perform a mechanical act.
+#
+# This runs the commit. That is the entire change, and it is why the rule "never queue a sequence"
+# does not apply to it: that rule exists because the queue could not commit, not because sequences
+# are unsafe.
+#
+# ## What is NOT automated, on purpose
+#
+# Retrying. The same field report is unambiguous about why: of four failed rounds, two failed on
+# criteria that no honest implementation could satisfy — a test pinned to the wrong clock, and a
+# single-query assertion that contradicted another criterion in the same plan. The model's response
+# to an impossible criterion was never to fail cleanly. It wrote `Carbon::setTestNow()` into
+# production code to force a flag true. A retry loop cannot detect that, and a planner asked to
+# re-specify is likely to harden the bad assertion rather than doubt it.
+#
+# So automating the advance helps and automating the retry hurts, and this does only the first.
+# On a rejection it stops, leaves the tree exactly as the gates found it, and hands back what to
+# read. The diagnosis is the reviewer's, which is the one part of the loop a human was ever doing.
+
+set -uo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+HANDOFF_HOME="$(cd "$HERE/.." && pwd)"
+REPO_ROOT="$(git rev-parse --show-toplevel)" || exit 1
+cd "$REPO_ROOT" || exit 1
+
+DRY_RUN=0
+CHECK_ONLY=0
+SLUGS=()
+
+while (( $# > 0 )); do
+    case "$1" in
+    --dry-run) DRY_RUN=1; shift ;;
+    --check)   CHECK_ONLY=1; shift ;;
+    -h|--help) sed -n '2,38p' "$(readlink -f "${BASH_SOURCE[0]}")" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*)        echo "unknown option: $1" >&2; exit 64 ;;
+    *)         SLUGS+=("$1"); shift ;;
+    esac
+done
+
+(( ${#SLUGS[@]} > 0 )) || { echo "usage: handoff sequence <slug> [<slug>...]" >&2; exit 64; }
+
+# shellcheck disable=SC1091
+[[ -f "$REPO_ROOT/.handoff/config.sh" ]] && source "$REPO_ROOT/.handoff/config.sh"
+PLANS_DIR="${HANDOFF_PLANS_DIR:-$REPO_ROOT/.handoff/plans}"
+RUNS_DIR="${HANDOFF_RUNS_DIR:-$REPO_ROOT/.handoff/runs}"
+HANDOFF_BIN="$HANDOFF_HOME/bin/handoff"
+
+rule() { printf '\n\033[1m── %s\033[0m\n' "$*"; }
+say()  { printf '   %s\n' "$*"; }
+die()  { printf '\n\033[1;31mstopped:\033[0m %s\n' "$*" >&2; exit 1; }
+
+# --- 1. every plan, before any model time ------------------------------------------------------
+#
+# All of them, not just the first. Discovering that step 3's plan has four criteria against two
+# commands — a plan the harness refuses outright — is worth knowing before spending twenty minutes
+# on steps 1 and 2, and this is also where a destructive acceptance command is caught for the whole
+# sequence at once.
+rule "pre-flight ${#SLUGS[@]} plan(s)"
+PREFLIGHT_FAILED=0
+PLAN_FILES=()
+for slug in "${SLUGS[@]}"; do
+    plan="$PLANS_DIR/$slug.md"
+    if [[ -f "$plan" ]]; then
+        PLAN_FILES+=("$plan")
+    else
+        echo "  plan not found: ${plan#"$REPO_ROOT"/}" >&2
+        PREFLIGHT_FAILED=1
+    fi
+done
+# One invocation over all of them, not one each: check-plan prints a tally at the end, and calling
+# it per plan produces a run of "1 plan(s) would be accepted" that buries the finding it is for.
+(( ${#PLAN_FILES[@]} == 0 )) || "$HERE/check-plan" "${PLAN_FILES[@]}" | sed 's/^/  /' || PREFLIGHT_FAILED=1
+(( PREFLIGHT_FAILED == 0 )) || die "fix the plans above. Nothing was run."
+
+if (( CHECK_ONLY )); then
+    echo
+    echo "every plan would be accepted by the harness. Nothing was run."
+    exit 0
+fi
+
+# --- 2. a clean tree, because the first step's verdict depends on it ----------------------------
+#
+# Refused rather than warned. Every plan asserts what it changed, and the scope gate compares the
+# tree against the plan's file list — so anything already sitting there is charged to step 1 and
+# it is rejected for someone else's work. There is no bypass for this: a sequence started dirty
+# produces verdicts that mean nothing, which is worse than not running.
+# Asked with the SAME exclusions the scope gate uses, or this refuses to start on trees the gates
+# would happily judge. Plans live under .handoff/plans or .claude/plans and are usually uncommitted
+# while a sequence is being written; counting them as dirt would make the tool unusable in exactly
+# the workflow it is for. Found by its own selftest.
+# shellcheck source=lib/harness-paths.sh
+source "$HERE/lib/harness-paths.sh"
+mapfile -t TREE_EXCLUDES < <(harness_excludes)
+dirty() { git status --porcelain -- . "${TREE_EXCLUDES[@]}"; }
+
+if [[ -n "$(dirty)" ]]; then
+    echo
+    dirty | sed 's/^/   /'
+    # A dry run executes nothing, so a dirty tree cannot hurt it — and stopping here would mean
+    # the one mode whose whole job is to show you the plan never gets as far as showing it.
+    if (( DRY_RUN )); then
+        say "(dirty — a real run would refuse until these are committed or stashed)"
+    else
+        die "the working tree is not clean.
+   The scope gate charges everything in the tree to the running step, so step 1 would be
+   rejected for changes it did not make. Commit or stash these first."
+    fi
+fi
+
+# --- 3. the loop -------------------------------------------------------------------------------
+
+# The subject line for a step's commit: the plan's own `## Commit` line if it has one, else its
+# H1. A plan that names its commit subject is one whose history reads as a person wrote it.
+commit_subject() {
+    local plan="$1" subject
+    subject="$(awk '
+        /^## Commit[[:space:]]*$/ { in_section=1; next }
+        in_section && /^## / { exit }
+        in_section && NF { print; exit }
+    ' "$plan")"
+    [[ -n "$subject" ]] || subject="$(sed -n 's/^# \(.*\)/\1/p' "$plan" | head -1)"
+    [[ -n "$subject" ]] || subject="$(basename "$plan" .md)"
+    printf '%s' "$subject"
+}
+
+verdict_of() {
+    python3 -c "
+import json,sys
+try: d=json.load(open(sys.argv[1]))
+except Exception: print('NONE 0 0 0'); raise SystemExit
+print(d.get('verdict','NONE'), d.get('acceptance_passed',0), d.get('acceptance_total',0),
+      1 if d.get('regressed') else 0)" "$1" 2>/dev/null || echo "NONE 0 0 0"
+}
+
+COMPLETED=()
+STEP=0
+for slug in "${SLUGS[@]}"; do
+    STEP=$((STEP + 1))
+    plan="$PLANS_DIR/$slug.md"
+    rule "step $STEP of ${#SLUGS[@]}: $slug"
+
+    if (( DRY_RUN )); then
+        say "would run: handoff do $slug"
+        say "would commit as: $(commit_subject "$plan")"
+        continue
+    fi
+
+    "$HANDOFF_BIN" do "$slug"
+    DO_STATUS=$?
+
+    EVIDENCE="$RUNS_DIR/$slug/evidence/evidence.json"
+    read -r VERDICT PASSED TOTAL REGRESSED <<<"$(verdict_of "$EVIDENCE")"
+
+    # A missing verdict is not a rejection — it means the round did not reach the gates at all
+    # (the provider died, the lock was held, the model produced nothing). Committing on a verdict
+    # nobody wrote would be the one unrecoverable mistake this tool could make.
+    if [[ "$VERDICT" == "NONE" ]]; then
+        die "step $STEP produced no verdict (handoff do exited $DO_STATUS).
+   Nothing was committed and the tree is untouched.
+   Look at: ${RUNS_DIR#"$REPO_ROOT"/}/$slug/stdout.log"
+    fi
+
+    say "verdict: $VERDICT — $PASSED of $TOTAL acceptance criteria"
+
+    if [[ "$VERDICT" != "ACCEPT" ]]; then
+        cat <<EOF
+
+$STEP of ${#SLUGS[@]} steps ran. Step $STEP was rejected, and the sequence stops here —
+later steps assume it landed.
+
+The tree is exactly as the gates found it. Nothing has been reverted and nothing committed,
+so the work is there to read:
+
+  handoff diff $slug
+  ${RUNS_DIR#"$REPO_ROOT"/}/$slug/evidence/evidence.md
+
+Diagnose before re-running. The harness has already retried this plan internally, handing the
+model its failing commands each time, so running it again unchanged asks a question that has
+been answered. Two things to separate first, because they need opposite responses:
+
+  the model damaged working code   -> re-specify NARROWER and run the new plan
+  a criterion cannot honestly pass -> fix the criterion; the round was never about the model
+
+Check the second one first. It is the more common of the two and the one that looks like the
+first. Read each failing command and ask whether an ideal implementation could satisfy it.
+EOF
+        (( ${#COMPLETED[@]} == 0 )) || {
+            echo
+            echo "Committed and kept:"
+            printf '  %s\n' "${COMPLETED[@]}"
+        }
+        exit 1
+    fi
+
+    # A round can be accepted and still be worth stopping for. `regressed` means this attempt
+    # scored below the previous attempt at the same plan, which is the fingerprint of a repair
+    # that is damaging the tree rather than a step that is done.
+    if [[ "$REGRESSED" == "1" ]]; then
+        die "step $STEP scored worse than its previous attempt, despite being accepted.
+   That is usually a repair damaging the tree. Nothing was committed. Read:
+   ${RUNS_DIR#"$REPO_ROOT"/}/$slug/evidence/evidence.md"
+    fi
+
+    # Commit exactly what the gates measured, rather than `git add -A`. The gates already
+    # separated the model's work from the harness's own bookkeeping — run evidence, staged plans,
+    # the journal — and re-deriving that here is how the two would drift apart.
+    CHANGED="$RUNS_DIR/$slug/evidence/changed-files.txt"
+    if [[ ! -s "$CHANGED" ]]; then
+        die "step $STEP was accepted but the gates recorded no changed files.
+   Refusing to commit an empty step. Read: ${RUNS_DIR#"$REPO_ROOT"/}/$slug/evidence/evidence.md"
+    fi
+
+    # Read into an array rather than splitting `$(cat)`: a path with a space in it would otherwise
+    # be staged as two paths, both of which fail, after the round had already succeeded. `--`
+    # because a path beginning with a dash would be read as an option.
+    mapfile -t CHANGED_FILES <"$CHANGED"
+    if ! git add -- "${CHANGED_FILES[@]}"; then
+        die "step $STEP was accepted but its files could not be staged. Nothing committed."
+    fi
+
+    SUBJECT="$(commit_subject "$plan")"
+    if ! git commit --quiet -m "$SUBJECT" -m "$(cat <<EOF
+Implemented by the local model from ${plan#"$REPO_ROOT"/}.
+Acceptance: $PASSED of $TOTAL. Evidence: ${RUNS_DIR#"$REPO_ROOT"/}/$slug/evidence/evidence.md
+EOF
+)"; then
+        die "step $STEP was accepted but the commit failed. Nothing was lost — the work is in
+   the tree and can be committed by hand."
+    fi
+
+    COMMIT="$(git rev-parse --short HEAD)"
+    say "committed $COMMIT  $SUBJECT"
+    COMPLETED+=("$COMMIT  $SUBJECT")
+
+    # The tree must be clean again before the next step, or its scope gate inherits whatever is
+    # left. Anything still here was excluded from the commit deliberately — harness bookkeeping,
+    # or something the model wrote outside the plan's file list — and the next step would be
+    # blamed for it.
+    if [[ -n "$(dirty)" ]]; then
+        echo
+        dirty | sed 's/^/   /'
+        die "step $STEP left changes outside the files the gates attributed to it.
+   The next step would be charged with these. Deal with them, then continue with:
+     handoff sequence ${SLUGS[*]:$STEP}"
+    fi
+done
+
+if (( DRY_RUN )); then
+    echo
+    echo "dry run — nothing was executed."
+    exit 0
+fi
+
+rule "all ${#SLUGS[@]} step(s) accepted"
+printf '   %s\n' "${COMPLETED[@]}"
+cat <<EOF
+
+Now read the diff. The gates cannot see the things a reviewer of this workflow has consistently
+found only by reading — a truncated docblock, a non-breaking hyphen where a hyphen belonged, a
+comment lifted from a sibling class describing the wrong thing. An accepted verdict means every
+criterion held, and nothing more than that.
+
+  git log --oneline -${#SLUGS[@]}
+  git diff HEAD~${#SLUGS[@]}
+
+EOF

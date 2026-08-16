@@ -78,7 +78,22 @@ counts, above, which are mechanical.
 Read every plan in the sequence before running the first. Later steps usually assume earlier ones
 landed, and knowing where you are going changes how you read a failure.
 
-## 3. Run one step at a time
+## 3. Run the steps
+
+When the plans are a sequence in one repository and you expect them to stand as written, run the
+sequence and let it do the committing:
+
+```bash
+HANDOFF_PROVIDER=${HANDOFF_PROVIDER:-native} handoff sequence <slug> <slug> <slug>
+```
+
+It checks every plan first, runs them in order, commits each accepted step, and stops at the first
+rejection with the tree exactly as the gates left it. It never retries and never re-specifies, so
+anything it stops on is yours to diagnose from section 4 onward — which is the same work you would
+have done, minus the part where you typed `git commit` between steps.
+
+Drop to one step at a time when you need to intervene between rounds — after a rejection, when
+narrowing a step, or when the plans span more than one repository:
 
 ```bash
 HANDOFF_PROVIDER=${HANDOFF_PROVIDER:-native} handoff do <slug>
@@ -152,7 +167,8 @@ failing commands in hand. The exception is the "never happened" row above.
 
 ## 6. Commit accepted steps, and nothing else
 
-The implementer never commits. You do, and only for a step the gates accepted:
+The implementer never commits. You do, and only for a step the gates accepted — `handoff sequence`
+already does this for the steps it runs, so this section is for the rounds you drove by hand:
 
 ```bash
 handoff diff <slug>       # exactly what the round changed

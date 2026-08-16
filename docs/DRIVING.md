@@ -133,6 +133,10 @@ Every plan asserts how many files changed, and that count includes whatever step
 uncommitted. The operator commits accepted steps for exactly this reason — and never pushes,
 amends, or commits a rejected round.
 
+`handoff sequence <slug>...` does this for you: it runs the steps in order, commits each accepted
+one, and stops at the first rejection with the tree as the gates left it. Drive by hand when you
+need to intervene between rounds; use the sequence when you expect the plans to stand.
+
 ### Let the ladder handle the retrying
 
 ```bash

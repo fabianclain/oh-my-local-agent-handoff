@@ -216,12 +216,31 @@ the six-file plan actually scored slightly better on first attempt (87%) than th
 4. **Data before presentation, and each layer gated on its own tests.**
 
 Name them in order: `<slug>-1-service`, `<slug>-2-view`. Write every plan up front so the user can
-review the whole sequence, then run them one at a time.
+review the whole sequence, then run it:
 
-**Commit between steps.** This is mechanical, not stylistic: the implementer leaves changes
-uncommitted, and the scope gate compares the tree against the plan's file list. If step 1's changes
-are still sitting in the tree, step 2's scope gate charges them to step 2. So after each accepted
-step, show the user the diff and have them commit before the next one starts.
+```bash
+handoff sequence <slug>-1-service <slug>-2-view <slug>-3-page
+```
+
+**Run the sequence rather than the steps.** `handoff sequence` checks every plan first, runs them
+in order, commits each accepted step, and stops at the first rejection with the tree exactly as
+the gates left it. It never retries and never re-specifies — a rejection comes back to you.
+
+**Why the commit matters, and why a tool now does it.** The implementer leaves changes uncommitted,
+and the scope gate compares the tree against the plan's file list, so step 1's files still sitting
+there are charged to step 2 and it fails for a reason unrelated to itself. That is why someone had
+to commit between steps — and because nothing but a person could, a person sat at every step
+boundary performing a mechanical act. A field report of nine rounds counted the cost: five
+approvals, not one of which decided anything. Every one was "continue".
+
+So do not ask the user to approve each step. **Approve the plan sequence once, before any of it
+runs** — that review is where their judgement is worth something, and it fits in one turn. Then
+run the sequence and bring back what it stops on.
+
+Two things it deliberately refuses, both of which mean the verdicts would be meaningless:
+
+- a working tree that is not clean, because step 1 would be charged with whatever is already there;
+- any plan whose acceptance commands are destructive. See "Criteria are executed, twice" below.
 
 **And write the plans up front for the same reason, not only for review.** Writing step 2's plan
 *while step 1 is running* puts a new file in the tree mid-round, and it shows up under "changed by
@@ -242,15 +261,16 @@ cd ~/dev/other-project && handoff queue 01-service
 handoff drain                    # runs everything queued, one at a time, oldest first
 ```
 
-Queueing steps 1 and 2 of one sequence looks like the obvious use and is the one thing that cannot
-work. The implementer leaves its changes uncommitted, so step 2's scope gate is charged with step
-1's files and fails for a reason that has nothing to do with step 2. Both rules that prevent that —
-*commit between steps* and *stop on the first rejection* — are enforced by the queue rather than
-requested: a second job for a repo that already has one is **refused**, and a rejected job holds
-back that repository's remaining jobs and no other project's.
+Queueing steps 1 and 2 of one sequence looks like the obvious use and is the one thing the QUEUE
+cannot do. The implementer leaves its changes uncommitted, so step 2's scope gate is charged with
+step 1's files and fails for a reason that has nothing to do with step 2. Both rules that prevent
+that — *commit between steps* and *stop on the first rejection* — are enforced by the queue rather
+than requested: a second job for a repo that already has one is **refused**, and a rejected job
+holds back that repository's remaining jobs and no other project's.
 
-So the shape that works is one job per project, drained while you do something else, with you
-reading each verdict and committing before the next step of anything. See `docs/queueing.md`.
+Use `handoff sequence` for steps within one repository, and the queue for work across several. The
+difference is only that the queue cannot commit, which is what `sequence` was added to do — the
+rule was ever about that limitation, never about sequences being unsafe. See `docs/queueing.md`.
 
 **That includes another agent session.** `handoff do` and `handoff resume` now take a lock on
 `.handoff/.lock` and refuse to start while a round is running in the same checkout, because the
@@ -563,8 +583,14 @@ Treat its answers as leads to check, not findings.
 ### 8a. Or hand the running to an operator
 
 You are the expensive model, and the expensive part of your job is the specification, not watching
-rounds go by. Once the plans are written and `handoff check` accepts them, another agent can run
-them:
+rounds go by.
+
+For steps in this repository, `handoff sequence` is enough and needs no second agent — it commits
+each accepted step and stops at the first rejection. Reach for an operator when the running needs
+judgement the tool has none of: several repositories, a step you expect to need narrowing, or a
+report written back to you in prose.
+
+Once the plans are written and `handoff check` accepts them, another agent can run them:
 
 ```bash
 codex          # then: /local-drive feature-1-service feature-2-view
