@@ -78,7 +78,7 @@ except SystemExit as error:
     print(f"{error}", file=sys.stderr)
     sys.exit(2)
 
-print("==> 1/6 nested tool arguments keep their fields and descriptions")
+print("==> 1/8 nested tool arguments keep their fields and descriptions")
 missing = [n for n in ("path?: string", "start?: number", "end?: number",
                        "first line, 1-based", "last line, inclusive") if n not in PROMPT]
 if "any[]" in PROMPT:
@@ -88,7 +88,7 @@ elif missing:
 else:
     pas("path, start and end are in the type, with their descriptions")
 
-print("==> 2/6 a file read reaches the model with real newlines")
+print("==> 2/8 a file read reaches the model with real newlines")
 segment = PROMPT[PROMPT.find("<|start|>functions.read_files"):]
 if "\\n" in segment:
     bad("the tool result is JSON-escaped; the model still cannot see line structure",
@@ -98,7 +98,7 @@ elif segment.count("\n") < 4:
 else:
     pas(f"{segment.count(chr(10))} real newlines, 0 escaped")
 
-print("==> 3/6 the tool call goes to the commentary channel, addressed by name")
+print("==> 3/8 the tool call goes to the commentary channel, addressed by name")
 if "to=functions.read_files" not in PROMPT:
     bad("the call has no `to=functions.NAME` recipient", PROMPT[-400:])
 elif "<|channel|>commentary" not in PROMPT:
@@ -106,13 +106,13 @@ elif "<|channel|>commentary" not in PROMPT:
 else:
     pas("to=functions.read_files on the commentary channel")
 
-print("==> 4/6 the tool RESULT is authored by the function and addressed back")
+print("==> 4/8 the tool RESULT is authored by the function and addressed back")
 if "<|start|>functions.read_files to=assistant" not in PROMPT:
     bad("the tool result is not attributed to the function that produced it", PROMPT[-500:])
 else:
     pas("functions.read_files to=assistant")
 
-print("==> 5/6 everything the control also says is still said")
+print("==> 5/8 everything the control also says is still said")
 # The control that makes the arm readable. If the system message or the channel rules differ, an
 # outcome difference cannot be attributed to the renderer, and bench/compare would be right to
 # call it confounded.
@@ -130,7 +130,36 @@ for needed, why in [
 else:
     pas("system message, channel rules, date, instructions and namespace all present")
 
-print("==> 6/6 a missing library raises, and never silently renders the control's prompt")
+print("==> 6/8 a carried chain of thought becomes an analysis message")
+with_cot = [dict(m) for m in MESSAGES]
+with_cot[2]["reasoning_content"] = "The plan needs Proration; read Invoice first."
+carried = harmony_render.render_prompt(with_cot, TOOLS)
+if "<|channel|>analysis" not in carried:
+    bad("reasoning_content did not reach the analysis channel", carried[-400:])
+elif "read Invoice first" not in carried:
+    bad("the analysis channel is present but empty of the thought", carried[-400:])
+elif carried.index("<|channel|>analysis") > carried.index("to=functions.read_files"):
+    bad("the thought is rendered AFTER the call it led to; docs/format.md orders it before")
+else:
+    pas("analysis precedes the call it led to, as the spec's worked example does")
+
+print("==> 7/8 without it, nothing changes — the two arms differ in ONE thing")
+# nativeharmony against nativecot is only readable if this is the sole difference between them.
+if "<|channel|>analysis" in PROMPT:
+    bad("an analysis message appears with no reasoning_content to carry")
+else:
+    stripped = carried.replace(
+        "<|start|>assistant<|channel|>analysis<|message|>"
+        "The plan needs Proration; read Invoice first.<|end|>", "")
+    if stripped != PROMPT:
+        import difflib
+        bad("the two prompts differ by more than the analysis message",
+            "\n".join(list(difflib.unified_diff(PROMPT.splitlines(),
+                                                stripped.splitlines(), lineterm=""))[:6]))
+    else:
+        pas("removing the analysis message reproduces the control's prompt byte for byte")
+
+print("==> 8/8 a missing library raises, and never silently renders the control's prompt")
 saved = harmony_render._VENV
 harmony_render._VENV = pathlib.Path("/nonexistent-for-this-test")
 for name in ("openai_harmony",):

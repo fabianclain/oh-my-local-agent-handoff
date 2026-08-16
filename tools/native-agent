@@ -905,6 +905,14 @@ RAW_HARMONY = False
 # Render the prompt with OpenAI's harmony library rather than llama.cpp's template. Implies the
 # raw path, because a prompt we build ourselves can only be sent to /completions.
 HARMONY_RENDER = False
+# Carry the model's own chain of thought forward between tool calls, which docs/format.md asks for
+# in as many words: the worked example passes "not just the function output back into the model for
+# further sampling but ALSO the previous chain-of-thought ... to provide the model with the
+# necessary information to continue its chain-of-thought". This harness has always dropped it, so
+# every turn re-derived its reasoning from nothing. It is a separate arm from the renderer because
+# it is a separate claim, and because it is not free: analysis is the bulk of what gpt-oss
+# generates, and carrying it grows the context it is trying to help.
+CARRY_REASONING = False
 
 
 def call_model(host: str, port: int, model: str, messages: list[dict], tools: list[dict],
@@ -1119,6 +1127,9 @@ def main() -> int:
                         help="drop replace_in_file, forcing whole-file writes (round 15)")
     parser.add_argument("--no-report-tool", action="store_true",
                         help="no submit_report tool; the report comes from the no-tools final turn")
+    parser.add_argument("--carry-reasoning", action="store_true",
+                        help="keep the analysis channel in context between tool calls, as "
+                             "docs/format.md's worked example does")
     parser.add_argument("--harmony-render", action="store_true",
                         help="build the prompt with openai-harmony, not llama.cpp's template")
     parser.add_argument("--raw-harmony", action="store_true",
@@ -1134,6 +1145,8 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=600)
     args = parser.parse_args()
 
+    if args.carry_reasoning:
+        globals()["CARRY_REASONING"] = True
     if args.harmony_render:
         # Implies --raw-harmony: a prompt rendered here can only be sent to /completions, and
         # /v1/chat/completions would rebuild it with the template this arm exists to replace.
@@ -1258,8 +1271,14 @@ def main() -> int:
                 except (ValueError, TypeError):
                     function["arguments"] = "{}"
                 history_calls.append({**call, "function": function})
-            messages.append({"role": "assistant", "content": text or "",
-                             "tool_calls": history_calls})
+            turn = {"role": "assistant", "content": text or "", "tool_calls": history_calls}
+            if CARRY_REASONING and reasoning:
+                # The analysis channel, carried forward so the next turn continues a thought
+                # rather than starting one. Kept on the message rather than appended as prose,
+                # so the renderer can put it on the channel it belongs to and a renderer that
+                # cannot will simply ignore it.
+                turn["reasoning_content"] = reasoning
+            messages.append(turn)
             done = False
             for call in calls:
                 function = call.get("function") or {}

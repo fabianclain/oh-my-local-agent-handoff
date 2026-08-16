@@ -128,6 +128,14 @@ def render_prompt(messages: list[dict], tools: list[dict]) -> str:
             rendered.append(h.Message.from_role_and_content(h.Role.USER,
                                                             message.get("content") or ""))
         elif role == "assistant":
+            # The analysis channel first, when the loop chose to carry it. docs/format.md's worked
+            # example keeps the chain of thought in context across a tool call precisely so the
+            # model can continue a thought rather than restart one, and this harness dropped it on
+            # every turn until it was read.
+            thinking = (message.get("reasoning_content") or "").strip()
+            if thinking:
+                rendered.append(h.Message.from_role_and_content(h.Role.ASSISTANT, thinking)
+                                .with_channel("analysis"))
             text = (message.get("content") or "").strip()
             if text:
                 rendered.append(h.Message.from_role_and_content(h.Role.ASSISTANT, text)
