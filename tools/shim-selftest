@@ -29,6 +29,15 @@
 
 set -uo pipefail
 
+# qw3c-32k — Qwen3-Coder at 32k, the model this shim's promotion path was measured against
+# (providers/cline.sh: "qw3c-32k read a file and returned the marker in two iterations").
+#
+# DO NOT casually substitute another model to make check 4 run again. The check measures how one
+# model emits tool calls and how the shim promotes them; a different architecture emits them
+# differently, so a substitute would turn a green check into a green check about something else.
+# `qw-32k` is the obvious candidate and is NOT one: it reports architecture qwen2, 14.8B, Q4_K_M —
+# Qwen2.5-Coder — against Qwen3-Coder's 30B-A3B. Pass a model explicitly if you know it is
+# equivalent; otherwise let the suite skip and say so.
 MODEL="${1:-qw3c-32k}"
 # A free port, chosen now, rather than a fixed one.
 #
@@ -176,6 +185,28 @@ sys.exit(0 if ok else 1)
 PY
 [[ $? -eq 0 ]] && pass "escaping repaired, truncation refused" \
                || fail "repair/refusal boundary is wrong"
+
+# Checks 1-3 have run and are reported above. Check 4 needs a real model, and a model that is not
+# installed is not a model that misbehaved.
+#
+# This suite reported `{"error":"model 'qw3c-32k' not found"}` as "no tool call was promoted for
+# qw3c-32k (model may not have emitted one)" — a confident claim about a model's tool-calling
+# behaviour, made over a model that does not exist. The daemon probe added earlier caught the
+# daemon being down and did not catch this, which is the same fault one layer deeper.
+if ! curl -fsS --max-time 5 "$UPSTREAM/api/show" -d "{\"name\": \"$MODEL\"}" >/dev/null 2>&1; then
+    echo
+    echo "checks 1-3 above ran; check 4 did not." >&2
+    echo "ollama has no model '$MODEL', so nothing can be said about tool-call promotion." >&2
+    NEAR="$(curl -fsS --max-time 5 "$UPSTREAM/api/tags" 2>/dev/null \
+            | python3 -c 'import json,sys
+try: names=[m["name"] for m in json.load(sys.stdin).get("models",[])]
+except Exception: names=[]
+stem=sys.argv[1][:2]
+print(", ".join(n for n in names if n.startswith(stem)) or "none with a similar name")' "$MODEL" 2>/dev/null)"
+    echo "Similar models present: $NEAR" >&2
+    echo "Pass one as an argument (tools/shim-selftest <model>), or recreate '$MODEL'." >&2
+    exit 2
+fi
 
 echo "==> 4/4 promoted tool call survives the client's zod schema"
 printf 'MARKER-7Q4X\n' >"$WORK/probe.md"
