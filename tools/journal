@@ -56,6 +56,57 @@ SCHEMA_VERSION = 1
 # paths
 
 
+def usage_ledger() -> Path:
+    """The machine-wide record of what the local model has spent.
+
+    The per-repository journal is the authority on a ROUND -- it sits beside the artifacts it
+    describes and is read by everything that reasons about outcomes. It is a poor authority on
+    USAGE over time, for one reason: it lives inside the repository, so deleting a worktree
+    deletes its history. Six projects on this machine hold the only copy of their own token
+    counts, and a `git worktree remove` takes one of them with it.
+
+    So each round also appends a small line here, outside every repository. Usage only: no
+    outcome, no gates, no report. Those belong with the artifacts and are not what survives.
+
+    Under XDG state rather than ~/.cache, deliberately: a cache is by definition safe for anything
+    to delete, and this is the copy that exists precisely because the other one is not durable.
+    """
+    root = os.environ.get("HANDOFF_STATE_HOME") or os.environ.get("XDG_STATE_HOME") \
+        or str(Path.home() / ".local" / "state")
+    return Path(root) / "agent-handoff" / "usage.jsonl"
+
+
+def append_usage(record: dict, repo: Path) -> None:
+    """One line per round, append-only, and never fatal.
+
+    A usage ledger that could fail a round would be worse than no ledger: the round is the thing
+    that matters and this is bookkeeping about it. Every error is swallowed on purpose, which is
+    the one place in this file where that is the right call.
+    """
+    try:
+        tokens = (record.get("activity") or {}).get("tokens") or {}
+        line = {
+            "run_id": record.get("run_id"),
+            "at": record.get("started_at") or record.get("recorded_at"),
+            "project": repo.name,
+            "project_path": str(repo),
+            "slug": record.get("slug"),
+            "provider": (record.get("provider") or {}).get("name"),
+            "model": (record.get("provider") or {}).get("model"),
+            "seconds": record.get("seconds"),
+            # Presented, not evaluated: this is the API's per-turn prompt_tokens summed, which
+            # re-counts the whole context every turn. Named so nobody adds it to a bench figure.
+            "input_presented": tokens.get("input"),
+            "output": tokens.get("output"),
+        }
+        path = usage_ledger()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as fh:
+            fh.write(json.dumps(line) + "\n")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def journal_dir(repo: Path) -> Path:
     return Path(os.environ.get("HANDOFF_JOURNAL_DIR") or (repo / ".handoff" / "journal"))
 
@@ -478,6 +529,10 @@ def cmd_record(args: argparse.Namespace) -> int:
 
     with records_path(repo).open("a") as fh:
         fh.write(json.dumps(record) + "\n")
+
+    # And once more, outside the repository, so the usage survives the repository. See
+    # usage_ledger(): six projects here hold the only copy of their own token counts.
+    append_usage(record, repo)
 
     print(f"==> journal: {run_id}  {outcome}"
           + (f"  ({gates['acceptance_passed']}/{gates['acceptance_total']} criteria)"

@@ -64,8 +64,15 @@ import argparse
 import collections
 import datetime
 import json
+import os
 import pathlib
 import sys
+
+def ledger_path() -> pathlib.Path:
+    root = os.environ.get("HANDOFF_STATE_HOME") or os.environ.get("XDG_STATE_HOME") \
+        or str(pathlib.Path.home() / ".local" / "state")
+    return pathlib.Path(root) / "agent-handoff" / "usage.jsonl"
+
 
 DEFAULT_ROOTS = [pathlib.Path.home() / "dev"]
 DEFAULT_BENCH = pathlib.Path.home() / "dev" / "agent-handoff-bench" / "bench"
@@ -105,6 +112,30 @@ def read_journals(roots: list[pathlib.Path]) -> tuple[list[dict], list[str]]:
                              "input": tokens.get("input") or 0,
                              "output": tokens.get("output") or 0,
                              "outcome": entry.get("outcome")})
+    return rows, problems
+
+
+def read_ledger(path: pathlib.Path) -> tuple[list[dict], list[str]]:
+    """The machine-wide ledger tools/journal appends to, one line per round.
+
+    This is the copy that survives a repository being deleted. It carries usage only, so a round
+    here has no outcome -- that lives with the artifacts, and the artifacts went with the repo.
+    """
+    if not path.is_file():
+        return [], [f"{path} does not exist yet (written from the next round onward)"]
+    rows, problems = [], []
+    for line in path.read_text(errors="replace").splitlines():
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            problems.append(f"{path}: a line that is not JSON")
+            continue
+        rows.append({"source": "ledger", "project": entry.get("project") or "unknown",
+                     "when": entry.get("at"), "model": entry.get("model"),
+                     "provider": entry.get("provider"), "slug": entry.get("slug"),
+                     "seconds": entry.get("seconds") or 0,
+                     "input": entry.get("input_presented"), "output": entry.get("output"),
+                     "outcome": None, "run_id": entry.get("run_id")})
     return rows, problems
 
 
@@ -153,14 +184,26 @@ def main() -> int:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--roots", nargs="*", type=pathlib.Path, default=DEFAULT_ROOTS)
     parser.add_argument("--bench", type=pathlib.Path, default=DEFAULT_BENCH)
+    parser.add_argument("--ledger", type=pathlib.Path, default=ledger_path())
     parser.add_argument("--since", help="YYYY-MM-DD, inclusive")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
     rows, problems = read_journals(args.roots)
     bench_rows, bench_problems = read_bench(args.bench)
-    rows += bench_rows
-    problems += bench_problems
+    ledger_rows, ledger_problems = read_ledger(args.ledger)
+    problems += bench_problems + ledger_problems
+
+    # The ledger and the journals overlap for every repository that still exists, and a round
+    # counted twice is worse than a round missed: the total would be quietly inflated and nothing
+    # would look wrong. Journals win, because they carry the outcome too; the ledger contributes
+    # only rounds whose repository is gone.
+    seen = {(r["project"], r["slug"], r["when"]) for r in rows}
+    recovered = [r for r in ledger_rows if (r["project"], r["slug"], r["when"]) not in seen]
+    rows += bench_rows + recovered
+    if recovered:
+        problems.append(f"{len(recovered)} round(s) came only from the ledger — their "
+                        "repositories are gone, and this is the copy that outlived them")
 
     if not rows:
         print("UNKNOWN  no journals and no bench metrics were readable, so nothing was counted.",

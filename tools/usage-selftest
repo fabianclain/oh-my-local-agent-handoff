@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""usage-selftest — does the usage record survive the repository, without counting twice?
+
+    tools/usage-selftest
+
+The per-repository journal is the authority on a round, and a poor authority on usage over time:
+it lives inside the repository, so `git worktree remove` takes its history with it. Six projects
+on this machine held the only copy of their own token counts.
+
+So tools/journal also appends a line to a machine-wide ledger, and tools/usage reads both. That
+creates the failure this suite exists for: for every repository that still exists, the same round
+appears TWICE. A double-counted round is worse than a missed one -- the total inflates and nothing
+looks wrong.
+
+    1  the ledger is written, outside any repository
+    2  a round whose repository is gone is recovered from it
+    3  a round whose repository still exists is NOT counted twice
+    4  the ledger never fails a round
+    5  a missing ledger is reported as missing, not as zero usage
+"""
+
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import tempfile
+
+HERE = pathlib.Path(__file__).resolve().parent
+FAILURES = 0
+
+
+def pas(what: str) -> None:
+    print(f"    PASS: {what}")
+
+
+def bad(what: str, detail: str = "") -> None:
+    global FAILURES
+    FAILURES += 1
+    print(f"    FAIL: {what}")
+    if detail:
+        for line in str(detail).splitlines()[:4]:
+            print(f"        {line}")
+
+
+def load(name: str, path: pathlib.Path):
+    spec = importlib.util.spec_from_loader(
+        name, importlib.machinery.SourceFileLoader(name, str(path)))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+work = pathlib.Path(tempfile.mkdtemp())
+os.environ["HANDOFF_STATE_HOME"] = str(work / "state")
+journal = load("journal_mod", HERE / "journal")
+
+RECORD = {
+    "run_id": "20260816T190000Z-demo-1", "started_at": "2026-08-16T19:00:00Z", "slug": "demo",
+    "seconds": 120, "provider": {"name": "nativelow", "model": "gpt-oss-20b"},
+    "activity": {"tokens": {"input": 50_000, "output": 1_200}},
+}
+
+print("==> 1/5 the ledger is written outside every repository")
+journal.append_usage(RECORD, work / "repos" / "gone-tomorrow")
+ledger = journal.usage_ledger()
+if not ledger.is_file():
+    bad("no ledger was written", str(ledger))
+elif str(work / "repos") in str(ledger):
+    bad("the ledger is inside the repository tree, which defeats the point", str(ledger))
+else:
+    line = json.loads(ledger.read_text().splitlines()[0])
+    if line.get("output") != 1_200 or line.get("input_presented") != 50_000:
+        bad("the line does not carry the usage", json.dumps(line))
+    elif "outcome" in line or "gates" in line:
+        bad("the ledger carries verdicts; those belong with the artifacts", json.dumps(line))
+    else:
+        pas("one line, usage only, outside the repo")
+
+print("==> 2/5 a round whose repository is gone is recovered")
+usage = load("usage_mod", HERE / "usage")
+rows, _ = usage.read_ledger(ledger)
+if len(rows) != 1 or rows[0]["output"] != 1_200:
+    bad(f"the ledger produced {len(rows)} usable row(s)", json.dumps(rows)[:200])
+else:
+    pas("read back with its tokens")
+
+print("==> 3/5 a round whose repository still exists is not counted twice")
+# The whole risk of having two sources. Built as tools/usage builds it: journals first, then only
+# the ledger rows nothing has already claimed.
+journal_rows = [{"source": "journal", "project": "gone-tomorrow", "slug": "demo",
+                 "when": "2026-08-16T19:00:00Z", "input": 50_000, "output": 1_200,
+                 "seconds": 120, "model": None, "provider": None, "outcome": "accepted"}]
+seen = {(r["project"], r["slug"], r["when"]) for r in journal_rows}
+recovered = [r for r in rows if (r["project"], r["slug"], r["when"]) not in seen]
+if recovered:
+    bad(f"{len(recovered)} duplicate(s) survived deduplication — the total would inflate",
+        json.dumps(recovered)[:200])
+else:
+    pas("the duplicate is absorbed, and the total does not move")
+
+print("==> 4/5 a ledger that cannot be written does not fail the round")
+# Bookkeeping must never break the thing it is bookkeeping about.
+os.environ["HANDOFF_STATE_HOME"] = "/proc/nonexistent-and-unwritable"
+try:
+    journal.append_usage(RECORD, work / "repos" / "another")
+except Exception as error:  # noqa: BLE001
+    bad(f"an unwritable ledger raised {type(error).__name__}", str(error))
+else:
+    pas("swallowed, as bookkeeping must be")
+os.environ["HANDOFF_STATE_HOME"] = str(work / "state")
+
+print("==> 5/5 a missing ledger is reported as missing, never as zero usage")
+missing, problems = usage.read_ledger(work / "state" / "nope.jsonl")
+if missing:
+    bad("rows came from a ledger that does not exist")
+elif not any("does not exist" in p for p in problems):
+    bad("a missing ledger produced no note; it would read as no usage", str(problems))
+else:
+    pas("named as missing")
+
+print()
+print("all checks passed" if not FAILURES else f"{FAILURES} check(s) failed")
+subprocess.run(["rm", "-rf", str(work)])
+sys.exit(1 if FAILURES else 0)
