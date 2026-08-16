@@ -81,6 +81,32 @@ CASES = [
     ("depth is the largest request, not the last",
      [usage(3000), usage(21000), usage(9000), tool_call("submit_report")],
      GOOD_REPORT, "accepted", {"depth": 21000}),
+
+    # A report the extractor RECONSTRUCTED out of a string value inside a mangled tool call. It
+    # counts as reported, and it is not the same event as the model answering. A channel that
+    # reports 90% while repairing a third of them is not a 90% channel, and until the extractor
+    # was instrumented these two rows were identical.
+    ("a reconstructed report is marked as repaired",
+     [usage(16300), ev({"type": "report_turn", "attempt": 1, "finishReason": "stop",
+                        "chars": 400}),
+      ev({"type": "report_provenance", "attempt": 1, "repaired": True,
+          "notes": ["candidates=2", "score=4/7", "NESTED-depth-1", "PARTIAL-schema-match"]})],
+     GOOD_REPORT, "accepted", {"channel": "fallback-1", "repaired": True}),
+
+    ("a report the model simply answered is not marked repaired",
+     [usage(16300), ev({"type": "report_turn", "attempt": 1, "finishReason": "stop",
+                        "chars": 400}),
+      ev({"type": "report_provenance", "attempt": 1, "repaired": False,
+          "notes": ["candidates=1", "score=7/7"]})],
+     GOOD_REPORT, "accepted", {"channel": "fallback-1", "repaired": False}),
+
+    # The answerability rule, applied to this tool's own history. Every run archived before the
+    # provenance events existed carries no evidence either way, and `False` would be a claim about
+    # 114 real runs that nothing supports.
+    ("a run from before the instrumentation is UNKNOWN, not 'not repaired'",
+     [usage(16300), ev({"type": "report_turn", "attempt": 1, "finishReason": "stop",
+                        "chars": 400})],
+     GOOD_REPORT, "accepted", {"channel": "fallback-1", "repaired": None}),
 ]
 
 

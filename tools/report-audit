@@ -53,6 +53,7 @@ def analyse(run: pathlib.Path) -> dict:
     peg_faults = 0
     peg_retries = 0
     report_turns = []
+    provenance = []
     saw_report_tool = False
     finishes = []
     last_text = ""
@@ -79,6 +80,8 @@ def analyse(run: pathlib.Path) -> dict:
             peg_retries += 1
         elif kind == "report_turn":
             report_turns.append(event)
+        elif kind == "report_provenance":
+            provenance.append(event)
         elif kind == "content_end":
             if event.get("contentType") == "tool" and event.get("toolName") in (
                     "submit_report", "attempt_completion"):
@@ -131,9 +134,21 @@ def analyse(run: pathlib.Path) -> dict:
         else:
             reason = "no fallback turn recorded"
 
+    # Whether the report was ANSWERED or RECONSTRUCTED. Those two counted identically until the
+    # extractor was instrumented, and the difference is the whole case for prevention over repair:
+    # a channel that reports 90% but repairs a third of them is not a 90% channel.
+    #
+    # Absent from every log written before that instrumentation existed, and `False` would be a
+    # lie about those runs -- so the distinction is only drawn where the evidence exists.
+    repaired = None
+    if provenance:
+        repaired = any(entry.get("repaired") for entry in provenance)
+
     return {"run": str(run), "outcome": outcome, "depth": depth, "channel": channel,
             "reason": reason, "peg_faults": peg_faults, "peg_retries": peg_retries,
-            "report_turns": len(report_turns), "finishes": finishes}
+            "report_turns": len(report_turns), "finishes": finishes,
+            "repaired": repaired,
+            "provenance": [n for entry in provenance for n in (entry.get("notes") or [])]}
 
 
 def runs_under(target: pathlib.Path) -> list[pathlib.Path]:
@@ -198,6 +213,20 @@ def main() -> int:
     print(f'\n{len(rows)} run(s)')
     for channel, count in channels.most_common():
         print(f'  {channel:20} {count:3d}  ({count / len(rows):.0%})')
+
+    # Answered against reconstructed. Only over runs whose logs carry the evidence: a run from
+    # before the extractor was instrumented is `None`, and counting it as "not repaired" would
+    # overstate the channel exactly the way this measurement exists to stop.
+    judged = [r for r in rows if r["repaired"] is not None]
+    if judged:
+        repaired = [r for r in judged if r["repaired"]]
+        print(f'\n  of {len(judged)} run(s) with provenance recorded, {len(repaired)} had the '
+              f'report RECONSTRUCTED rather than answered ({len(repaired) / len(judged):.0%})')
+        for row in repaired:
+            print(f'    {pathlib.Path(row["run"]).name}: {", ".join(row["provenance"])}')
+    if len(judged) < len(rows):
+        print(f'  {len(rows) - len(judged)} run(s) predate the provenance events, so whether '
+              f'their reports were repaired is UNKNOWN, not "no"')
 
     faults = sum(r["peg_faults"] for r in rows)
     retries = sum(r["peg_retries"] for r in rows)
