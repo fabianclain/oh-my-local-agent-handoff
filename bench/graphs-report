@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""graphs-report — what the overnight replication actually showed.
+
+    bench/graphs-report [<overnight-dir>]
+
+With no argument it reads the newest directory under .overnight/.
+
+Reads the pass logs rather than any summary written by the thing being measured. Every number
+below is counted from a line the harness printed while it ran, so a pass killed at 04:00 is
+reported as what it did before it died rather than being omitted.
+"""
+
+from __future__ import annotations
+
+import pathlib
+import re
+import sys
+from collections import Counter, defaultdict
+
+STEP = re.compile(r"── step (\d+) of (\d+): (\S+)")
+VERDICT = re.compile(r"verdict: (\w+) — (\d+) of (\d+)")
+REPAIRED = re.compile(r"after repair: (\w+) — (\d+) of (\d+)")
+COMMITTED = re.compile(r"committed (\w+)\s+(.*)")
+CONSULTED = re.compile(r"rejected — asking (\S+)")
+ANSWER = re.compile(r"^\s+\S+: (RETRY|STOP|UNAVAILABLE)\b(.*)", re.MULTILINE)
+STOPPED = re.compile(r"stopped: (.*)")
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+class Pass:
+    def __init__(self, name: str, mode: str) -> None:
+        self.name = name
+        self.mode = mode
+        self.steps: list[dict] = []
+        self.stopped_because = ""
+        # Read from the log's own "step N of M", not from the highest step reached: a pass that
+        # stops at step 2 of 8 must not be reported as having completed 2 of 2.
+        self.total = 0
+
+    @property
+    def landed(self) -> int:
+        return sum(1 for s in self.steps if s["final"] == "ACCEPT")
+
+    @property
+    def reached(self) -> int:
+        return len(self.steps)
+
+
+def parse(path: pathlib.Path) -> Pass:
+    name = path.stem.replace("graphs-", "")
+    text = ANSI.sub("", path.read_text(errors="replace"))
+    mode = "consult" if "asking" in text or "--consult" in text else "pure"
+    # The mode is in the pass name too, and that is the authority; the text is a fallback for a
+    # pass that never had a rejection to consult about.
+    if name.startswith("pure"):
+        mode = "pure"
+    elif name.startswith("consult"):
+        mode = "consult"
+
+    run = Pass(name, mode)
+    current: dict | None = None
+
+    for line in text.splitlines():
+        step = STEP.search(line)
+        if step:
+            if current:
+                run.steps.append(current)
+            run.total = int(step.group(2))
+            current = {
+                "n": int(step.group(1)), "slug": step.group(3),
+                "first": None, "final": None, "score": None,
+                "consulted": False, "answer": None, "answer_detail": "",
+            }
+            continue
+        if current is None:
+            stopped = STOPPED.search(line)
+            if stopped:
+                run.stopped_because = stopped.group(1).strip()
+            continue
+
+        verdict = VERDICT.search(line)
+        if verdict:
+            current["first"] = verdict.group(1)
+            current["final"] = verdict.group(1)
+            current["score"] = f"{verdict.group(2)}/{verdict.group(3)}"
+            continue
+        if CONSULTED.search(line):
+            current["consulted"] = True
+            continue
+        answer = ANSWER.search(line)
+        if answer and current["consulted"] and current["answer"] is None:
+            current["answer"] = answer.group(1)
+            current["answer_detail"] = answer.group(2).strip()[:220]
+            continue
+        repaired = REPAIRED.search(line)
+        if repaired:
+            current["final"] = repaired.group(1)
+            current["score"] = f"{repaired.group(2)}/{repaired.group(3)}"
+            continue
+        if COMMITTED.search(line):
+            current["final"] = "ACCEPT"
+            continue
+        stopped = STOPPED.search(line)
+        if stopped:
+            run.stopped_because = stopped.group(1).strip()
+
+    if current:
+        run.steps.append(current)
+    return run
+
+
+def main(argv: list[str]) -> int:
+    root = pathlib.Path(argv[0]) if argv else None
+    if root is None:
+        base = pathlib.Path(__file__).resolve().parent.parent / ".overnight"
+        candidates = sorted(base.glob("*"), key=lambda p: p.name)
+        if not candidates:
+            print("no overnight runs found", file=sys.stderr)
+            return 1
+        root = candidates[-1]
+
+    logs = sorted(root.glob("graphs-*.log"))
+    if not logs:
+        print(f"no pass logs in {root}", file=sys.stderr)
+        return 1
+
+    runs = [parse(p) for p in logs]
+    total_steps = max((r.total for r in runs), default=0)
+
+    print(f"# Overnight replication — {root.name}\n")
+    print(f"{len(runs)} pass(es) over {total_steps} steps of the crawler-graphs feature.\n")
+
+    print("## How far each pass got unattended\n")
+    print(f"{'pass':<12} {'mode':<8} {'landed':>7}  stopped at")
+    print("-" * 72)
+    for run in runs:
+        if run.landed == total_steps and total_steps:
+            where = "— completed"
+        elif run.steps:
+            last = run.steps[-1]
+            where = f"step {last['n']} {last['slug'].replace('crawler-graphs-', '')} ({last['score'] or 'no verdict'})"
+        else:
+            where = "— never started a step"
+        print(f"{run.name:<12} {run.mode:<8} {run.landed:>3} of {total_steps or '?':<2}  {where}")
+
+    print("\n## Per step, across every pass\n")
+    per_step: dict[int, Counter] = defaultdict(Counter)
+    names: dict[int, str] = {}
+    for run in runs:
+        for s in run.steps:
+            names[s["n"]] = s["slug"].replace("crawler-graphs-", "")
+            per_step[s["n"]][s["final"] or "no-verdict"] += 1
+    print(f"{'step':<16} {'accepted':>9} {'rejected':>9} {'attempts':>9}")
+    print("-" * 48)
+    for n in sorted(per_step):
+        counts = per_step[n]
+        attempts = sum(counts.values())
+        print(f"{names[n]:<16} {counts['ACCEPT']:>9} {attempts - counts['ACCEPT']:>9} {attempts:>9}")
+
+    consulted = [s for r in runs for s in r.steps if s["consulted"]]
+    print(f"\n## The orchestrator — {len(consulted)} consultation(s)\n")
+    if not consulted:
+        print("No rejection reached a consult pass. Either the pure passes ran alone, or nothing")
+        print("was rejected — check the table above before reading that as a working orchestrator.")
+    else:
+        answers = Counter(s["answer"] or "no-answer" for s in consulted)
+        for answer, count in answers.most_common():
+            print(f"  {answer:<12} {count}")
+        rescued = [s for s in consulted if s["answer"] == "RETRY" and s["final"] == "ACCEPT"]
+        retried = [s for s in consulted if s["answer"] == "RETRY"]
+        print()
+        if retried:
+            print(f"  {len(rescued)} of {len(retried)} retries landed the step.")
+        stopped_early = [s for s in consulted if s["answer"] == "STOP"]
+        if stopped_early:
+            print(f"  {len(stopped_early)} stop(s), which is the orchestrator declining to guess:")
+            for s in stopped_early[:6]:
+                print(f"    {s['slug'].replace('crawler-graphs-', '')}: {s['answer_detail'][:150]}")
+
+    pure = [r for r in runs if r.mode == "pure"]
+    cons = [r for r in runs if r.mode == "consult"]
+    if pure and cons:
+        pure_avg = sum(r.landed for r in pure) / len(pure)
+        cons_avg = sum(r.landed for r in cons) / len(cons)
+        print("\n## Does consulting help?\n")
+        print(f"  pure     {pure_avg:.1f} steps landed on average, over {len(pure)} pass(es)")
+        print(f"  consult  {cons_avg:.1f} steps landed on average, over {len(cons)} pass(es)")
+        print()
+        if cons_avg > pure_avg:
+            print(f"  +{cons_avg - pure_avg:.1f} steps. Read it against the sample size before")
+            print("  believing it — these are single-digit counts.")
+        elif cons_avg == pure_avg:
+            print("  No difference. If that holds at a larger n, consulting is latency and cost")
+            print("  with a story attached, and the honest move is to drop it.")
+        else:
+            print("  Consulting did WORSE. Look at the retries above before assuming noise: a")
+            print("  repair that damages the tree is the failure mode this design fears most.")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
