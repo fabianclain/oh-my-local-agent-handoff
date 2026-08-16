@@ -813,6 +813,13 @@ for provider in "${PROVIDER_LIST[@]}"; do
                 source "$PROVIDER_FILE"
                 declare -F provider_usage_since >/dev/null && provider_usage_since "$USAGE_MARK"
             )" || ATTEMPT_USAGE=""
+            # The completions llama.cpp discarded during this attempt, saved beside its artefacts
+            # before the log can rotate. Bracketed by the SAME byte offset as the token accounting,
+            # so a discard and its tokens cannot land in different rounds. 99 samples -- the whole
+            # evidence base for the harmony fault -- were lost to rotation before this existed, and
+            # the three that survived by accident overturned a model verdict the same day.
+            "$BENCH_HOME/../tools/peg-capture" --since "$USAGE_MARK" \
+                --out "$RESULT_DIR/discarded-attempt-$ATTEMPTS.txt" >/dev/null 2>&1 || true
             # Always yields a number: an empty substitution inside $(( )) is a syntax error, and
             # an adapter that reports nothing must not abort the round.
             usage_field() {
