@@ -136,6 +136,14 @@ def tool_schemas(include_report: bool, schema: dict) -> list[dict]:
             "parameters": {"type": "object", "required": ["query"], "properties": {
                 "query": {"type": "string"}, "path": {"type": "string"}}}}},
         {"type": "function", "function": {
+            "name": "symbols",
+            "description": ("List what a file declares and the exact line range of each — "
+                            "`method reorderAllocation lines 359-402`. Use this before editing a "
+                            "large existing file: it gives the END of a declaration, which "
+                            "`search` cannot, so 'insert after the whole of X' needs no counting."),
+            "parameters": {"type": "object", "required": ["path"], "properties": {
+                "path": {"type": "string"}}}}},
+        {"type": "function", "function": {
             "name": "write_file",
             "description": ("Write a file in full. Creates it if absent, replaces it if "
                             f"present. Anything not named by the plan belongs in {SCRATCH}/, "
@@ -155,6 +163,11 @@ def tool_schemas(include_report: bool, schema: dict) -> list[dict]:
             "parameters": {"type": "object", "required": ["commands"], "properties": {
                 "commands": {"type": "array", "items": {"type": "string"}}}}}},
     ]
+    # An ARM, not a default. Enabling it by editing the tool list would change harness_tree, and
+    # two arms with different trees are not comparable -- which this project has already had to
+    # throw away 25 runs to learn. An environment variable keeps the tree identical.
+    if not os.environ.get("NATIVE_SYMBOLS"):
+        tools = [t for t in tools if t["function"]["name"] != "symbols"]
     tools = [t for t in tools if t["function"]["name"] not in DISABLED]
     if include_report and "submit_report" not in DISABLED:
         tools.append({"type": "function", "function": {
@@ -419,6 +432,15 @@ def run_tool(repo: pathlib.Path, name: str, args: dict) -> str:
                         f"literally. This query would work: {plain(query)}")
             return clamp(proc.stdout or f"no matches for {query!r}")
 
+        if name == "symbols":
+            tool = pathlib.Path(__file__).resolve().parent / "symbols"
+            done = subprocess.run([sys.executable, str(tool), str(args.get("path", "")),
+                                   "--repo", str(repo)],
+                                  capture_output=True, text=True, timeout=TOOL_TIMEOUT)
+            # Exit 2 is "could not read this language", which is a real answer and not an error the
+            # model should treat as a broken tool. Pass its own words through either way.
+            return clamp((done.stdout or "") + (done.stderr or "") or "(no output)")
+
         if name == "write_file":
             path = resolve(repo, args["path"])
             check_writable(repo, path)
@@ -452,8 +474,35 @@ def run_tool(repo: pathlib.Path, name: str, args: dict) -> str:
                     out.append(f"$ {command}\nrefused: the plan forbids git history changes; "
                                "leave every change uncommitted in the working tree\n(exit 1)")
                     continue
-                proc = subprocess.run(["bash", "-o", "pipefail", "-c", command], cwd=repo,
-                                      capture_output=True, text=True, timeout=TOOL_TIMEOUT)
+                # A timeout is caught HERE, per command, not by the handler around the whole tool.
+                #
+                # It used to propagate: one slow command threw away the output of every command
+                # that had already succeeded, which command had hung, and its partial output. The
+                # model got `error: run_commands timed out` and nothing else. Both accepted rounds
+                # on real work ran 17 and 20 commands in a single batch during verification, so one
+                # slow test suite would have discarded the entire verification report.
+                #
+                # The rule, borrowed from deepseek-harness's defensive-patterns: report orthogonal
+                # outcomes independently. Timing out and what was produced before it are separate
+                # facts, and nesting one inside the other loses both.
+                try:
+                    proc = subprocess.run(["bash", "-o", "pipefail", "-c", command], cwd=repo,
+                                          capture_output=True, text=True, timeout=TOOL_TIMEOUT)
+                except subprocess.TimeoutExpired as expired:
+                    partial = ""
+                    for stream in (expired.stdout, expired.stderr):
+                        if isinstance(stream, bytes):
+                            partial += stream.decode("utf-8", "replace")
+                        elif stream:
+                            partial += stream
+                    out.append(f"$ {command}\n{partial}"
+                               f"(TIMED OUT after {TOOL_TIMEOUT}s and was killed. Any output above "
+                               f"is partial, and there is no exit code because it never finished.)")
+                    remaining = (args.get("commands") or [])[len(out):]
+                    if remaining:
+                        out.append("(not run, because the command before them timed out: "
+                                   + ", ".join(repr(c) for c in remaining) + ")")
+                    break
                 body = (proc.stdout or "") + (proc.stderr or "")
                 out.append(f"$ {command}\n{body}(exit {proc.returncode})")
             return clamp("\n\n".join(out) or "(no commands)")

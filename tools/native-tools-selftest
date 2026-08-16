@@ -80,7 +80,7 @@ SMALL.write_text("<?php\nclass Small {}\n")
 
 assert BIG.stat().st_size > native.OUTPUT_CAP, "the fixture must exceed the cap or nothing is tested"
 
-print("==> 1/6 a file past the cap says how many lines it has and how to reach them")
+print("==> 1/7 a file past the cap says how many lines it has and how to reach them")
 out = native.run_tool(work, "read_files", {"files": [{"path": "Big.php"}]})
 if "of 1052" not in out:
     bad("the truncated read does not say how long the file is", out[-300:])
@@ -92,7 +92,7 @@ elif "moveOption" in out:
 else:
     pas("truncated, with the total line count and a concrete follow-up call")
 
-print("==> 2/6 the unreachable region is reachable with start/end")
+print("==> 2/7 the unreachable region is reachable with start/end")
 out = native.run_tool(work, "read_files", {"files": [{"path": "Big.php", "start": 860, "end": 920}]})
 if "moveOption" not in out or "moveItem" not in out:
     bad("a windowed read did not return the lines it was asked for", out[:300])
@@ -101,7 +101,7 @@ elif "lines 860-920 of 1052" not in out:
 else:
     pas("lines 871 and 914 — the two anchors three rounds could not see — come back")
 
-print("==> 3/6 a small file is still returned whole, with no window furniture")
+print("==> 3/7 a small file is still returned whole, with no window furniture")
 out = native.run_tool(work, "read_files", {"files": [{"path": "Small.php"}]})
 if out != "--- Small.php ---\n<?php\nclass Small {}\n":
     bad("an ordinary read changed shape; every plan and log in the archive assumes it did not",
@@ -109,7 +109,7 @@ if out != "--- Small.php ---\n<?php\nclass Small {}\n":
 else:
     pas("unchanged for the case that was never broken")
 
-print("==> 4/6 a window running past the end is clamped, not an error")
+print("==> 4/7 a window running past the end is clamped, not an error")
 out = native.run_tool(work, "read_files", {"files": [{"path": "Big.php", "start": 1040, "end": 9999}]})
 if "lines 1040-1052 of 1052" not in out:
     bad("an over-long window was not clamped to the file", out.splitlines()[0] if out else "")
@@ -118,7 +118,7 @@ elif "not shown" in out:
 else:
     pas("clamped to the last line, and does not claim there is more")
 
-print("==> 5/6 an invalid pattern is reported as an error, never as 'no matches'")
+print("==> 5/7 an invalid pattern is reported as an error, never as 'no matches'")
 out = native.run_tool(work, "search", {"query": "private function moveOption(", "path": "Big.php"})
 # Matched on the opening words, not anywhere in the text: the error deliberately contains the
 # phrase "This is NOT 'no matches'", and a substring test would fail the correct behaviour.
@@ -131,12 +131,50 @@ elif "moveOption\\(" not in out:
 else:
     pas("named as a pattern error, with the working alternative to copy")
 
-print("==> 6/6 a pattern that is valid and genuinely absent still says 'no matches'")
+print("==> 6/7 a pattern that is valid and genuinely absent still says 'no matches'")
 out = native.run_tool(work, "search", {"query": "thisAppearsNowhere", "path": "Big.php"})
 if not out.startswith("no matches"):
     bad("a real absence stopped being reported as an absence", out[:200])
 else:
     pas("a true negative is still a negative")
+
+print("==> 7/8 a command that times out does not discard the batch")
+# Borrowed from deepseek-harness's defensive-patterns: "report orthogonal outcomes independently
+# ... never nest one flag's report inside another's branch". A timeout used to propagate out of
+# run_commands and take the whole batch with it. Both accepted rounds on real work ran 17 and 20
+# commands in one call, so one slow test suite would have discarded the verification report.
+saved = native.TOOL_TIMEOUT
+native.TOOL_TIMEOUT = 2
+out = native.run_tool(work, "run_commands",
+                      {"commands": ["echo FIRST_SUCCEEDED", "sleep 30", "echo THIRD"]})
+native.TOOL_TIMEOUT = saved
+if "FIRST_SUCCEEDED" not in out:
+    bad("a timeout discarded the output of a command that had already succeeded", out)
+elif "TIMED OUT" not in out:
+    bad("the timeout is not attributed to the command that hung", out)
+elif "not run" not in out:
+    bad("the commands after the hang are neither run nor accounted for", out)
+elif "exit 0" not in out:
+    bad("the successful command lost its exit status", out)
+else:
+    pas("the batch keeps what it earned, names what hung, and says what it skipped")
+
+print("==> 8/8 symbols is an ARM, and reports the extent search cannot")
+import os
+os.environ.pop("NATIVE_SYMBOLS", None)
+off = [t["function"]["name"] for t in native.tool_schemas(False, {})]
+os.environ["NATIVE_SYMBOLS"] = "1"
+on = [t["function"]["name"] for t in native.tool_schemas(False, {})]
+os.environ.pop("NATIVE_SYMBOLS", None)
+out = native.run_tool(work, "symbols", {"path": "Big.php"})
+if "symbols" in off:
+    bad("symbols is registered by default — the control arm would not be a control", str(off))
+elif "symbols" not in on:
+    bad("NATIVE_SYMBOLS did not enable it, so the arm cannot be measured", str(on))
+elif "moveOption" not in out:
+    bad("symbols did not find a declaration the fixture certainly has", out[:200])
+else:
+    pas("off by default, on by env, and it names the declarations")
 
 print()
 print("all checks passed" if not FAILURES else f"{FAILURES} check(s) failed")

@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""symbols — what is declared in this file, and on which lines.
+
+    tools/symbols <file> [--repo DIR] [--json]
+
+Exit 0 with the declarations, 2 when nothing on this machine can parse the file.
+
+WHY THIS, RATHER THAN LSP
+
+The measured failure was narrow: a round spent 25 searches locating a declaration at line 914 of a
+1,052-line component, and three rounds never reached a write. That needs symbol lookup. It does not
+need hover, completion, references, rename, or diagnostics — which is most of what a language
+server is, and all of what makes one a subsystem (a server per language, a JSON-RPC client, a
+document-sync protocol, a daemon lifecycle).
+
+So this is the narrow thing. If something later genuinely needs types or cross-file references,
+that is when LSP earns its keep.
+
+WHAT IT GIVES THAT `search` CANNOT
+
+The END of a declaration. `grep -n 'function moveOption'` finds line 959; a plan that says "insert
+after the whole of moveOption" needs line 990, and to get there from grep the model must read the
+file and count braces — which is the reading cost that broke those three rounds. An AST knows the
+extent, so both anchors come back from one call.
+
+BACKENDS, BEST FIRST
+
+    php-parse   nikic/php-parser, already a dependency of every modern Laravel project
+                (vendor/bin/php-parse). A real AST, so the extents are exact.
+
+                It does NOT survive a file that does not compile. That was claimed here first and
+                measured second, which is the wrong order: `--with-recovery` makes the CLI report
+                the error, and it writes ZERO bytes of JSON to stdout for both a truncated file and
+                a mid-file error. The flag is passed anyway — it costs nothing and a future version
+                may emit a partial tree — but nothing here relies on it.
+
+    patterns    a line scan. Two different situations fall back to it, and they are reported
+                differently because only one of them is about the language:
+
+                  no parser for this suffix   — a language nothing here can parse
+                  the parser could not parse  — PHP whose syntax is currently broken, which is
+                    THIS file                   worth saying plainly: it means the file is broken,
+                                                not that the tool is unavailable
+
+                Labelled approximate either way, because a regex cannot know that a `function`
+                inside a string is not a declaration, and a caller that thought it was reading an
+                AST would trust it too far.
+
+    nothing     exit 2, naming the file and why. Not an empty list: "no declarations found" and "I
+                cannot read this language" are different answers, and returning the first for the
+                second is the fault docs/answerability.md exists for.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import re
+import subprocess
+import sys
+
+# nodeType -> what to call it. Only declarations a plan would anchor on.
+PHP_NODES = {
+    "Stmt_Class": "class",
+    "Stmt_Interface": "interface",
+    "Stmt_Trait": "trait",
+    "Stmt_Enum": "enum",
+    "Stmt_ClassMethod": "method",
+    "Stmt_Function": "function",
+    "Stmt_ClassConst": "const",
+    "Stmt_Property": "property",
+}
+
+# The fallback. Deliberately conservative: anchored at the start of a line, so a `function` inside
+# a string or a comment body is not reported as a declaration.
+PATTERNS = {
+    ".php": re.compile(r"^\s*(?:(?:final|abstract|readonly|public|protected|private|static)\s+)*"
+                       r"(?P<kind>class|interface|trait|enum|function|const)\s+(?P<name>\w+)"),
+    ".py": re.compile(r"^\s*(?P<kind>class|def)\s+(?P<name>\w+)"),
+    ".js": re.compile(r"^\s*(?:export\s+)?(?:default\s+)?(?P<kind>class|function)\s+(?P<name>\w+)"),
+    ".ts": re.compile(r"^\s*(?:export\s+)?(?:default\s+)?"
+                      r"(?P<kind>class|interface|type|function|enum)\s+(?P<name>\w+)"),
+}
+PATTERNS[".jsx"] = PATTERNS[".js"]
+PATTERNS[".tsx"] = PATTERNS[".ts"]
+
+
+def php_parser(repo: pathlib.Path) -> pathlib.Path | None:
+    candidate = repo / "vendor" / "bin" / "php-parse"
+    return candidate if candidate.is_file() else None
+
+
+def from_php_ast(parser: pathlib.Path, path: pathlib.Path,
+                 repo: pathlib.Path) -> list[dict] | None:
+    """Declarations from a real AST, or None when the parser could not produce one."""
+    try:
+        # --with-recovery so a file mid-edit still answers. The model needs this most when it has
+        # just broken something, which is precisely when every other PHP tool goes quiet.
+        done = subprocess.run([str(parser), "-j", "-P", "-r", str(path)],
+                              capture_output=True, text=True, timeout=60, cwd=repo)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    body = done.stdout
+    start = body.find("[")
+    if start < 0:
+        return None
+    try:
+        tree = json.loads(body[start:])
+    except ValueError:
+        return None
+
+    found: list[dict] = []
+
+    def walk(node) -> None:
+        if isinstance(node, dict):
+            kind = PHP_NODES.get(node.get("nodeType", ""))
+            if kind:
+                attributes = node.get("attributes") or {}
+                name = (node.get("name") or {})
+                name = name.get("name") if isinstance(name, dict) else None
+                # A property or const declares several names under one node.
+                if name is None:
+                    for sub in node.get("props") or node.get("consts") or []:
+                        inner = (sub.get("name") or {}).get("name") if isinstance(sub, dict) else None
+                        if inner:
+                            found.append({"kind": kind, "name": inner,
+                                          "start": attributes.get("startLine"),
+                                          "end": attributes.get("endLine")})
+                elif attributes.get("startLine"):
+                    found.append({"kind": kind, "name": name,
+                                  "start": attributes.get("startLine"),
+                                  "end": attributes.get("endLine")})
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(tree)
+    found.sort(key=lambda d: (d["start"] or 0, d["name"]))
+    return found
+
+
+def from_patterns(path: pathlib.Path) -> list[dict] | None:
+    pattern = PATTERNS.get(path.suffix.lower())
+    if not pattern:
+        return None
+    found = []
+    for number, line in enumerate(path.read_text(errors="replace").splitlines(), 1):
+        match = pattern.match(line)
+        if match:
+            found.append({"kind": match.group("kind"), "name": match.group("name"),
+                          "start": number, "end": None})
+    return found
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("file", type=pathlib.Path)
+    parser.add_argument("--repo", type=pathlib.Path, default=pathlib.Path("."))
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+
+    path = args.file if args.file.is_absolute() else args.repo / args.file
+    if not path.is_file():
+        print(f"cannot read {args.file}", file=sys.stderr)
+        return 2
+
+    backend, found = "", None
+    php = php_parser(args.repo) if path.suffix.lower() == ".php" else None
+    if php:
+        found = from_php_ast(php, path, args.repo)
+        backend = "php-parse (exact, from the AST)"
+    if found is None:
+        # Which fallback this is matters to the caller. "There is no parser for .rs" is a fact
+        # about the machine; "the parser could not parse this .php" is a fact about the FILE, and
+        # telling a model the second as though it were the first hides that its own edit broke the
+        # syntax. Both were reported with one message until this was tested rather than assumed.
+        found = from_patterns(path)
+        backend = ("line patterns (APPROXIMATE — this file does not currently parse, so extents "
+                   "are unavailable; the syntax error is the thing to fix)" if php else
+                   "line patterns (APPROXIMATE — no parser for this language on this machine)")
+    if found is None:
+        print(f"UNKNOWN  {args.file} — no parser and no pattern for '{path.suffix}' files, "
+              f"so nothing was read", file=sys.stderr)
+        print("         This is not 'no declarations'. Use search for this file.", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps({"file": str(args.file), "backend": backend, "symbols": found}, indent=2))
+        return 0
+
+    if not found:
+        # A parsed file with nothing in it is a real answer, and a different one from the exit-2
+        # case above. Say which happened.
+        print(f"{args.file}: no declarations, and the file WAS parsed ({backend})")
+        return 0
+
+    print(f"{args.file} — {len(found)} declaration(s) via {backend}")
+    for entry in found:
+        extent = f"{entry['start']}-{entry['end']}" if entry["end"] else f"{entry['start']}"
+        print(f"  {extent:>12}  {entry['kind']:<10} {entry['name']}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
