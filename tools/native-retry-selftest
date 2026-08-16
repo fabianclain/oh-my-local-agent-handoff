@@ -23,6 +23,7 @@ this repository has shipped three of them.
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -103,7 +104,8 @@ class Handler(BaseHTTPRequestHandler):
 
 def run_case(name: str, script: list[tuple[int, str]], expect_completions: int,
              expect_report: bool, expect_finish: set[str], extra_args: list[str] | None = None,
-             check_requests=None, files: dict[str, str] | None = None) -> bool:
+             check_requests=None, files: dict[str, str] | None = None,
+             env: dict[str, str] | None = None) -> bool:
     server = Server(script)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -127,7 +129,8 @@ def run_case(name: str, script: list[tuple[int, str]], expect_completions: int,
              "--result", str(result), "--log", str(log), "--host", "127.0.0.1",
              "--port", str(port), "--prompt", "do the thing", "--max-turns", "6",
              "--timeout", "20", *(extra_args or [])],
-            capture_output=True, text=True, timeout=120)
+            capture_output=True, text=True, timeout=120,
+            env={**os.environ, **(env or {})})
         server.shutdown()
 
         finish = ""
@@ -525,6 +528,39 @@ def main() -> int:
                "everything passed, so the status is complete."),
             ok('{"status": "complete", "summary": "done"}'),
         ], 4, True, {"completed"}),
+
+        # --- the nativejson arm ----------------------------------------------------------------
+        # Every defence against a malformed report in this harness is post-hoc. llama.cpp has
+        # accepted response_format: json_schema on this server throughout and nothing ever sent
+        # one. These two cases assert the arm is an arm: nothing constrained by default, the
+        # REPORT TURN ONLY when asked, and never a turn that carries tools -- a grammar on a turn
+        # where the model may want to call a tool would forbid the call.
+        # Deliberately the SAME script as the arm case below, so the env var is the only
+        # difference between them. A control that ran a different conversation would not be one.
+        ("no turn is constrained by default", [
+            ok(tool=("read_files", {"files": [{"path": "notes.txt"}]})),
+            ok("I have finished."),
+            ok('{"status": "complete", "summary": "done"}'),
+        ], 3, True, {"completed"}, None,
+         lambda requests: (
+             ["a request carried response_format with the arm off"]
+             if any("response_format" in r for r in requests) else [])),
+
+        ("the arm constrains the report turn and only the report turn", [
+            ok(tool=("read_files", {"files": [{"path": "notes.txt"}]})),
+            ok("I have finished."),
+            ok('{"status": "complete", "summary": "done"}'),
+        ], 3, True, {"completed"}, None,
+         lambda requests: (
+             (["no request carried response_format, so the arm did nothing"]
+              if not any("response_format" in r for r in requests) else [])
+             + ["a request carried BOTH tools and response_format; a grammar there would "
+                "forbid the tool call the model wanted"
+                for r in requests if r.get("tools") and "response_format" in r]
+             + [f"a constrained request was not strict json_schema: {r['response_format']}"
+                for r in requests if "response_format" in r
+                and r["response_format"].get("type") != "json_schema"]),
+         None, {"NATIVE_RESPONSE_FORMAT": "1"}),
     ]
 
     extractor_cases, extractor_failures = check_extractor()

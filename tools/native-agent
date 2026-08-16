@@ -895,14 +895,27 @@ RAW_HARMONY = False
 
 
 def call_model(host: str, port: int, model: str, messages: list[dict], tools: list[dict],
-               temperature: float, timeout: int) -> dict:
+               temperature: float, timeout: int, response_format: dict | None = None) -> dict:
     # The raw path takes llama.cpp's chat parser off the critical path: same prompt, our parsing.
     if RAW_HARMONY:
+        if response_format is not None:
+            # Refused, not silently dropped. /completions accepts `json_schema`, but the grammar
+            # would constrain the WHOLE completion -- and on the raw path the completion begins
+            # with harmony channel tokens, not with `{`. The model would be forced to open a brace
+            # where it must open `<|channel|>`, and parse_harmony would then find no message at
+            # all. Constraining only the final channel needs a GBNF that admits the harmony prefix,
+            # which is a real piece of work and not this arm.
+            raise SystemExit(
+                "nativejson and nativeraw cannot be combined: a json_schema grammar constrains "
+                "the whole completion, and the raw path's completion starts with harmony channel "
+                "tokens. Run them as separate arms.")
         return call_model_raw(host, port, messages, tools, temperature, timeout)
     payload = {"model": model, "messages": messages, "stream": False,
                "temperature": temperature}
     if tools:
         payload["tools"] = tools
+    if response_format is not None:
+        payload["response_format"] = response_format
     request = urllib.request.Request(f"http://{host}:{port}/v1/chat/completions",
                                      data=json.dumps(payload).encode(),
                                      headers={"Content-Type": "application/json"})
@@ -1024,7 +1037,8 @@ def extract_json_object(text: str, wanted: "frozenset[str] | set[str] | tuple" =
 
 
 def call_model_retrying(host: str, port: int, model: str, messages: list[dict], tools: list[dict],
-                        temperature: float, timeout: int, log, where: str) -> dict:
+                        temperature: float, timeout: int, log, where: str,
+                        response_format: dict | None = None) -> dict:
     """Re-ask a completion that llama.cpp refused to parse, instead of losing the round to it.
 
     The fault is in the serving stack, not in the conversation. The model generated output,
@@ -1052,7 +1066,8 @@ def call_model_retrying(host: str, port: int, model: str, messages: list[dict], 
     """
     for attempt in range(1, PEG_RETRIES + 2):
         try:
-            return call_model(host, port, model, messages, tools, temperature, timeout)
+            return call_model(host, port, model, messages, tools, temperature, timeout,
+                              response_format)
         except urllib.error.HTTPError as error:
             detail = error.read().decode("utf-8", "replace")[:300]
             # Logged on every occurrence, recovered or not, so tools/peg-audit and the journal
@@ -1318,10 +1333,30 @@ def main() -> int:
                         "do not reason, do not restate the work. Emit the object and nothing "
                         "else, beginning with { and ending with }.")
             try:
+                # An ARM. The report turn is the only place a grammar can be applied safely: it
+                # carries no tools, so constraining the whole completion to the report's shape
+                # cannot collide with a tool call the model wanted to make.
+                #
+                # It cannot fix everything this turn does wrong. Of the four recorded failures at
+                # depth -- 62 characters of prose, a tool call emitted as text with the report
+                # nested in its arguments, reasoning truncated mid-sentence, and an empty response
+                # -- a grammar precludes the first two and is powerless against the last two,
+                # which are budget and transport. Half, by count, and the honest expectation.
+                #
+                # There is also a reason it might make things WORSE, which is why it is an arm and
+                # not a default: 18 of the 99 completions llama.cpp discarded overnight were a
+                # `final` message tagged `<|constrain|>json`, which is what harmony emits when it
+                # has been told to produce JSON. Asking for constrained JSON may raise the rate of
+                # the very fault that eats reports.
+                enforced = None
+                if os.environ.get("NATIVE_RESPONSE_FORMAT"):
+                    enforced = {"type": "json_schema",
+                                "json_schema": {"name": "report", "schema": schema,
+                                                "strict": True}}
                 body = call_model_retrying(args.host, args.port, args.model,
                                            messages + [{"role": "user", "content": ask}],
                                            [], args.temp, args.timeout, log,
-                                           f"report-{attempt}")
+                                           f"report-{attempt}", enforced)
                 choice = (body.get("choices") or [{}])[0]
                 final = (choice.get("message") or {}).get("content") or ""
                 usage = body.get("usage") or {}
