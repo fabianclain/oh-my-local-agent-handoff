@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""usage — how much local model has actually been spent, from records that already exist.
+
+    tools/usage [--roots DIR ...] [--bench DIR] [--since YYYY-MM-DD] [--json]
+
+Exit 0 with a report, 2 when no source could be read at all.
+
+WHERE THE NUMBERS COME FROM
+
+Nothing new is instrumented. Every round already records what it spent, in two places, and this
+adds them up:
+
+    project journals   <repo>/.handoff/journal/runs.jsonl, one line per attempt, carrying
+                       activity.tokens {input, output}, provider, model, seconds and the slug.
+                       These are the interactive rounds -- real work on real repositories.
+
+    bench results      bench/results/**/metrics and bench/archive/**/metrics, carrying
+                       prompt_tokens, generated_tokens and usage_unattributable. These are the
+                       benchmark rounds, and they are the bulk of the GPU time.
+
+Both are kept per-round rather than aggregated, which is why this tool exists rather than a
+counter: a counter cannot be re-read, corrected, or broken down after the fact, and this project
+has needed to do all three.
+
+THE TWO SOURCES DO NOT MEAN THE SAME THING BY "INPUT", and adding them together is wrong.
+
+    bench prompt_tokens      from llama-server's own `prompt eval time = ... / N tokens`, so it
+                             counts tokens actually EVALUATED. llama.cpp reuses the KV cache for a
+                             shared prefix, so turn 2 of a conversation evaluates only what is new.
+                             This is compute really performed.
+
+    journal activity.input   the sum of the API's usage.prompt_tokens across turns, which reports
+                             the WHOLE context every turn, cached prefix included. A 40-turn round
+                             on a 30k conversation reports over a million input tokens having
+                             evaluated a small fraction of that.
+
+The first version of this tool added them and reported 62.1M input tokens, a figure with no
+referent. They are now reported separately and labelled. OUTPUT tokens are unambiguous -- every
+generated token is generated once -- so that is the headline, and it is the number to use when
+asking how much this machine has actually produced.
+
+WHAT IT REFUSES TO DO
+
+It does not invent a total. `usage_unattributable=1` marks a bench round whose token accounting
+could not be bracketed -- providers/lcpp.sh reads llama-server's log by byte offset, and a
+concurrent round makes that attribution wrong rather than absent. Those rounds are counted
+SEPARATELY and named, because folding them in would report a number that looks complete and is not.
+The same for journal entries whose `activity.tokens` is missing: absent is not zero.
+
+It also does not claim to see rounds that left no record. A project whose `.handoff/` was deleted
+with its worktree, or a bench directory pruned, is simply not here -- so the figure is a floor, and
+the report says so rather than implying completeness.
+
+COST
+
+There is no cost column, deliberately. The model runs on hardware already paid for; a number
+invented from someone else's per-token pricing would be fiction dressed as accounting. Tokens and
+wall-clock are what was actually spent.
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import datetime
+import json
+import pathlib
+import sys
+
+DEFAULT_ROOTS = [pathlib.Path.home() / "dev"]
+DEFAULT_BENCH = pathlib.Path.home() / "dev" / "agent-handoff-bench" / "bench"
+
+
+def read_journals(roots: list[pathlib.Path]) -> tuple[list[dict], list[str]]:
+    """Interactive rounds, one record per attempt."""
+    rows, problems = [], []
+    for root in roots:
+        if not root.is_dir():
+            problems.append(f"{root} does not exist")
+            continue
+        for path in root.glob("*/.handoff/journal/runs.jsonl"):
+            project = path.parts[-4]
+            for line in path.read_text(errors="replace").splitlines():
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    problems.append(f"{path}: a line that is not JSON")
+                    continue
+                tokens = ((entry.get("activity") or {}).get("tokens")) or {}
+                if tokens.get("input") is None and tokens.get("output") is None:
+                    # Recorded, but without usage. Counted as a round and not as zero tokens.
+                    rows.append({"source": "journal", "project": project,
+                                 "when": entry.get("started_at") or entry.get("recorded_at"),
+                                 "model": (entry.get("provider") or {}).get("model"),
+                                 "provider": (entry.get("provider") or {}).get("name"),
+                                 "slug": entry.get("slug"), "seconds": entry.get("seconds") or 0,
+                                 "input": None, "output": None,
+                                 "outcome": entry.get("outcome")})
+                    continue
+                rows.append({"source": "journal", "project": project,
+                             "when": entry.get("started_at") or entry.get("recorded_at"),
+                             "model": (entry.get("provider") or {}).get("model"),
+                             "provider": (entry.get("provider") or {}).get("name"),
+                             "slug": entry.get("slug"), "seconds": entry.get("seconds") or 0,
+                             "input": tokens.get("input") or 0,
+                             "output": tokens.get("output") or 0,
+                             "outcome": entry.get("outcome")})
+    return rows, problems
+
+
+def read_bench(bench: pathlib.Path) -> tuple[list[dict], list[str]]:
+    """Benchmark rounds, from the metrics file each one writes."""
+    rows, problems = [], []
+    if not bench.is_dir():
+        return rows, [f"{bench} does not exist"]
+    for metrics in bench.rglob("metrics"):
+        fields: dict[str, str] = {}
+        for line in metrics.read_text(errors="replace").splitlines():
+            if "=" in line:
+                key, _, value = line.partition("=")
+                fields[key.strip()] = value.strip()
+        if "generated_tokens" not in fields:
+            continue
+        parts = metrics.parts
+        plan = parts[parts.index("metrics") - 3] if "metrics" in parts else "?"
+        arm = parts[parts.index("metrics") - 2] if "metrics" in parts else "?"
+        stamp = None
+        timing = metrics.parent / "timing"
+        if timing.is_file():
+            for line in timing.read_text(errors="replace").splitlines():
+                if line.startswith("started_epoch="):
+                    stamp = datetime.datetime.fromtimestamp(
+                        int(line.split("=", 1)[1])).isoformat()
+        unattributable = fields.get("usage_unattributable") == "1"
+        rows.append({"source": "bench", "project": f"bench/{plan}", "when": stamp,
+                     "model": None, "provider": arm, "slug": plan,
+                     "seconds": int(fields.get("seconds") or 0),
+                     "input": None if unattributable else int(fields.get("prompt_tokens") or 0),
+                     "output": None if unattributable else int(fields.get("generated_tokens") or 0),
+                     "outcome": fields.get("outcome")})
+    return rows, problems
+
+
+def human(n: int) -> str:
+    for unit, size in (("B", 1_000_000_000), ("M", 1_000_000), ("k", 1_000)):
+        if abs(n) >= size:
+            return f"{n / size:.1f}{unit}"
+    return str(n)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--roots", nargs="*", type=pathlib.Path, default=DEFAULT_ROOTS)
+    parser.add_argument("--bench", type=pathlib.Path, default=DEFAULT_BENCH)
+    parser.add_argument("--since", help="YYYY-MM-DD, inclusive")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+
+    rows, problems = read_journals(args.roots)
+    bench_rows, bench_problems = read_bench(args.bench)
+    rows += bench_rows
+    problems += bench_problems
+
+    if not rows:
+        print("UNKNOWN  no journals and no bench metrics were readable, so nothing was counted.",
+              file=sys.stderr)
+        print("         This is not 'no usage'. Check --roots and --bench.", file=sys.stderr)
+        return 2
+
+    if args.since:
+        rows = [r for r in rows if (r["when"] or "") >= args.since]
+
+    counted = [r for r in rows if r["input"] is not None]
+    unknown = [r for r in rows if r["input"] is None]
+    evaluated = [r for r in counted if r["source"] == "bench"]
+    presented = [r for r in counted if r["source"] == "journal"]
+
+    if args.json:
+        print(json.dumps({
+            "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            "rounds": len(rows), "rounds_counted": len(counted),
+            "rounds_without_usage": len(unknown),
+            # Deliberately not one "input_tokens" field. See the header: the two sources count
+            # different things and a consumer adding them would reproduce the bug this had.
+            "output_tokens": sum(r["output"] for r in counted),
+            "input_tokens_evaluated": sum(r["input"] for r in evaluated),
+            "input_tokens_presented": sum(r["input"] for r in presented),
+            "seconds": sum(r["seconds"] for r in rows),
+            "notes": problems,
+            "detail": rows}, indent=2))
+        return 0
+
+    total_out = sum(r["output"] for r in counted)
+    in_evaluated = sum(r["input"] for r in evaluated)
+    in_presented = sum(r["input"] for r in presented)
+    seconds = sum(r["seconds"] for r in rows)
+
+    print(f"{len(rows)} round(s) recorded"
+          + (f", {args.since} onward" if args.since else ""))
+    print(f"  OUTPUT  {human(total_out):>8}  ({total_out:,} tokens generated)")
+    print()
+    print("  input, which the two sources count differently and which must not be added:")
+    print(f"    evaluated  {human(in_evaluated):>8}  ({len(evaluated)} bench rounds; cache misses "
+          "only, so compute really done)")
+    print(f"    presented  {human(in_presented):>8}  ({len(presented)} interactive rounds; the "
+          "whole context re-counted every turn)")
+    print(f"  time    {seconds / 3600:>7.1f}h  ({seconds:,} seconds of round wall-clock)")
+    if seconds:
+        print(f"  rate    {total_out / seconds:>7.1f}  output tokens per second of round time")
+
+    if unknown:
+        # Named, never folded in. A round whose accounting could not be bracketed is not a round
+        # that spent nothing, and a total that quietly included it as zero would be wrong in the
+        # direction that looks tidy.
+        print(f"\n  {len(unknown)} round(s) have NO usable token count and are excluded from the")
+        print("  totals above — recorded, but their accounting could not be bracketed. The")
+        print("  figures are a floor, not a complete account.")
+
+    print("\nby project")
+    by_project: dict[str, list[dict]] = collections.defaultdict(list)
+    for row in counted:
+        by_project[row["project"]].append(row)
+    for project, group in sorted(by_project.items(),
+                                 key=lambda kv: -sum(r["output"] for r in kv[1])):
+        out = sum(r["output"] for r in group)
+        inp = sum(r["input"] for r in group)
+        print(f"  {project:28} {len(group):4} rounds  in {human(inp):>7}  out {human(out):>7}")
+
+    print("\nby day")
+    by_day: dict[str, list[dict]] = collections.defaultdict(list)
+    for row in counted:
+        by_day[(row["when"] or "?")[:10]].append(row)
+    for day, group in sorted(by_day.items())[-14:]:
+        out = sum(r["output"] for r in group)
+        inp = sum(r["input"] for r in group)
+        print(f"  {day:12} {len(group):4} rounds  in {human(inp):>7}  out {human(out):>7}")
+
+    if problems:
+        print("\nsources that could not be read:")
+        for problem in problems:
+            print(f"  {problem}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
