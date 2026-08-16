@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+#
+# refuse-destructive-selftest — the guard still refuses what it claims to, and still permits what
+# it claims to.
+#
+#   tools/refuse-destructive-selftest
+#
+# The permitted half matters as much as the refused half. A denylist that fires on
+# `php artisan migrate` or on a grep FOR a dangerous string is one a reader will route around,
+# and a routed-around gate protects nothing. Both directions are asserted here so that tightening
+# a pattern cannot quietly start refusing ordinary criteria.
+
+set -uo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+TOOL="$HERE/refuse-destructive"
+FAILED=0
+
+refuses() {
+    local command="$1"
+    if printf '%s\n' "$command" | "$TOOL" >/dev/null 2>&1; then
+        printf 'FAIL  should be REFUSED but passed:  %s\n' "$command"
+        FAILED=$((FAILED + 1))
+    fi
+}
+
+permits() {
+    local command="$1" out
+    if ! out="$(printf '%s\n' "$command" | "$TOOL" 2>&1)"; then
+        printf 'FAIL  should be PERMITTED but was refused:  %s\n' "$command"
+        printf '%s\n' "$out" | sed -n '3p' | sed 's/^/        /'
+        FAILED=$((FAILED + 1))
+    fi
+}
+
+[[ -x "$TOOL" ]] || { echo "no refuse-destructive at $TOOL" >&2; exit 1; }
+
+# --- the incident this was written for ---------------------------------------------------------
+refuses 'php artisan migrate:fresh'
+refuses 'php artisan migrate:fresh --seed && php artisan test'
+refuses 'php artisan migrate:refresh'
+refuses 'php artisan db:wipe'
+refuses 'bash -c "php artisan migrate:fresh"'
+
+# --- the tree the gates are about to judge -----------------------------------------------------
+refuses 'git reset --hard HEAD'
+refuses 'git checkout .'
+refuses 'git checkout -- .'
+refuses 'git restore .'
+refuses 'git clean -fd'
+refuses 'git stash'
+refuses 'rm -rf storage/framework/views'
+refuses 'rm -r public/build'
+
+# --- the reviewer owns the commit --------------------------------------------------------------
+refuses 'git commit -am "step 1"'
+refuses 'git push origin main'
+refuses 'git branch -D feature'
+
+# --- data outside the tree ---------------------------------------------------------------------
+refuses 'psql -c "DROP TABLE crawl_pages"'
+refuses 'sqlite3 database/database.sqlite "DROP DATABASE x"'
+refuses 'psql -c "TRUNCATE TABLE users"'
+refuses 'dropdb monolith'
+refuses 'docker rm crawler'
+refuses 'pkill -f llama-server'
+refuses 'systemctl --user stop monolith-llama'
+
+# --- ordinary criteria, which must keep working ------------------------------------------------
+permits 'php artisan migrate --force'
+permits 'php artisan migrate --pretend | grep -q "create table"'
+permits 'php artisan test --compact --filter=ChartTest'
+permits 'vendor/bin/pint --dirty --test'
+permits 'git diff --stat | tail -1'
+permits 'git status --porcelain | wc -l | grep -qE "^\s*3$"'
+permits 'git diff --name-only HEAD | grep -c . | grep -qE "^2$"'
+permits 'cargo test --manifest-path crawler/Cargo.toml'
+permits 'npm run build'
+permits 'php -l app/Services/Chart.php'
+permits 'grep -q "bucket_start" database/migrations/*_buckets.php'
+
+# The false positive that would discredit the whole gate: a criterion asserting nobody wrote the
+# dangerous thing. Every one of these NAMES a refused command and must still be permitted.
+permits 'grep -rc "migrate:fresh" .claude/plans/ | grep -qv ":0$"'
+permits "grep -c 'git commit' tools/local-drive | grep -qE '^0$'"
+permits 'rg -q "rm -rf" scripts/ && echo found'
+permits 'awk "/DROP TABLE/ {n++} END {exit n>0}" schema.sql'
+permits 'sed -n "s/git push//p" README.md | wc -l'
+
+echo
+if (( FAILED > 0 )); then
+    echo "$FAILED case(s) wrong."
+    exit 1
+fi
+echo "refuse-destructive: every case correct."

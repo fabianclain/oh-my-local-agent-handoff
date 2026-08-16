@@ -22,9 +22,23 @@
 # Every expression below is copied from bench/run, deliberately and character for character. A
 # checker that parsed plans its own way would approve plans the harness rejects, which is worse
 # than no checker. If bench/run's parsing changes, change it here in the same commit —
-# tools/check-plan-selftest asserts the two agree on the repository's own plans.
+# there is no tools/check-plan-selftest — an earlier version of this comment claimed there was,
+# which is worse than none, because it tells a reader the drift is already guarded against.
+#
+# ## Refusing, as distinct from rejecting
+#
+# Below the shape checks there is one thing this refuses on content: an acceptance command that
+# destroys something. That is not a shape problem and would sit more naturally in plan-lint, except
+# that plan-lint never refuses — and `handoff prepare` EXECUTES every criterion as a dry run
+# immediately after this runs. An advisory note would be printed and then the command would run.
+# See tools/refuse-destructive.
 
 set -uo pipefail
+
+# Where the sibling tools are. `readlink -f` because bin/handoff calls this by absolute path but a
+# reader may well call it through a symlink, and a checker that cannot find refuse-destructive
+# would silently stop refusing.
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 
 FAILED=0
 CHECKED=0
@@ -71,6 +85,18 @@ check_one() {
     criteria="$(criteria_count "$plan")"
     commands="$(verification_commands "$plan" | grep -c .)"
     paths="$(allowed_paths "$plan" | grep -c .)"
+
+    # Before anything about shape, and before the caller reaches `prepare` — which would EXECUTE
+    # these. Reported separately rather than folded into `problems` because the reason is long and
+    # names each command; a one-line "has a destructive command" would send the reader hunting.
+    if (( commands > 0 )) && [[ "${HANDOFF_ALLOW_DESTRUCTIVE:-}" != "1" ]]; then
+        if ! DESTRUCTIVE="$(verification_commands "$plan" | "$HERE/refuse-destructive")"; then
+            FAILED=$((FAILED + 1))
+            printf 'REFUSE   %s\n' "$plan"
+            printf '%s\n' "$DESTRUCTIVE"
+            return
+        fi
+    fi
 
     (( criteria > 0 )) || problems+=("no '- [ ]' checklist criteria")
     (( commands > 0 )) || problems+=("no commands in a fenced block under '## Verification'")

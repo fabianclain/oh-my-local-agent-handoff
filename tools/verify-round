@@ -261,6 +261,28 @@ awk '
     in_block && NF { print }
 ' "$PLAN_FILE" >"$VERIFY_CMDS"
 
+# Nothing below this line asks permission, so the refusal has to come above it.
+#
+# `handoff prepare` runs check-plan first and would already have refused. `handoff do` does not:
+# it hands the plan straight to the model and verifies afterwards, which makes THIS the last point
+# at which a criterion like `migrate:fresh` can be stopped, and the first at which it would run.
+# Both entry points call the same scanner so they cannot drift.
+REFUSAL_TOOL="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/refuse-destructive"
+if [[ -s "$VERIFY_CMDS" && -x "$REFUSAL_TOOL" && "${HANDOFF_ALLOW_DESTRUCTIVE:-}" != "1" ]]; then
+    REFUSAL_OUT="$OUT_DIR/refused-destructive.log"
+    if ! "$REFUSAL_TOOL" <"$VERIFY_CMDS" >"$REFUSAL_OUT" 2>&1; then
+        cat "$REFUSAL_OUT" >&2
+        # Emptied, not skipped: an empty command list makes the block below record the round as
+        # having no passing criteria, which is the verdict a plan that cannot be run deserves.
+        # Reporting it as "skipped" would let it read as an accepted round with nothing to check.
+        : >"$VERIFY_CMDS"
+        record "acceptance" "fail" \
+            "refused: the plan contains a destructive acceptance command — see refused-destructive.log" \
+            "" "$REFUSAL_OUT"
+        REFUSED_DESTRUCTIVE=1
+    fi
+fi
+
 if [[ -s "$VERIFY_CMDS" ]]; then
     IDX=0; PASSED=0; TOTAL=0
     while IFS= read -r command; do
@@ -293,7 +315,7 @@ if [[ -s "$VERIFY_CMDS" ]]; then
     done <"$VERIFY_CMDS"
     record "acceptance" "$([[ "$PASSED" -eq "$TOTAL" ]] && echo pass || echo fail)" \
         "$PASSED of $TOTAL acceptance commands passed"
-else
+elif [[ -z "${REFUSED_DESTRUCTIVE:-}" ]]; then
     record "acceptance" "skipped" "the plan declares no verification commands"
 fi
 

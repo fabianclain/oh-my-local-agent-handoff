@@ -720,6 +720,36 @@ service-and-view step becomes a service step and a view step.
 loop does not yet. Treat it as the best available reasoning, and be ready to find it wrong — two
 other plausible improvements to the retry path already were.
 
+## Criteria are executed, twice, and nothing asks you first
+
+An acceptance criterion is not a description of a check. It is a command, and two different parts
+of the harness run it against the live tree with approval disabled:
+
+- `handoff prepare` runs every one of them as a dry run **before the model does anything**;
+- the gates run them again afterwards.
+
+So a criterion is the most dangerous line in a plan. A reviewer wrote `php artisan migrate:fresh`
+as one, on a repository whose `.env` pointed at a live Postgres database holding 977,526 crawled
+pages. `prepare` would not have warned about it — prepare's job is to run each criterion and report
+what it saw, so the more careful half of the workflow would have destroyed the database first and
+then reported, accurately, that the criterion passed.
+
+`check-plan` now refuses a plan containing one, and so do `handoff prepare`, `handoff sequence` and
+the gates themselves. But the refusal list is a denylist and cannot be complete, so **read your own
+criteria for what they will do, not only for what they assert.** The test is whether anything is
+lost that the tree, git, or a re-run cannot bring back.
+
+Assert the same thing without the damage:
+
+| instead of | write |
+| --- | --- |
+| `php artisan migrate:fresh` | `php artisan migrate --pretend`, plus a test that the migration file exists |
+| `git commit -am wip` | `git status --porcelain` shows the expected files — the reviewer commits |
+| `rm -rf <path>` | assert what should be absent, rather than making it absent |
+
+`HANDOFF_ALLOW_DESTRUCTIVE=1` exists for the case where every such command genuinely points at a
+throwaway database. Setting it because a refusal is in the way is how the database goes.
+
 ## Acceptance commands that read tool output must not grep for colour
 
 The harness runs every acceptance command with `NO_COLOR=1`, `TERM=dumb` and `CLICOLOR=0`. **That

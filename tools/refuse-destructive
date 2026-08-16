@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+#
+# refuse-destructive — acceptance commands that must never be run, whatever else is true.
+#
+#   verification_commands plan.md | tools/refuse-destructive [--source <label>]
+#
+# Exits 0 when every command is safe, 1 when any is not. Reads one command per line on stdin.
+#
+# ## Why this exists
+#
+# An acceptance criterion is not a suggestion to the harness. `verify-round` executes every one of
+# them against the live working tree, with approval disabled, and `handoff prepare` executes them
+# a second time as a dry run BEFORE the model has done anything. Both are automatic. Nothing
+# between a plan and a running command asks a human whether that command is a good idea.
+#
+# A reviewer wrote `php artisan migrate:fresh` as a criterion on a repository whose `.env` pointed
+# the crawler connection at a live Postgres database holding 977,526 crawled pages. It was caught
+# by reading, not by any gate. `handoff prepare` would not have warned about it — prepare's job is
+# to run each criterion and report what it saw, so prepare would have DESTROYED the database and
+# then reported, accurately, that the command passed.
+#
+# That is the whole shape of the hazard: the more thorough half of this harness is the half that
+# executes the dangerous thing earliest. So the check has to come before both execution points, and
+# it has to refuse rather than warn.
+#
+# ## What belongs on this list
+#
+# Only commands whose damage outlives the round. A criterion that is merely wrong costs a round and
+# is recoverable — that is what the gates are for, and refusing those would make this a linter and
+# get it bypassed. The test for inclusion is: if this runs by accident, is anything lost that the
+# working tree, git, or a re-run cannot bring back?
+#
+# By that test `php artisan migrate` stays allowed and `migrate:fresh` does not; `git diff` stays
+# allowed and `git reset --hard` does not.
+#
+# The list grows from incidents. Each entry names its own reason, because a refusal a reader cannot
+# evaluate is one they will work around.
+#
+# ## Quoted patterns are not commands
+#
+# `grep -c 'migrate:fresh' plans/*.md` is a legitimate criterion — it asserts nobody wrote the
+# dangerous thing. Refusing it would be the false positive that discredits the whole gate, so
+# quoted spans are stripped before matching, but ONLY on lines that invoke a text-matching tool.
+# Everywhere else quotes are kept, so `bash -c "php artisan migrate:fresh"` is still caught.
+#
+# The residual gap is deliberate: `grep x && php artisan db:wipe` is caught, because stripping the
+# grep pattern leaves the second command intact. What escapes is a destructive command quoted as an
+# argument to grep itself, which is evasion rather than accident, and accident is the threat here.
+
+set -uo pipefail
+
+SOURCE="acceptance command"
+[[ "${1:-}" == "--source" ]] && { SOURCE="$2"; shift 2; }
+
+# pattern <TAB> what it destroys
+#
+# Extended regular expressions, matched case-insensitively against one command line.
+RULES=$(cat <<'RULES'
+(migrate:fresh|migrate:reset|migrate:refresh|db:wipe)	drops every table in the configured database — and the configured database is whatever .env points at, not a test one
+\bdrop(db|user)\b	removes a database or role outright
+\bdrop[[:space:]]+(table|database|schema)\b	SQL that destroys a table, database or schema
+\btruncate[[:space:]]+(table[[:space:]]+)?[a-z_]	empties a table; the rows are not in git
+\brm[[:space:]]+(-[^[:space:]]+[[:space:]]+)*-[^[:space:]]*[rR][^[:space:]]*[[:space:]]	recursive delete, in a tree the harness is about to judge
+\bgit[[:space:]]+reset[[:space:]]+--hard\b	discards the implementer's work and the verdict with it
+\bgit[[:space:]]+clean\b	deletes untracked files — which is where the new files of a create round live
+\bgit[[:space:]]+checkout[[:space:]]+(--[[:space:]]+)?\.(\s|$)	reverts the entire tree being measured
+\bgit[[:space:]]+restore[[:space:]]+(--[^[:space:]]+[[:space:]]+)*\.(\s|$)	reverts the entire tree being measured
+\bgit[[:space:]]+stash\b	hides the change under test; the gates then measure an unmodified tree
+\bgit[[:space:]]+push\b	publishes from inside a criterion, before anyone has read the result
+\bgit[[:space:]]+commit\b	the implementer never commits — the reviewer owns the commit, and a criterion that commits destroys the scope gate's baseline
+\bgit[[:space:]]+branch[[:space:]]+-[dD]\b	deletes a branch
+\bgit[[:space:]]+rebase\b	rewrites history mid-round
+\bdocker[[:space:]]+(rm|rmi|kill|system[[:space:]]+prune|volume[[:space:]]+rm)\b	destroys a container, image or volume the machine may be relying on
+\b(pkill|killall)\b	kills by name; it has already killed a shell in this project's own benchmark
+\bsystemctl[[:space:]]+(--user[[:space:]]+)?(stop|disable|mask)\b	stops a service that other work on this machine is using
+\bmkfs\b|\bdd[[:space:]]+if=	writes over a device
+RULES
+)
+
+TEXT_TOOL='(^|[[:space:]|(])(grep|egrep|fgrep|rg|ag|ack|awk|sed|jq)([[:space:]]|$)'
+
+FOUND=0
+IDX=0
+
+while IFS= read -r command; do
+    [[ -n "${command//[[:space:]]/}" ]] || continue
+    IDX=$((IDX + 1))
+
+    # See the header: strip quoted spans only where they are plausibly search patterns.
+    scan="$command"
+    if [[ "$scan" =~ $TEXT_TOOL ]]; then
+        scan="$(printf '%s' "$scan" | sed -E "s/'[^']*'/''/g; s/\"[^\"]*\"/\"\"/g")"
+    fi
+
+    while IFS=$'\t' read -r pattern reason; do
+        [[ -n "$pattern" ]] || continue
+        if printf '%s' "$scan" | grep -qiE "$pattern"; then
+            if (( FOUND == 0 )); then
+                echo "REFUSED  destructive ${SOURCE}(s):"
+            fi
+            FOUND=$((FOUND + 1))
+            printf '  %2d  %s\n' "$IDX" "$command"
+            printf '      ^ %s\n' "$reason"
+            break                 # one reason per command is enough to refuse it
+        fi
+    done <<<"$RULES"
+done
+
+if (( FOUND > 0 )); then
+    cat <<'WHY'
+
+These are executed automatically — by `handoff prepare` before the model runs, and by the gates
+after it. Nothing asks first. Rewrite the criterion to assert the same thing without the damage:
+
+  migrate:fresh   ->  assert the migration file exists and `php artisan migrate --pretend` succeeds
+  git commit      ->  assert `git status --porcelain` shows the expected files; the reviewer commits
+  rm -rf          ->  assert what should be absent, rather than making it absent
+
+Set HANDOFF_ALLOW_DESTRUCTIVE=1 only when every command above is pointed at a database or tree you
+are willing to lose.
+WHY
+    exit 1
+fi
+
+exit 0
