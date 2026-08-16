@@ -258,7 +258,9 @@ cmd_calibrate() {
 
         local pid rss=""
         pid="$(pgrep -f "$LLAMA_SERVER" 2>/dev/null | head -1)"
-        [[ -z "$pid" ]] || rss="$(awk '/^VmRSS:/{print $2}' "/proc/$pid/status" 2>/dev/null)"
+        # RssAnon, not VmRSS -- see cmd_residency. The mmapped GGUF is file-backed and is not
+        # a spill.
+        [[ -z "$pid" ]] || rss="$(awk '/^RssAnon:/{print $2}' "/proc/$pid/status" 2>/dev/null)"
         if ! cmd_residency "$LOG" "$rss" >/dev/null 2>&1; then
             echo "spilled out of VRAM — stopping here"
             break
@@ -345,10 +347,19 @@ cmd_residency() {
         problems=$(( problems + 1 ))
     fi
 
+    # ANONYMOUS rss only. llama.cpp mmaps the GGUF, so the model file's page cache is file-backed
+    # and lands in RssFile; counting it made this check reject a model that was entirely on the
+    # card. Measured on a fully resident gpt-oss: VmRSS 1.19 GB, RssFile 0.81 GB, RssAnon 0.38 GB,
+    # with nvidia-smi reporting all 12,756 MiB on the GPU. A model read from ollama's blob store
+    # carries even more page cache -- 2.2 GB -- and was reported as "at least partly in host
+    # memory" while running at 94-96% GPU and 14% of one CPU core. That verdict nearly bought a
+    # needless 10 GB download of a smaller quant, and the throughput evidence contradicting it was
+    # sitting in the same terminal.
     if [[ -n "$rss_kb" ]] && [[ "$rss_kb" =~ ^[0-9]+$ ]] && (( rss_kb > 2000000 )); then
-        printf '  WARNING: llama-server holds %.1f GB of host RAM. A GPU-resident model holds well\n' \
+        printf '  WARNING: llama-server holds %.1f GB of ANONYMOUS host memory. A GPU-resident\n' \
             "$(awk -v k="$rss_kb" 'BEGIN{print k/1048576}')"
-        echo "           under 1 GB here, so the model is at least partly in host memory."
+        echo "           model holds well under 1 GB here, so weights or KV are in host RAM."
+        echo "           (File-backed pages are excluded: the mmapped GGUF is not a spill.)"
         problems=$(( problems + 1 ))
     fi
 
@@ -413,9 +424,47 @@ cmd_start() {
 
     mkdir -p "$STATE_DIR"
 
-    # The context this run is asking for, recorded before anything starts. The unit reads it, and
-    # `status` reports against it, so there is one statement of what is being served.
+    # The context this run is asking for, recorded before anything starts, because the unit reads
+    # it on the way up and `status` reports against it.
+    #
+    # Kept recoverable, because a start that FAILS used to leave this file describing a server that
+    # never came up. `start lfm2.5-8b 65536` failed on a busy port, wrote 65536, and the gpt-oss
+    # server that came back a moment later read it and served 65536 where the session had been
+    # running 98304 -- a silent stack change, which is the confound that cost an overnight queue
+    # forty minutes once and is exactly what HANDOFF_EXPECT_CTX exists to catch.
+    local previous_context=""
+    [[ -f "$CONTEXT_FILE" ]] && previous_context="$(cat "$CONTEXT_FILE" 2>/dev/null)"
+    _restore_context() {
+        if [[ -n "$previous_context" ]]; then
+            printf '%s\n' "$previous_context" >"$CONTEXT_FILE"
+            echo "note: start failed; context file left at $previous_context, as it was." >&2
+        else
+            rm -f "$CONTEXT_FILE"
+        fi
+    }
     printf '%s\n' "$context" >"$CONTEXT_FILE"
+
+    # The unit names ONE model in its ExecStart. Restarting it to serve a different one starts the
+    # unit's model instead, silently: `start lfm2.5-8b` brought up gpt-oss three times running,
+    # each looking like a different failure, and the state file then recorded gpt-oss so nothing
+    # downstream noticed either. Serving something other than what was asked for is worse than
+    # refusing, so take the manual path instead of delegating.
+    if unit_present; then
+        local unit_model
+        unit_model="$(systemctl --user cat "$UNIT" 2>/dev/null \
+            | sed -n 's|^ExecStart=.*llamacpp-serve  *foreground  *\([^ ]*\).*|\1|p' | head -1)"
+        if [[ -n "$unit_model" && "$unit_model" != "$model" ]]; then
+            echo "note: $UNIT is defined for '$unit_model', not '$model'." >&2
+            echo "      Starting it directly instead of through systemd, so the model you asked" >&2
+            echo "      for is the model that runs. Stopping the unit first." >&2
+            systemctl --user stop "$UNIT" 2>/dev/null
+            local waited=0
+            while systemctl --user is-active --quiet "$UNIT" && (( waited < 20 )); do
+                sleep 1; waited=$(( waited + 1 ))
+            done
+            UNIT="__bypassed__"
+        fi
+    fi
 
     if unit_present; then
         # systemd owns the process. Restarting through it evicts ollama via ExecStartPre and
@@ -423,6 +472,7 @@ cmd_start() {
         printf '%s\n' "$model" >"$SERVING"
         if ! systemctl --user restart "$UNIT" 2>&1; then
             echo "systemctl --user restart $UNIT failed" >&2
+            _restore_context
             return 1
         fi
     else
@@ -456,6 +506,7 @@ cmd_start() {
                 echo "  asked for: $gguf" >&2
                 echo "  serving:   ${serving_path:-<unknown>}" >&2
                 echo "A previous llama-server is still holding the port. Run 'llamacpp-serve stop'." >&2
+                _restore_context
                 return 1
             fi
             printf '%s\n' "$model" >"$SERVING"
@@ -464,7 +515,9 @@ cmd_start() {
                 sed 's/^/  GPU: /'
             local pid rss=""
             pid="$(pgrep -f "$LLAMA_SERVER" 2>/dev/null | head -1)"
-            [[ -z "$pid" ]] || rss="$(awk '/^VmRSS:/{print $2}' "/proc/$pid/status" 2>/dev/null)"
+            # RssAnon, not VmRSS -- see cmd_residency. The mmapped GGUF is file-backed and is not
+        # a spill.
+        [[ -z "$pid" ]] || rss="$(awk '/^RssAnon:/{print $2}' "/proc/$pid/status" 2>/dev/null)"
             cmd_residency "$LOG" "$rss" || true
             return 0
         fi
@@ -473,6 +526,7 @@ cmd_start() {
     done
     echo "llama-server failed to become healthy; last log lines:" >&2
     tail -5 "$LOG" >&2
+    _restore_context
     return 1
 }
 
