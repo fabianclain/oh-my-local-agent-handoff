@@ -125,7 +125,7 @@ run_bench() {
     rm -rf "${CLONE:?}/bench/results/harness-selftest"
     (
         cd "$CLONE"
-        # Its own TMPDIR: bench/run takes a lock at $TMPDIR/agent-handoff-bench.lock, and a live
+        # Its own TMPDIR: bench/run takes a lock at $TMPDIR/agent-handoff-gpu.lock, and a live
         # benchmark on this machine holds the real one.
         TMPDIR="$SANDBOX/tmp-$label" \
         STUB_PROMPT_LOG="$PROMPT_LOG" \

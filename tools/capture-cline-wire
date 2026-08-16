@@ -46,7 +46,7 @@ while (( $# > 0 )); do
 done
 
 # The refusal that matters. See the header.
-if ! flock -n "${TMPDIR:-/tmp}/agent-handoff-bench.lock" -c true 2>/dev/null; then
+if ! flock -n "${TMPDIR:-/tmp}/agent-handoff-gpu.lock" -c true 2>/dev/null; then
     echo "a benchmark is running and holds the bench lock." >&2
     echo "A capture would share the GPU with it AND put its completions into the same" >&2
     echo "llama-server log that tools/peg-audit counts, corrupting that run's fault rate." >&2

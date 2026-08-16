@@ -91,7 +91,7 @@ tools/harness-selftest tools/feedback-selftest tools/patch-shape-selftest tools/
 
 **Never `pgrep -f` for a string your own command line contains.** A waiter written as
 `while pgrep -f "bench/run --plan wide"` matches itself and never exits; the same mistake as
-`pkill -f` killed a shell. Use `flock -n "${TMPDIR:-/tmp}/agent-handoff-bench.lock" true`, which
+`pkill -f` killed a shell. Use `flock -n "${TMPDIR:-/tmp}/agent-handoff-gpu.lock" true`, which
 succeeds exactly when no benchmark is running.
 
 **`cd` explicitly in every command.** Two documentation appends landed in the benchmark clone,

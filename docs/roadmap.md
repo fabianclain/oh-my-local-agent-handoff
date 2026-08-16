@@ -583,7 +583,7 @@ retry's feedback into the results.
 `while pgrep -f "bench/run --plan wide"; do sleep 60; done` matches itself and can never exit. Two
 of them ran for 47 and 25 minutes past the end of the round they were watching, and the round's
 completion went unnoticed for a quarter of an hour. The same mistake then killed a shell outright
-via `pkill -f`. Use the lock instead — `flock -n "${TMPDIR:-/tmp}/agent-handoff-bench.lock" true`
+via `pkill -f`. Use the lock instead — `flock -n "${TMPDIR:-/tmp}/agent-handoff-gpu.lock" true`
 succeeds exactly when no benchmark is running, and cannot match anything.
 
 **Check `cwd` before a redirect.** Two documentation appends went to the benchmark clone instead of

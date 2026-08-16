@@ -23,7 +23,14 @@ set -euo pipefail
 # continuously — so they measure contention rather than the model.
 if [[ -z "${BENCH_LOCK_HELD:-}" ]]; then
     export BENCH_LOCK_HELD=1
-    BENCH_LOCK="${TMPDIR:-/tmp}/agent-handoff-bench.lock"
+    # The SAME file bin/handoff locks, not a bench-private one.
+    #
+    # These were two different paths -- agent-handoff-bench.lock and agent-handoff-gpu.lock -- so a
+    # benchmark and an interactive round could run at once, which is exactly the overlap the
+    # token-accounting comment in providers/lcpp.sh says makes both sets of numbers wrong. A commit
+    # message claimed they already serialised; they did not, and the claim was caught by reading
+    # the two literals side by side rather than by anything failing.
+    BENCH_LOCK="${TMPDIR:-/tmp}/agent-handoff-gpu.lock"
     exec flock --close -w "${BENCH_LOCK_WAIT:-600}" "$BENCH_LOCK" "$0" "$@"
 fi
 

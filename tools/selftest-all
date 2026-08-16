@@ -99,6 +99,37 @@ check_literal "the Files-to-touch heading" '/\^## Files to touch\[\[:space:\]\]\
 check_literal "the criteria pattern"       "\^- \\\\\[ \\\\\]"
 if [[ "$MISMATCH" -eq 0 ]]; then echo "pass"; else echo "FAIL"; FAILED+=("plan-parser agreement"); fi
 
+printf '%-24s ' "lock-path agreement"
+# The invariant: every place that takes, waits on, or probes the serialising lock names the SAME
+# file. bench/run and bin/handoff were unified onto one lock and four other sites were left on the
+# retired name -- two runtime guards (sync-bench-clone, capture-cline-wire) that could therefore
+# never refuse, and two operator instructions telling a future session to probe a lock nobody
+# takes. A guard that cannot fail is worse than no guard.
+#
+# Stated as agreement rather than as a blacklist of the old name, for two reasons. A blacklist
+# cannot see a THIRD name being introduced, which is the same defect again. And it cannot tell a
+# live reference from a comment explaining the history -- the first draft of this check failed on
+# three files that merely describe the change, which is precisely the mistake the plan-parser
+# check above already records against itself.
+#
+# Comments are stripped, so prose about the retired lock is free; only executable references count.
+NAMES="$(grep -rhoE '^[^#]*agent-handoff-[a-z]+\.lock' --exclude-dir=.git --exclude=selftest-all . 2>/dev/null \
+         | grep -oE 'agent-handoff-[a-z]+\.lock' | sort -u)"
+if [[ -z "$NAMES" ]]; then
+    echo "FAIL"; echo "      no lock reference found at all -- this check is no longer looking at anything"
+    FAILED+=("lock-path agreement")
+elif [[ "$(wc -l <<<"$NAMES")" -ne 1 ]]; then
+    echo "FAIL"
+    echo "      the serialising lock is referred to by more than one name, so at least one"
+    echo "      guard is watching a file nobody locks:"
+    sed 's/^/        /' <<<"$NAMES"
+    grep -rnE "^[^#]*agent-handoff-[a-z]+\.lock" --exclude-dir=.git --exclude=selftest-all . 2>/dev/null \
+        | sed 's/^/        /' | head -8
+    FAILED+=("lock-path agreement")
+else
+    echo "pass ($NAMES)"
+fi
+
 echo
 if (( ${#FAILED[@]} )); then
     echo "BROKEN: ${FAILED[*]}"

@@ -21,7 +21,11 @@ SOURCE="$(git -C "$HERE" rev-parse --show-toplevel)"
 
 [[ -d "$CLONE/.git" ]] || { echo "not a git repository: $CLONE" >&2; exit 1; }
 
-if ! flock -n "${TMPDIR:-/tmp}/agent-handoff-bench.lock" true 2>/dev/null; then
+# The GPU lock, which is the one bench/run and bin/handoff both take. It was
+# agent-handoff-bench.lock until the two were unified, and this line was not moved with them -- so
+# for a day this refusal checked a file nobody locked and therefore always allowed the sync. A
+# guard that cannot fail is worse than no guard; tools/selftest-all now asserts these agree.
+if ! flock -n "${TMPDIR:-/tmp}/agent-handoff-gpu.lock" true 2>/dev/null; then
     echo "a benchmark is running; syncing now could corrupt it mid-round" >&2
     exit 1
 fi
