@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""repeat-guard-selftest — the model is told when it is asking the same question again.
+
+    tools/repeat-guard-selftest
+
+THE FAILURE
+
+Three rounds against a 1,052-line component made 66 searches and 8 whole-file reads and wrote
+nothing. The tell was in the arguments the entire time: the identical `read_files` call returning
+the identical 20,028 bytes three times over, and repeated searches for a declaration the tool had
+already reported at line 914. The model could not see that; the harness could.
+
+WHAT IS BEING GUARDED, AND WHAT MUST NOT BE
+
+    1  a repeated call is named          at the first threshold, with the arguments
+    2  identical results are named       "it will return it again" is a stronger claim than
+                                          "you have asked twice", and only sound when true
+    3  a write clears the chain          THE ONE THAT MATTERS. Run tests, fix, run tests again is
+                                          correct behaviour and byte-identical. A counter that
+                                          flagged it would be training the model out of verifying.
+    4  different arguments are not a repeat
+    5  the final threshold escalates     from "try something else" to "record the blocker"
+    6  nothing is said below the first threshold
+    7  the log records the TOOL          the note goes to the model, never into provider.log, or
+                                          twelve analysis tools start measuring the commentary
+    8  a long argument is not truncated INTO a collision — the preview is capped, the key is not
+
+Case 3 is the reason this is not a five-line counter, and case 8 is the reason the key and the
+preview are different strings.
+"""
+
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import io
+import json
+import pathlib
+import sys
+import tempfile
+
+HERE = pathlib.Path(__file__).resolve().parent
+spec = importlib.util.spec_from_loader(
+    "native_agent", importlib.machinery.SourceFileLoader("native_agent", str(HERE / "native-agent")))
+native = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(native)
+
+FAILURES = 0
+
+
+def pas(what: str) -> None:
+    print(f"    PASS: {what}")
+
+
+def bad(what: str, detail: str = "") -> None:
+    global FAILURES
+    FAILURES += 1
+    print(f"    FAIL: {what}")
+    for line in str(detail).splitlines()[:3]:
+        print(f"        {line}")
+
+
+def fresh() -> None:
+    native._repeats.clear()
+
+
+READ = {"files": [{"path": "Big.php"}]}
+
+print("==> 1/8 a repeated call is named at the first threshold")
+fresh()
+notes = [native.repeat_note("read_files", READ, "same bytes") for _ in range(3)]
+if notes[0] or notes[1]:
+    bad("fired before the threshold", notes[0] or notes[1])
+elif not notes[2]:
+    bad("did not fire at the third identical call")
+elif "call 3" not in notes[2] or "read_files" not in notes[2]:
+    bad("fired without saying which call or which tool", notes[2])
+else:
+    pas("silent for two, then names the tool and the count")
+
+print("==> 2/8 an identical result is claimed only when it is identical")
+fresh()
+same = [native.repeat_note("search", {"query": "x"}, "identical") for _ in range(3)][-1]
+fresh()
+varying = [native.repeat_note("search", {"query": "x"}, f"different {n}") for n in range(3)][-1]
+if "byte-for-byte" not in same:
+    bad("identical results were not reported as identical", same)
+elif "byte-for-byte" in varying:
+    bad("claimed identical results over results that differed — a false statement to the model",
+        varying)
+else:
+    pas("the stronger claim is made only when the bytes actually matched")
+
+print("==> 3/8 a successful write clears the chain")
+fresh()
+for _ in range(2):
+    native.repeat_note("run_commands", {"commands": ["pest"]}, "1 failed")
+native.repeat_note("replace_in_file", {"path": "S.php"}, "replaced 1 occurrence in S.php")
+after = native.repeat_note("run_commands", {"commands": ["pest"]}, "0 failed")
+if after:
+    bad("flagged a test re-run after an edit — that is the correct behaviour, not a loop", after)
+else:
+    pas("test, fix, test again is not a repeat")
+
+print("==> 3b/8 a FAILED write does not clear it, because nothing changed")
+fresh()
+for _ in range(2):
+    native.repeat_note("read_files", READ, "same")
+native.repeat_note("replace_in_file", {"path": "S.php"},
+                   "error: `old` not found in S.php; the file is unchanged")
+third = native.repeat_note("read_files", READ, "same")
+if not third:
+    bad("a failed edit reset the chain, so a loop around a failing edit stays invisible")
+else:
+    pas("the tree did not move, so the chain did not reset")
+
+print("==> 4/8 different arguments are a different question")
+fresh()
+for query in ("alpha", "beta", "gamma"):
+    note = native.repeat_note("search", {"query": query}, "result")
+    if note:
+        bad(f"three distinct searches were called a repeat at {query!r}", note)
+        break
+else:
+    pas("only identical arguments count")
+
+print("==> 5/8 the last threshold escalates to recording a blocker")
+fresh()
+notes = [native.repeat_note("search", {"query": "x"}, "same") for _ in range(8)]
+third, eighth = notes[2], notes[7]
+if not eighth:
+    bad("nothing at the final threshold")
+elif "blocker" not in eighth:
+    bad("the final reminder does not offer the honest way out", eighth)
+elif "blocker" in third:
+    bad("escalated on the first reminder, so there is nowhere left to escalate to", third)
+else:
+    pas("advice first, then 'stop and record the blocker'")
+
+print("==> 6/8 a submitted report is never called a repeat")
+fresh()
+notes = [native.repeat_note("submit_report", {"status": "complete"}, "ok") for _ in range(5)]
+if any(notes):
+    bad("flagged the report turn", next(n for n in notes if n))
+else:
+    pas("the report is exempt")
+
+print("==> 7/8 the note reaches the model and not the log")
+fresh()
+work = pathlib.Path(tempfile.mkdtemp())
+(work / "a.txt").write_text("hello\n")
+log = io.StringIO()
+seen = [native.dispatch(work, "read_files", {"files": [{"path": "a.txt"}]}, f"c{n}", log)
+        for n in range(3)]
+logged = [json.loads(line) for line in log.getvalue().splitlines()]
+results = [e["event"]["output"]["result"] for e in logged
+           if e.get("event", {}).get("contentType") == "tool"]
+if "[harness]" not in seen[2]:
+    bad("the model never got the note", seen[2])
+elif any("[harness]" in r for r in results):
+    bad("the note was written into provider.log — every analysis tool would now measure it",
+        next(r for r in results if "[harness]" in r))
+else:
+    pas("the model sees it, the log records what the tool returned")
+
+print("==> 8/8 a long argument is capped in the preview but not in the key")
+fresh()
+long_one = {"commands": ["echo " + "a" * 900]}
+long_two = {"commands": ["echo " + "a" * 900 + "DIFFERENT"]}
+for _ in range(2):
+    native.repeat_note("run_commands", long_one, "out")
+collided = native.repeat_note("run_commands", long_two, "out")
+if collided:
+    bad("two different long commands were counted as the same call — a truncated key", collided)
+else:
+    third = native.repeat_note("run_commands", long_one, "out")
+    if not third:
+        bad("the long-argument chain stopped counting altogether")
+    elif len(third) > 1200:
+        bad("the whole argument rode into the reminder; a loop would carry it every turn")
+    else:
+        pas("distinct long commands stay distinct, and the quoted preview is bounded")
+
+print()
+print("all checks passed" if not FAILURES else f"{FAILURES} check(s) failed")
+sys.exit(1 if FAILURES else 0)

@@ -44,6 +44,7 @@ database, never a live one.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import pathlib
@@ -500,6 +501,67 @@ def analysable_args(name: str, parsed: dict) -> dict:
     return args
 
 
+# --- the repeat guard ---------------------------------------------------------------------------
+#
+# A model that asks the same question twice has been told something it cannot use. Three rounds
+# against one file made 66 searches and 8 whole-file reads and wrote nothing, and the tell was in
+# the arguments the whole time: the identical `read_files` call returning the identical 20,028
+# bytes, three times over, and a search for a declaration the tool had already located at line 914.
+#
+# It is ADVISORY. It never refuses a call and never rewrites one — the model may have a reason, and
+# a guard that vetoes on suspicion would break the legitimate case below. All it does is say what
+# the harness can see and the model cannot: that this exact call has already been made, and what
+# came back.
+#
+# THE LEGITIMATE REPEAT, which is why this is not a simple counter.
+#
+# Running the test suite, fixing something, and running it again is the correct behaviour and the
+# calls are byte-identical. So a successful WRITE clears the counters: after the tree changes,
+# every previous answer is stale and asking again is right. What remains counted is repetition with
+# nothing changed in between, which is the only kind that cannot be productive.
+#
+# The key is the FULL argument string. Only the quoted preview is capped, because a key truncated
+# to a preview would collide two different long commands into one false repeat.
+REPEAT_THRESHOLDS = (3, 5, 8)
+REPEAT_PREVIEW = 300
+_repeats: dict[tuple[str, str], list[str]] = {}
+
+
+def repeat_note(name: str, parsed: dict, result: str) -> str:
+    """What to append to this result, if anything. Mutates the repeat chain."""
+    if name in ("write_file", "replace_in_file") and not result.startswith("error:"):
+        _repeats.clear()          # the tree moved; every earlier answer is now stale
+        return ""
+    if name == "submit_report":
+        return ""
+
+    key = (name, json.dumps(parsed, sort_keys=True, default=str))
+    seen = _repeats.setdefault(key, [])
+    seen.append(hashlib.sha256(result.encode("utf-8", "replace")).hexdigest())
+    count = len(seen)
+    if count not in REPEAT_THRESHOLDS:
+        return ""
+
+    preview = key[1]
+    if len(preview) > REPEAT_PREVIEW:
+        preview = preview[:REPEAT_PREVIEW] + "…"
+    same = len(set(seen)) == 1
+    note = [f"\n\n[harness] This is call {count} of `{name}` with exactly these arguments, "
+            f"and nothing has been written since the first one."]
+    if same:
+        note.append("Every one returned byte-for-byte the same thing, so a further attempt will "
+                    "return it again.")
+    note.append(f"Arguments: {preview}")
+    if count >= REPEAT_THRESHOLDS[-1]:
+        note.append("Stop repeating this. If you cannot get what you need from this tool, do the "
+                    "work a different way, or finish and record the blocker in your report — an "
+                    "honest blocker is a useful result and running out of turns is not.")
+    else:
+        note.append("If it did not answer your question the first time, a different question or a "
+                    "different tool will serve you better than the same one again.")
+    return " ".join(note)
+
+
 def dispatch(repo: pathlib.Path, name: str, parsed: dict, call_id: str, log) -> str:
     """Every tool call goes through here, so every tool call is logged the same way.
 
@@ -539,6 +601,12 @@ def dispatch(repo: pathlib.Path, name: str, parsed: dict, call_id: str, log) -> 
         # it verbatim. "tool-<kind> fault" is the phrase that file matches on.
         emit(log, "agent_event", {"type": "error", "error": {
             "message": f"tool-{fault.kind} fault in {name}: {fault.detail}"}})
+
+    # Appended AFTER the event is emitted, so provider.log records what the tool actually returned
+    # and every analysis tool built on it keeps measuring the tool rather than the commentary.
+    # Only the model sees the note.
+    if fault is None:
+        return result + repeat_note(name, parsed, result)
     return result
 
 
