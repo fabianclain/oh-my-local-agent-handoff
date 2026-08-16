@@ -40,8 +40,11 @@ silent difference here would be indistinguishable from a model effect:
     our `tool`        -> a tool message authored by `functions.NAME`, matched back to the call it
                          answers by tool_call_id
 
-REASONING EFFORT is left at the encoding's default rather than set from anything here, because the
-control does not set it either and an arm that changes two things measures neither.
+REASONING EFFORT is settable and defaults to UNSET, which leaves the encoding's `Reasoning: medium`
+-- the same line llama.cpp's template emits, so the default arm differs from the control in one
+thing and not two. Passing it is opt-in, for an arm that means to vary it. The one prior measurement
+here (low against off, 15 runs each, no difference at p >= 0.70) went through Cline, whose flag is a
+different mechanism, so it does not settle what this control does.
 """
 
 from __future__ import annotations
@@ -109,7 +112,8 @@ def response_format_section(name: str, schema: dict, description: str = "") -> s
 
 
 def render_prompt(messages: list[dict], tools: list[dict],
-                  response_format: dict | None = None) -> str:
+                  response_format: dict | None = None,
+                  reasoning_effort: str | None = None) -> str:
     """The completion prompt for this conversation, rendered by openai-harmony.
 
     `response_format`, when given, is {"name", "schema", "description"} and is appended to the END
@@ -147,6 +151,18 @@ def render_prompt(messages: list[dict], tools: list[dict],
     # and which this project has thrown away runs over.
     system = h.SystemContent.new().with_conversation_start_date(
         _today() if _today() else "")
+    if reasoning_effort:
+        # `Reasoning: low|medium|high` in the system message, which docs/format.md calls the
+        # recommended way to control it. This harness has never set it: llama.cpp's template emits
+        # `Reasoning: medium` and nothing here chose that. The one prior measurement -- low against
+        # off, 15 runs each, no difference at p >= 0.70 -- was taken through Cline, whose own flag
+        # is a different mechanism, so it does not settle what this control does.
+        levels = {"low": h.ReasoningEffort.LOW, "medium": h.ReasoningEffort.MEDIUM,
+                  "high": h.ReasoningEffort.HIGH}
+        if reasoning_effort not in levels:
+            raise SystemExit(f"reasoning effort must be one of {sorted(levels)}, "
+                             f"not {reasoning_effort!r}")
+        system = system.with_reasoning_effort(levels[reasoning_effort])
     rendered: list = [
         h.Message.from_role_and_content(h.Role.SYSTEM, system),
         h.Message.from_role_and_content(h.Role.DEVELOPER, developer),

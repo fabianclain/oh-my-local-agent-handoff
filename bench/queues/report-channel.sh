@@ -1,87 +1,93 @@
-# The report channel: stop repairing the envelope and try preventing the damage.
+# The report channel and the prompt: a SCREEN across nine arms.
 #
 #   handoff overnight bench/queues/report-channel.sh --until 08:00
 #   handoff overnight bench/queues/report-channel.sh --list
 #
-# WHAT IS BEING ASKED
+# WHAT THIS IS, AND WHAT IT IS NOT
 #
-# Every defence this harness has against a malformed completion report is post-hoc. A lenient
-# harmony parser, a brace-balanced scan that descends into string values, schema-key scoring, a
-# second ask. All repair; none prevention.
+# This is a SCREEN, not a confirmation, and reading it as one would be the mistake this file exists
+# to prevent. THIRTEEN arms in a night buys n=9 each; the four-rung ladder alone would have bought
+# n=30. At n=9 a proportion resolves to roughly +/-30 points, so ACCEPT RATE WILL NOT SETTLE
+# ANYTHING HERE -- not for one arm, and certainly not across thirteen, where testing that many
+# comparisons at once makes a spurious "winner" likely by chance alone.
 #
-# Two of these arms go further than prevention: they fix what the model is TOLD, rather than how
-# its answer is read. One settles a comparison that already exists but cannot be read.
+# What n=9 can do is rank the CONTINUOUS measures -- generated tokens, seconds, model requests --
+# where a Mann-Whitney sees a ratio of about 1.4x. Read those, in that order, and treat the outcome
+# counts as colour.
 #
-#   1. nativeraw against native, UNDER ONE TREE. This comparison already has 12 runs on `wide`
-#      and bench/compare refuses to read them: control b91dc3b, treatment 6bbd0cd. As it stands
-#      nativeraw looks WORSE at the thing it was built to fix -- 4/6 no-report against 1/6 -- at
-#      p = 0.24 and confounded, which is not a finding in either direction. Re-running both arms
-#      under today's tree is the cheapest real result on this list: it converts existing data
-#      rather than gathering new.
+# The intended shape is two nights: screen wide tonight, then confirm whatever moves at n=30.
+# Anything reported from tonight as "arm X is better" without that second night is a claim this
+# data cannot support.
 #
-#   2. nativeharmony against NATIVERAW -- OpenAI's own renderer instead of llama.cpp's template.
-#      Measured on identical conversations, llama.cpp's template loses two things the spec
-#      requires. Every nested tool argument collapses to `any[]`: read_files.files, and
-#      submit_report's files_changed, tests_run and deviations. The `start`/`end` window -- the
-#      change that turned three dead rounds into an accepted one -- is not in the type the model
-#      is shown at all. And tool results are JSON-quoted, so a seven-line file arrives with ZERO
-#      newlines and seven literal \n sequences: the model has never seen the line structure of
-#      anything it was asked to edit.
-#
-#      The control is nativeraw, not native. Both parse harmony locally and differ only in who
-#      builds the prompt; comparing against native would fold the parser change in with it.
-#
-#   3. nativecot against NATIVEHARMONY -- the chain of thought carried between tool calls, which
-#      docs/format.md's worked example does explicitly and this harness never has. Every turn has
-#      started its reasoning from nothing. That is a candidate cause for rounds that re-read a
-#      file they already read, and for the circling tools/repeat-guard exists to detect.
-#
-#      Not free: analysis is the bulk of what gpt-oss generates, so carrying it grows the context
-#      it is meant to help, on a plan that already reaches 14-33k. It may cost more than it
-#      returns, which is what the arm is for.
-#
-#   4. WHAT IS DELIBERATELY ABSENT. nativesym on `ledger` was in an earlier draft and is dropped:
-#      tools/symbols exists because locating a declaration was hard, and one reason it was hard is
-#      that files arrived with no newlines. Measuring it on the old renderer produces a number that
-#      goes stale the moment arm 2 is settled. nativejson, nativetype and nativersp are built and
-#      also absent -- none of them sits on this ladder, and four arms at eight waves buys n=24
-#      where six arms would buy n=16 and the noise floor would eat the difference.
-#
-# WHAT THIS QUEUE CANNOT ANSWER
-#
-# Report loss is a proportion and this repository's noise floor on `wide` is about 17 points at
-# n=6 -- bench/compare says so itself in the attempt-1 control. Detecting 30% -> 10% needs n near
-# 60 per arm. Six waves buys n=18, which is enough to see a large effect and NOT enough to call a
-# small one. The continuous measures -- generated tokens, seconds, turns -- are far better powered
-# at this n and are where a real difference will show first. Read them first, and do not let a
-# 4/18-against-2/18 be reported as a result.
-#
-# nativejson, nativetype and nativersp are BUILT and are deliberately NOT in this queue. Five arms
-# at six waves buys n=18 each; four buys the same n on the questions most likely to move. The
-# renderer defects are mechanical and measured, so they are the ones worth the night. nativersp
-# in particular should wait: it costs +145 tokens per request against submit_report and its case
-# is adherence, which is only readable once the renderer question is settled.
-#
-# THE LADDER. Every adjacent pair differs by exactly ONE thing, which is what makes each rung
-# readable, and the whole thing readable against native -- the arm every published number here was
-# measured on.
+# THE LADDER, which is still the spine. Each rung differs from the one above it by exactly ONE
+# thing, so each is readable against its own neighbour rather than against native.
 #
 #   native          llama.cpp parses, llama.cpp renders, chain of thought dropped
-#   nativeraw       WE parse            llama.cpp renders          -> isolates the parser
-#   nativeharmony   we parse            WE render                  -> isolates the renderer
-#   nativecot       we parse            we render      CoT CARRIED  -> isolates the chain of thought
+#   nativeraw       WE parse           llama.cpp renders          -> the parser
+#   nativeharmony   we parse           WE render                  -> the renderer
+#   nativecot       we parse           we render     CoT CARRIED   -> the chain of thought
+#
+# WHAT THE RENDERER RUNG IS ABOUT, since it is the one with mechanical evidence behind it. Measured
+# against openai-harmony on identical conversations, llama.cpp's template loses two things the
+# specification requires. Every nested tool argument collapses to `any[]` -- read_files.files, and
+# submit_report's files_changed, tests_run and deviations -- so the `start`/`end` window, the change
+# that turned three dead rounds into an accepted one, is not in the type the model is shown at all.
+# And tool results are JSON-quoted: a seven-line file arrives with ZERO newlines and seven literal
+# \n sequences. The model has never seen the line structure of anything it was asked to edit.
+#
+# THE FIVE HANGING OFF IT, each against the arm it actually varies from:
+#
+#   nativegrammar   vs nativeharmony. Both halves of docs/format.md's structured output: the schema
+#                   declared in the developer message where the model expects to read it, AND a
+#                   GBNF built from that schema wrapped in the harmony final-message envelope, so
+#                   the sampler cannot emit anything else. The spec says the declaration alone
+#                   "doesn't guarantee the full adherence to the schema"; this is the other half.
+#                   Measured: 118 tokens, every required key, status inside the enum -- where the
+#                   same turn under a generic JSON grammar answered "completed", which the enum
+#                   does not admit.
+#
+#   nativersp       vs nativeharmony. The declaration WITHOUT the grammar, so the pair says how
+#                   much of any effect is the prompt and how much is the sampler. Costs +145 tokens
+#                   per request against submit_report, measured, so its case is adherence not
+#                   economy.
+#
+#   nativejson      vs native. response_format on the chat path -- the enforcement half, on the
+#                   branch that cannot reach the harmony renderer. Kept because if the ladder shows
+#                   nothing, this is the cheap improvement that remains.
+#
+#   nativetype      vs native. The report schema rendered as a type definition, 762 tokens to 339,
+#                   every property, enum value and description preserved.
+#
+#   nativesym       vs native. The symbols tool, which has still never been measured. NOTE it is on
+#                   `wide` here rather than `ledger`, which is a weaker test of it: symbols exists
+#                   for big-file anchoring and ledger is the plan that exercises that. Read a null
+#                   result here as "not on this plan", not as "no effect".
+#
+# AND FOUR THAT PRE-DATE ALL OF IT, each built for a question and none ever measured against a
+# control under one tree:
+#
+#   nativelean      three context changes together: pruned superseded reads, the report tool
+#                   withdrawn past 10k, and a syntax-warning budget
+#   nativemsg       no submit_report tool at all, so the report can only come from the final turn
+#   nativeprune     read results replaced once the model has overwritten the file
+#   nativewhole     no replace_in_file: every edit is a whole-file write
+#
+# Waves rather than arms-in-sequence, for the reason the last three queues established: an
+# interruption at any point leaves a balanced comparison rather than one complete arm and nothing
+# to compare it against. With nine arms a wave is about 105 minutes, so a night cut short loses a
+# whole wave rather than a whole arm.
 #
 # SIZING, from measured medians rather than hope
 #
 #   wide/native 204s   wide/nativeraw 222s
 #
-# A wave is 3 reps x 4 arms, roughly 44 minutes. Eight waves is about 7.5 hours and n=24 per arm.
-# That is still short of the ~60 a proportion needs, and long enough to see a large effect on the
-# continuous measures, which is where a real difference will show first.
+# Three waves of thirteen arms is 9h13m including the preamble, against a 9-hour window from 23:00
+# to 08:00. That is over by a quarter of an hour, deliberately: waves mean a deadline cuts a whole
+# wave rather than a whole arm, so the arms stay balanced either way. What a cut WILL take is the
+# morning readouts at the end -- they need no GPU and take a minute each, so run them by hand if
+# the night runs out:
 #
-# Waves rather than arms-in-sequence, for the reason the last two queues established: an
-# interruption at any point leaves a balanced comparison rather than one complete arm and nothing
-# to compare it against.
+#   cd ~/dev/agent-handoff-bench && ./bench/compare wide nativeraw nativeharmony --acts-on first-attempt
 
 CLONE="${BENCH_CLONE:-$HOME/dev/agent-handoff-bench}"
 HANDOFF="${HANDOFF_HOME:-$PWD}"
@@ -109,13 +115,15 @@ job sync-clone --no-gpu --timeout 300 -- "$HANDOFF/tools/sync-bench-clone" "$CLO
 
 # --- the waves -----------------------------------------------------------------------------------
 
-for wave in 1 2 3 4 5 6 7 8; do
+for wave in 1 2 3; do
     flag="--append"
     [[ "$wave" == 1 ]] && flag="--force"
 
     # native FIRST in every wave. It is the control for all three comparisons, so if the night is
     # cut short the arm that survives is the one every reading depends on.
-    for arm in native nativeraw nativeharmony nativecot; do
+    for arm in native nativeraw nativeharmony nativecot nativegrammar \
+               nativersp nativejson nativetype nativesym \
+               nativelean nativemsg nativeprune nativewhole; do
         job "w$wave-$arm" --cwd "$CLONE" --est 660 --timeout 3600 -- \
             ./bench/run --plan wide --providers "$arm" --repeat 3 "$flag"
     done
@@ -135,6 +143,28 @@ job final-harmony --no-gpu --cwd "$CLONE" --timeout 300 -- \
     ./bench/compare wide nativeraw nativeharmony --acts-on first-attempt
 job final-cot --no-gpu --cwd "$CLONE" --timeout 300 -- \
     ./bench/compare wide nativeharmony nativecot --acts-on first-attempt
+# Each of these against the arm it actually varies from, not against native. nativegrammar and
+# nativersp both imply the harmony renderer, so nativeharmony is their control; nativejson and
+# nativetype are chat-path changes and belong against native.
+job final-grammar --no-gpu --cwd "$CLONE" --timeout 300 -- \
+    ./bench/compare wide nativeharmony nativegrammar --acts-on first-attempt
+job final-rsp --no-gpu --cwd "$CLONE" --timeout 300 -- \
+    ./bench/compare wide nativeharmony nativersp --acts-on first-attempt
+job final-json --no-gpu --cwd "$CLONE" --timeout 300 -- \
+    ./bench/compare wide native nativejson --acts-on first-attempt
+job final-type --no-gpu --cwd "$CLONE" --timeout 300 -- \
+    ./bench/compare wide native nativetype --acts-on first-attempt
+job final-sym --no-gpu --cwd "$CLONE" --timeout 300 -- \
+    ./bench/compare wide native nativesym --acts-on first-attempt
+# The four that pre-date all of this and have never been measured under one tree with a control.
+job final-lean --no-gpu --cwd "$CLONE" --timeout 300 -- \
+    ./bench/compare wide native nativelean --acts-on first-attempt
+job final-msg --no-gpu --cwd "$CLONE" --timeout 300 -- \
+    ./bench/compare wide native nativemsg --acts-on first-attempt
+job final-prune --no-gpu --cwd "$CLONE" --timeout 300 -- \
+    ./bench/compare wide native nativeprune --acts-on first-attempt
+job final-whole --no-gpu --cwd "$CLONE" --timeout 300 -- \
+    ./bench/compare wide native nativewhole --acts-on first-attempt
 
 job final-summary --no-gpu --cwd "$CLONE" --timeout 300 -- ./bench/summary
 

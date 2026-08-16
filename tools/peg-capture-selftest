@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""peg-capture-selftest — is the evidence actually being kept, and attributed to the right round?
+
+    tools/peg-capture-selftest
+
+llama-server writes every completion it discards to its own log, in full. That text is what
+separates "the model did not call the tool" from "the stack threw the call away" -- a distinction
+this project has got wrong twice, and the second time only came to light because three samples
+happened to survive.
+
+They usually do not. The log rotates on every server start and old rotations are pruned: 99
+samples, the whole evidence base for the harmony fault, no longer exist. tools/peg-capture copies
+each round's share into its result directory before that can happen.
+
+A capture that silently kept nothing would be indistinguishable from a round that discarded
+nothing, which is the failure this whole tool exists to prevent -- so the three exit codes are the
+point, and case 4 is the one that matters most: an offset past the end of the log means the log
+ROTATED MID-ROUND, and reading from zero there would attribute another round's discards to this
+one. That is worse than capturing nothing.
+"""
+
+from __future__ import annotations
+
+import pathlib
+import subprocess
+import sys
+import tempfile
+
+HERE = pathlib.Path(__file__).resolve().parent
+TOOL = HERE / "peg-capture"
+
+FAILURES = 0
+
+
+def pas(what: str) -> None:
+    print(f"    PASS: {what}")
+
+
+def bad(what: str, detail: str = "") -> None:
+    global FAILURES
+    FAILURES += 1
+    print(f"    FAIL: {what}")
+    if detail:
+        for line in str(detail).splitlines()[:4]:
+            print(f"        {line}")
+
+
+def run(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run([sys.executable, str(TOOL), *args], capture_output=True, text=True)
+
+
+MARKER = "W common_chat_peg_parse: unparsed peg-native output: "
+work = pathlib.Path(tempfile.mkdtemp())
+log = work / "llamacpp.log"
+
+log.write_text("I slot launch_slot_: processing\n"
+               + MARKER + "write_file(path='a.php', content='<?php')\n"
+               + "I slot release: stop processing\n")
+mark = log.stat().st_size
+with log.open("a") as handle:
+    handle.write(MARKER + "replace_in_file(path='b.php', old='x')\n")
+
+print("==> 1/5 only what happened after the mark is captured")
+out = work / "after.txt"
+done = run("--since", str(mark), "--log", str(log), "--out", str(out))
+body = out.read_text() if out.exists() else ""
+if done.returncode != 0:
+    bad(f"exited {done.returncode} with a discard to find", done.stderr)
+elif "replace_in_file" not in body:
+    bad("the discard after the mark was not captured", body[:200])
+elif "write_file" in body:
+    bad("a discard from BEFORE the mark was attributed to this round — the bracket is not "
+        "holding, and tokens use the same one", body[:200])
+else:
+    pas("one discard, the right one")
+
+print("==> 2/5 from zero, every discard in the log is found")
+done = run("--since", "0", "--log", str(log))
+if done.stdout.count("--- discarded completion") != 2:
+    bad(f"found {done.stdout.count('--- discarded completion')} of 2", done.stdout[:200])
+else:
+    pas("both")
+
+print("==> 3/5 a clean round exits 1 — looked, found none")
+clean = work / "clean.log"
+clean.write_text("I slot launch_slot_: processing\nI slot release: stop processing\n")
+done = run("--since", "0", "--log", str(clean))
+if done.returncode != 1:
+    bad(f"a log with no discards exited {done.returncode}, expected 1", done.stderr)
+elif done.stdout.strip():
+    bad("printed something for a round that discarded nothing", done.stdout[:120])
+else:
+    pas("exit 1, silent")
+
+print("==> 4/5 an offset past the end of the log is refused, not read from zero")
+# The log rotated mid-round. Reading from 0 would hand this round the PREVIOUS round's discards,
+# which is worse than capturing nothing: it is evidence filed against the wrong experiment.
+done = run("--since", str(log.stat().st_size + 10_000), "--log", str(log))
+if done.returncode != 2:
+    bad(f"exited {done.returncode}, expected 2 for a rotated log", done.stdout or done.stderr)
+elif "rotated" not in done.stderr:
+    bad("exited 2 without naming rotation as the cause", done.stderr)
+elif "write_file" in done.stdout or "replace_in_file" in done.stdout:
+    bad("it fell back to reading from the start and captured another round's discards")
+else:
+    pas("exit 2, names rotation, captures nothing")
+
+print("==> 5/5 a missing log is UNKNOWN, never 'no discards'")
+done = run("--since", "0", "--log", str(work / "nope.log"))
+if done.returncode != 2:
+    bad(f"a missing log exited {done.returncode}, expected 2")
+elif "not 'no completions were discarded'" not in done.stderr:
+    bad("exited 2 without distinguishing absence of evidence from evidence of absence",
+        done.stderr)
+else:
+    pas("exit 2, and says which it is")
+
+print()
+print("all checks passed" if not FAILURES else f"{FAILURES} check(s) failed")
+subprocess.run(["rm", "-rf", str(work)])
+sys.exit(1 if FAILURES else 0)

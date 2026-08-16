@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""peg-capture — save the completions llama.cpp threw away, before the log is rotated.
+
+    tools/peg-capture --since BYTES [--log FILE] [--out FILE]
+
+Exit 0 when it looked and found some, 1 when it looked and found none, 2 when it could not look.
+
+WHY
+
+llama-server writes every completion it discards to its own log, in full, under
+
+    W common_chat_peg_parse: unparsed peg-native output: <|channel|>...
+
+That text is the single most diagnostic artifact this stack produces. It is what distinguishes
+"the model did not call the tool" from "the stack threw the call away" -- a distinction this
+project has got wrong twice, once recording qwen2.5-coder as fabricating a blocker while it was
+telling the truth, and once writing up LFM2.5 as failing to edit files when three of its writes had
+been dropped as unparseable.
+
+It also does not survive. The log is rotated on every server start and old rotations are pruned:
+**99 archived samples, the entire evidence base for the harmony fault, no longer exist on this
+machine.** Three survived by accident, and those three overturned a model verdict the same day.
+Had this tool existed, the harmony question could have been answered from the archive instead of
+being unanswerable.
+
+HOW THE ROUND IS BRACKETED
+
+By byte offset into the log, which is exactly how providers/lcpp.sh already attributes tokens to a
+round. Reusing the mechanism rather than inventing one keeps the two answers about the same round
+derived from the same boundary: a discarded completion counted into one round and its tokens into
+another would be worse than not capturing either.
+
+WHAT IT DOES NOT DO
+
+It does not judge. A discarded completion is evidence, not a verdict -- llama.cpp is stricter than
+the harmony specification (see docs/changing-the-model.md), so some of these are valid output the
+server refused, and some are genuinely garbled. Deciding which is a job for a person reading them,
+which is the whole point of keeping them.
+"""
+
+from __future__ import annotations
+
+import argparse
+import pathlib
+import sys
+
+MARKER = "unparsed peg-native output:"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--since", type=int, required=True,
+                        help="byte offset into the log, from provider_usage_mark")
+    parser.add_argument("--log", type=pathlib.Path,
+                        default=pathlib.Path.home() / ".cache" / "agent-handoff" / "llamacpp.log")
+    parser.add_argument("--out", type=pathlib.Path)
+    args = parser.parse_args()
+
+    if not args.log.is_file():
+        print(f"UNKNOWN  no server log at {args.log}, so nothing was captured", file=sys.stderr)
+        print("         This is not 'no completions were discarded'.", file=sys.stderr)
+        return 2
+
+    size = args.log.stat().st_size
+    if args.since > size:
+        # The log was rotated mid-round: the offset points past the end of a file that is now a
+        # different file. Reading from 0 would attribute another round's discards to this one.
+        print(f"UNKNOWN  the log is {size} bytes and the round started at {args.since}; it was "
+              f"rotated mid-round, so this round's discards are unrecoverable", file=sys.stderr)
+        return 2
+
+    found = []
+    with args.log.open("r", errors="replace") as handle:
+        handle.seek(args.since)
+        for line in handle:
+            if MARKER in line:
+                found.append(line.split(MARKER, 1)[1].strip())
+
+    if not found:
+        return 1
+
+    body = "".join(f"--- discarded completion {n} ---\n{text}\n\n"
+                   for n, text in enumerate(found, 1))
+    if args.out:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(f"{len(found)} completion(s) llama.cpp parsed and discarded during "
+                            f"this round.\nThese are the model's real output. llama.cpp is "
+                            f"stricter than the harmony specification, so some are valid.\n\n"
+                            + body)
+        print(f"{len(found)} discarded completion(s) -> {args.out}")
+    else:
+        sys.stdout.write(body)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

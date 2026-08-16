@@ -864,7 +864,8 @@ def call_model_raw(host: str, port: int, messages: list[dict], tools: list[dict]
         # model has never seen either its tools' field names or a newline in a file it was reading.
         import harmony_render  # noqa: PLC0415
 
-        prompt = harmony_render.render_prompt(messages, tools, RESPONSE_SECTION)
+        prompt = harmony_render.render_prompt(messages, tools, RESPONSE_SECTION,
+                                              REASONING_EFFORT)
     else:
         prompt = json.loads(http_post(host, port, "/apply-template",
                                       {"messages": messages, "tools": tools}, timeout))["prompt"]
@@ -924,6 +925,14 @@ RESPONSE_SECTION: dict | None = None
 # sampling". response_format cannot do it here -- it constrains the whole completion, which on this
 # path starts with a channel marker rather than a brace.
 HARMONY_GRAMMAR = False
+# `Reasoning: low|medium|high` in the harmony system message. None leaves the encoding's default,
+# which is `medium` -- the same line llama.cpp's template emits, so an arm that does not set this
+# differs from the control in one thing rather than two.
+#
+# Note what this project has and has not measured. `low` against `off` was 15 runs each with every
+# difference inside chance (p >= 0.70); `low` against MEDIUM has never been run here, and medium is
+# what every result to date was produced under.
+REASONING_EFFORT: str | None = None
 
 
 def call_model(host: str, port: int, model: str, messages: list[dict], tools: list[dict],
@@ -1140,6 +1149,8 @@ def main() -> int:
                         help="drop replace_in_file, forcing whole-file writes (round 15)")
     parser.add_argument("--no-report-tool", action="store_true",
                         help="no submit_report tool; the report comes from the no-tools final turn")
+    parser.add_argument("--reasoning-effort", choices=("low", "medium", "high"),
+                        help="set `Reasoning:` in the harmony system message (harmony render only)")
     parser.add_argument("--harmony-grammar", action="store_true",
                         help="constrain the raw-path report turn with a schema-derived GBNF, "
                              "wrapped in the harmony final-message envelope")
@@ -1183,6 +1194,10 @@ def main() -> int:
 
     schema = json.loads(args.schema.read_text())
 
+    if args.reasoning_effort:
+        globals()["REASONING_EFFORT"] = args.reasoning_effort
+        globals()["HARMONY_RENDER"] = True
+        globals()["RAW_HARMONY"] = True
     if args.harmony_grammar:
         globals()["HARMONY_GRAMMAR"] = True
         globals()["HARMONY_RENDER"] = True

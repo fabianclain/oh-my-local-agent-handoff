@@ -35,6 +35,8 @@
 #                             results unescaped, and everything the control says still said
 #   schema-grammar-selftest   a GBNF from the report schema: one root, no dangling rules, legal
 #                             names, and a REFUSAL for every construct it cannot express
+#   peg-capture-selftest      each round keeps the completions llama.cpp discarded, attributed to
+#                             the right round, and refuses when the log rotated under it
 #   queue-selftest            the GPU lock, the position/estimate register, and the spool
 #   answerability-selftest    every gate's three exit codes: holds, does not hold, could not tell.
 #                             The third is the one five separate tools got wrong
@@ -54,7 +56,7 @@ REPO="$(cd "$HERE/.." && pwd)"
 cd "$REPO"
 FAILED=()
 
-for suite in smoke-e2e harness-selftest verifier-selftest feedback-selftest patch-shape-selftest shim-selftest native-retry-selftest native-tools-selftest turn-economy-selftest report-audit-selftest journal-selftest roundup-selftest plan-lint-selftest view-selftest site-audit-selftest overnight-selftest docblock-anchor-selftest repeat-guard-selftest repair-provenance-selftest schema-typedef-selftest harmony-render-selftest schema-grammar-selftest queue-selftest answerability-selftest; do
+for suite in smoke-e2e harness-selftest verifier-selftest feedback-selftest patch-shape-selftest shim-selftest native-retry-selftest native-tools-selftest turn-economy-selftest report-audit-selftest journal-selftest roundup-selftest plan-lint-selftest view-selftest site-audit-selftest overnight-selftest docblock-anchor-selftest repeat-guard-selftest repair-provenance-selftest schema-typedef-selftest harmony-render-selftest schema-grammar-selftest peg-capture-selftest queue-selftest answerability-selftest; do
     # Suites live in tools/, except the ones that test a bench fixture and belong beside it.
     # Resolving only tools/ made a real suite report `SKIP (missing)` — which this file's own next
     # comment calls the failure it exists to avoid, one line before failing to avoid it.
