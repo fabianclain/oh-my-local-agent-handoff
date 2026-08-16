@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""schema-typedef-selftest — is the smaller rendering the SAME rendering?
+
+    tools/schema-typedef-selftest
+
+A type definition is worth having only if it says everything the schema says. A version that drops
+a description or an enum value is not a saving; it is an information cut that would surface in a
+benchmark as the model mysteriously getting worse, with the cause sitting in the prompt where
+nobody looks.
+
+That is not hypothetical. The first hand-written type definition for this schema measured 6x
+smaller and was reported as such — because it had quietly dropped most of the descriptions. The
+faithful rendering is 2.2x. The claim was wrong in exactly the direction convenient to the change
+being proposed, which is the direction to distrust.
+
+So case 1 is the one that matters: every property name, every enum value, every description in the
+schema must appear in the output. It is checked against the REAL schema, not a fixture, because the
+real one is what ships.
+"""
+
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import json
+import pathlib
+import sys
+
+HERE = pathlib.Path(__file__).resolve().parent
+REPO = HERE.parent
+spec = importlib.util.spec_from_loader(
+    "schema_typedef",
+    importlib.machinery.SourceFileLoader("schema_typedef", str(HERE / "schema-typedef")))
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+FAILURES = 0
+
+
+def pas(what: str) -> None:
+    print(f"    PASS: {what}")
+
+
+def bad(what: str, detail: str = "") -> None:
+    global FAILURES
+    FAILURES += 1
+    print(f"    FAIL: {what}")
+    if detail:
+        for line in str(detail).splitlines()[:5]:
+            print(f"        {line}")
+
+
+def walk(node, names, enums, notes):
+    """Everything the schema states that a reader would need."""
+    if isinstance(node, dict):
+        for name, spec in (node.get("properties") or {}).items():
+            names.add(name)
+        for value in node.get("enum") or []:
+            enums.add(value)
+        note = node.get("description")
+        if note:
+            notes.add(" ".join(note.split()))
+        for value in node.values():
+            walk(value, names, enums, notes)
+    elif isinstance(node, list):
+        for value in node:
+            walk(value, names, enums, notes)
+
+
+SCHEMA = json.loads((REPO / "schemas" / "handoff.schema.json").read_text())
+OUT = mod.typedef(SCHEMA)
+
+print("==> 1/7 nothing the schema says is missing from the type definition")
+names, enums, notes = set(), set(), set()
+walk(SCHEMA, names, enums, notes)
+missing_names = sorted(n for n in names if n not in OUT)
+missing_enums = sorted(e for e in enums if json.dumps(e) not in OUT)
+missing_notes = sorted(n for n in notes if n not in OUT)
+if missing_names:
+    bad(f"{len(missing_names)} property name(s) lost", "\n".join(missing_names))
+elif missing_enums:
+    bad(f"{len(missing_enums)} enum value(s) lost — the model would invent replacements",
+        "\n".join(missing_enums))
+elif missing_notes:
+    bad(f"{len(missing_notes)} description(s) lost; this is the 6x-that-was-really-2.2x bug",
+        "\n".join(m[:90] for m in missing_notes))
+else:
+    pas(f"{len(names)} names, {len(enums)} enum values, {len(notes)} descriptions all present")
+
+print("==> 2/7 it is actually smaller, or there is no point")
+shipped = len(json.dumps(SCHEMA, indent=2))
+if len(OUT) >= shipped:
+    bad(f"the type definition ({len(OUT)} B) is not smaller than the schema ({shipped} B)")
+else:
+    pas(f"{shipped} B -> {len(OUT)} B ({shipped / len(OUT):.1f}x by bytes)")
+
+print("==> 3/7 required and optional are distinguishable")
+# `status` is required, so it must NOT be marked optional. Nothing in this schema is optional, so
+# a renderer that marked everything `?` would still pass case 1 while telling the model it may
+# omit the report's contents.
+if "status?" in OUT:
+    bad("a required field is rendered as optional")
+elif "status:" not in OUT:
+    bad("a required field is missing its declaration")
+else:
+    pas("required fields carry no `?`")
+
+optional_schema = {"type": "object", "required": ["a"],
+                   "properties": {"a": {"type": "string"}, "b": {"type": "string"}}}
+rendered = mod.typedef(optional_schema)
+if "b?:" not in rendered:
+    bad("an optional field is not marked optional", rendered)
+else:
+    pas("an optional field carries `?`")
+
+print("==> 4/7 nested arrays of objects keep their shape")
+if "files_changed:" not in OUT or "}[]" not in OUT:
+    bad("an array-of-objects did not render as an object followed by []", OUT[:300])
+elif "change:" not in OUT:
+    bad("a field inside an array element was lost", OUT[:300])
+else:
+    pas("array elements render inline with their fields")
+
+print("==> 5/7 an unreadable schema exits 2 rather than printing a confident empty type")
+import subprocess
+broken = pathlib.Path("/tmp/not-a-schema.json")
+broken.write_text("{ this is not json")
+done = subprocess.run([sys.executable, str(HERE / "schema-typedef"), str(broken)],
+                      capture_output=True, text=True)
+broken.unlink(missing_ok=True)
+if done.returncode != 2:
+    bad(f"a broken schema exited {done.returncode}, not 2", done.stdout + done.stderr)
+elif "cannot read" not in done.stderr:
+    bad("exited 2 without saying why", done.stderr)
+else:
+    pas("exit 2, with the reason")
+
+print("==> 6/7 the arm changes the report prompt and NOT the tools block")
+# The regression guard for a version that was built and removed. Putting the type definition in
+# submit_report's description and stripping `parameters` measured 632 -> 727 tokens, because
+# `parameters` must stay a JSON Schema -- it is the grammar source -- so the typedef restates the
+# same shape a second time. The tools block rides on every request, so that cost 95 tokens x 40-80
+# turns to save 423 once. If anyone re-adds it, this fails.
+import os
+
+import importlib.machinery as _m
+
+agent_spec = importlib.util.spec_from_loader(
+    "native_agent", _m.SourceFileLoader("native_agent", str(HERE / "native-agent")))
+agent = importlib.util.module_from_spec(agent_spec)
+agent_spec.loader.exec_module(agent)
+
+
+def report_tool(arm: bool):
+    os.environ.pop("NATIVE_TYPEDEF", None)
+    if arm:
+        os.environ["NATIVE_TYPEDEF"] = "1"
+    try:
+        tool = [t for t in agent.tool_schemas(True, SCHEMA)
+                if t["function"]["name"] == "submit_report"][0]
+        return json.dumps(tool, sort_keys=True), agent.render_schema_for_prompt(SCHEMA)
+    finally:
+        os.environ.pop("NATIVE_TYPEDEF", None)
+
+
+control_tool, control_prompt = report_tool(False)
+arm_tool, arm_prompt = report_tool(True)
+if control_tool != arm_tool:
+    bad("the arm changed the tools block; that variant was measured as a net LOSS and removed",
+        f"control {len(control_tool)} B vs arm {len(arm_tool)} B")
+elif control_prompt == arm_prompt:
+    bad("NATIVE_TYPEDEF did not change the report prompt, so the arm tests nothing")
+elif "type Report" not in arm_prompt:
+    bad("the arm's prompt is not a type definition", arm_prompt[:200])
+elif not control_prompt.lstrip().startswith("{"):
+    bad("the control stopped sending JSON Schema", control_prompt[:200])
+else:
+    pas(f"tools block identical; prompt {len(control_prompt)} B -> {len(arm_prompt)} B")
+
+print("==> 7/7 the arm fails loudly if its renderer is missing")
+# A silent fallback to the schema would let the arm run as the control, produce a full set of
+# results, and be recorded as having tested something it never tested. 25 runs were discarded to
+# that class of mistake once already.
+saved = agent._TYPEDEF
+agent._TYPEDEF = None
+real = HERE / "schema-typedef"
+hidden = HERE / "schema-typedef.hidden-for-test"
+os.environ["NATIVE_TYPEDEF"] = "1"
+try:
+    real.rename(hidden)
+    try:
+        agent.render_schema_for_prompt(SCHEMA)
+    except Exception:  # noqa: BLE001
+        pas("raises rather than silently running as the control")
+    else:
+        bad("the renderer was missing and the arm quietly produced the control's prompt")
+finally:
+    if hidden.exists():
+        hidden.rename(real)
+    os.environ.pop("NATIVE_TYPEDEF", None)
+    agent._TYPEDEF = saved
+
+print()
+print("all checks passed" if not FAILURES else f"{FAILURES} check(s) failed")
+sys.exit(1 if FAILURES else 0)

@@ -113,6 +113,43 @@ def emit(log, kind: str, event: dict) -> None:
 DISABLED: set[str] = set()
 
 
+def _typedef_renderer():
+    """tools/schema-typedef's renderer, loaded once.
+
+    Raises if it cannot be loaded. Falling back to the schema would be worse than failing: the arm
+    would run as the control, produce a full set of results, and be recorded as having tested
+    something it never tested. This project has already discarded 25 runs to that class of
+    mistake, and a silent fallback is how it happens.
+    """
+    global _TYPEDEF
+    if _TYPEDEF is None:
+        import importlib.machinery
+        import importlib.util
+        path = pathlib.Path(__file__).resolve().parent / "schema-typedef"
+        spec = importlib.util.spec_from_loader(
+            "schema_typedef", importlib.machinery.SourceFileLoader("schema_typedef", str(path)))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _TYPEDEF = module.typedef
+    return _TYPEDEF
+
+
+_TYPEDEF = None
+
+
+def render_schema_for_prompt(schema: dict) -> str:
+    """How the report's shape is shown to the model: JSON Schema, or a type definition.
+
+    Only the report-turn prompt, which is prose the harness renders itself. 762 tokens -> 339 on
+    the real schema, with every property, enum value and description preserved -- the fidelity
+    requirement is not decoration, it is what separates a saving from an information cut, and the
+    first hand-written type definition here failed it while reporting a better ratio because of it.
+    """
+    if os.environ.get("NATIVE_TYPEDEF"):
+        return _typedef_renderer()(schema)
+    return json.dumps(schema, indent=2)
+
+
 def tool_schemas(include_report: bool, schema: dict) -> list[dict]:
     tools = [
         {"type": "function", "function": {
@@ -169,6 +206,13 @@ def tool_schemas(include_report: bool, schema: dict) -> list[dict]:
     if not os.environ.get("NATIVE_SYMBOLS"):
         tools = [t for t in tools if t["function"]["name"] != "symbols"]
     tools = [t for t in tools if t["function"]["name"] not in DISABLED]
+    # Deliberately NOT touched by the typedef arm, and this was measured rather than assumed.
+    # Moving the prose into the description and stripping it from `parameters` was built, measured
+    # at 632 -> 727 tokens, and removed: `parameters` must stay a JSON Schema because it is what
+    # llama.cpp turns into the tool-call grammar, so a type definition beside it restates the same
+    # shape twice. The tools block rides on every request, so +95 tokens x 40-80 turns swamps the
+    # ~423 the report prompt saves once. The saving is only available where the schema is shown as
+    # PROSE and the harness owns the rendering -- see render_schema_for_prompt.
     if include_report and "submit_report" not in DISABLED:
         tools.append({"type": "function", "function": {
             "name": "submit_report",
@@ -1266,7 +1310,7 @@ def main() -> int:
                                       f"report-{attempt}"})
             ask = ("The work is finished. Reply with ONLY a JSON object matching this schema, "
                    "as your final message. No prose, no code fence.\n\n"
-                   + json.dumps(schema, indent=2))
+                   + render_schema_for_prompt(schema))
             if attempt > 1:
                 # Say what was wrong with the last answer. An empty response and a page of
                 # reasoning are different failures and the same instruction does not fix both.

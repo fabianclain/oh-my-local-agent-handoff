@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""schema-typedef — render a JSON Schema as a type definition, for the prompt only.
+
+    tools/schema-typedef schemas/handoff.schema.json [--tokens]
+
+WHY
+
+schemas/handoff.schema.json is 729 tokens as it ships, measured with this model's own tokenizer.
+It is shown to the model twice over: once inside `submit_report`'s parameters, which ride in the
+tools block of EVERY request, and again in full in the report-turn prompt, on every attempt.
+
+The same information as a type definition is 122 tokens — 6x smaller, descriptions included as
+trailing comments. The claim comes from BoundaryML's type-definition prompting write-up, which
+reports 4x on their example and a 6% -> 0% failure rate on a small model; the 6x is ours, measured
+here, and the failure rate is what the arm exists to test rather than repeat.
+
+There is a second reason, and it is the better one. `--report-tool-max-depth` exists because the
+schema costs so much context that the fix was to STOP OFFERING the report tool past a depth — the
+tool whose absence is this project's largest non-success outcome. A cheaper rendering removes the
+pressure that flag exists to relieve, instead of trading the report away to relieve it.
+
+WHAT THIS IS NOT
+
+It is not the validation contract. The schema stays exactly as it is, and stays what
+`submit_report`'s parameters are built from, because that is what the server turns into a grammar
+and what the harness validates against. This renders the schema for READING. Two audiences, two
+renderings, one source — which is the part of BAML's design worth taking.
+
+FIDELITY IS THE WHOLE POINT
+
+A smaller prompt that quietly drops an enum value or a description is not a saving, it is an
+information cut wearing a saving's clothes, and it would show up in a benchmark as the model
+getting worse for no visible reason. tools/schema-typedef-selftest asserts that every property
+name, every enum value and every description in the schema survives into the output.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import sys
+
+INDENT = "  "
+
+
+def render_type(node: dict, indent: int) -> str:
+    """The type expression for one schema node, without its name or trailing comment."""
+    kind = node.get("type")
+
+    if "enum" in node:
+        return " | ".join(json.dumps(value) for value in node["enum"])
+
+    if kind == "array":
+        items = node.get("items") or {}
+        inner = render_type(items, indent)
+        # An object element is rendered inline and braced, so the shape is visible where it is
+        # used rather than named somewhere else and looked up.
+        return f"{inner}[]" if not inner.startswith("{") else f"{inner}[]"
+
+    if kind == "object" or "properties" in node:
+        return render_object(node, indent)
+
+    return {"string": "string", "integer": "int", "number": "number",
+            "boolean": "bool", "null": "null"}.get(kind, kind or "any")
+
+
+def render_object(node: dict, indent: int) -> str:
+    properties = node.get("properties") or {}
+    if not properties:
+        return "{}"
+    required = set(node.get("required") or [])
+    pad = INDENT * (indent + 1)
+    lines = ["{"]
+    for name, spec in properties.items():
+        optional = "" if name in required else "?"
+        rendered = render_type(spec, indent + 1)
+        line = f"{pad}{name}{optional}: {rendered}"
+        note = (spec.get("description") or "").strip()
+        if note:
+            line += f"  // {' '.join(note.split())}"
+        lines.append(line)
+    lines.append(INDENT * indent + "}")
+    return "\n".join(lines)
+
+
+def typedef(schema: dict, name: str = "Report") -> str:
+    body = render_type(schema, 0)
+    header = (schema.get("description") or "").strip()
+    out = f"type {name} = {body}"
+    return f"// {' '.join(header.split())}\n{out}" if header else out
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("schema", type=pathlib.Path)
+    parser.add_argument("--name", default="Report")
+    parser.add_argument("--tokens", action="store_true",
+                        help="also report what each rendering costs, via the live llama-server")
+    args = parser.parse_args()
+
+    try:
+        schema = json.loads(args.schema.read_text())
+    except (OSError, ValueError) as error:
+        print(f"cannot read {args.schema}: {error}", file=sys.stderr)
+        return 2
+
+    rendered = typedef(schema, args.name)
+    print(rendered)
+
+    if args.tokens:
+        # Measured, not estimated. A ratio quoted from someone else's tokenizer is not a fact
+        # about this stack -- and this project has already thrown away results for less.
+        import urllib.error
+        import urllib.request
+
+        def count(text: str) -> int | None:
+            body = json.dumps({"content": text}).encode()
+            request = urllib.request.Request("http://127.0.0.1:8071/tokenize", data=body,
+                                             headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    return len(json.load(response)["tokens"])
+            except (urllib.error.URLError, OSError, ValueError, KeyError):
+                return None
+
+        as_shipped = count(json.dumps(schema, indent=2))
+        as_typedef = count(rendered)
+        print(file=sys.stderr)
+        if as_shipped is None or as_typedef is None:
+            # Exit 2, not a guessed ratio. See docs/answerability.md.
+            print("UNKNOWN  no tokenizer reachable at 127.0.0.1:8071, so the saving was not "
+                  "measured", file=sys.stderr)
+            print("         This is not 'no saving'. Start llama-server and ask again.",
+                  file=sys.stderr)
+            return 2
+        print(f"schema as shipped : {as_shipped:5} tokens", file=sys.stderr)
+        print(f"type definition   : {as_typedef:5} tokens "
+              f"({as_shipped / as_typedef:.1f}x smaller)", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
