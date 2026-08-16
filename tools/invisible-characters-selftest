@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+#
+# invisible-characters-selftest — the lookalike gate, from both sides.
+#
+#   tools/invisible-characters-selftest
+#
+# The permitted half is the half that decides whether this survives contact with a real codebase.
+# This project writes prose in its comments and uses en and em dashes throughout; a gate that
+# flagged those would fire on nearly every file here and be switched off within a day. So the
+# cases below assert just as hard that ordinary punctuation passes as that lookalikes fail.
+
+set -uo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+TOOL="$HERE/invisible-characters"
+WORK="$(mktemp -d)"
+FAILED=0
+trap 'rm -rf "$WORK"' EXIT
+
+clean() {
+    local name="$1" file="$WORK/$1"
+    cat >"$file"
+    if ! out="$(python3 "$TOOL" "$file" 2>&1)"; then
+        echo "    FAIL: '$name' is ordinary source but was flagged"
+        printf '%s\n' "$out" | head -4 | sed 's/^/          /'
+        FAILED=$((FAILED + 1))
+    fi
+}
+
+flagged() {
+    local name="$1" expect="$2" file="$WORK/$1"
+    cat >"$file"
+    if out="$(python3 "$TOOL" "$file" 2>&1)"; then
+        echo "    FAIL: '$name' contains $expect and was reported clean"
+        FAILED=$((FAILED + 1))
+    elif ! grep -q -- "$expect" <<<"$out"; then
+        echo "    FAIL: '$name' was caught, but not reported as $expect"
+        printf '%s\n' "$out" | head -3 | sed 's/^/          /'
+        FAILED=$((FAILED + 1))
+    fi
+}
+
+echo "==> the defect this exists for"
+# Byte-for-byte the docblock a local model wrote, in a round that was accepted 10 of 10.
+printf '<?php\n/**\n * Create the table to store 5\xe2\x80\x91minute bucket data.\n */\n' \
+    > "$WORK/real.php"
+if out="$(python3 "$TOOL" "$WORK/real.php" 2>&1)"; then
+    echo "    FAIL: the real U+2011 docblock was reported clean"
+    FAILED=$((FAILED + 1))
+elif ! grep -q '<U+2011>minute' <<<"$out"; then
+    echo "    FAIL: caught it but did not render it visibly"
+    printf '%s\n' "$out" | head -3 | sed 's/^/          /'
+    FAILED=$((FAILED + 1))
+fi
+
+echo "==> lookalikes are caught"
+printf 'a\xc2\xa0b\n'         > /dev/null; flagged nbsp     "U+00A0" < <(printf '<?php $a =\xc2\xa01;\n')
+flagged minus    "U+2212" < <(printf '<?php $a = \xe2\x88\x922;\n')
+flagged zwsp     "U+200B" < <(printf '<?php $a\xe2\x80\x8b = 1;\n')
+flagged bom      "U+FEFF" < <(printf '<?php $a = \xef\xbb\xbf1;\n')
+
+echo "==> ordinary source is not"
+clean house-style-prose <<'PHP'
+<?php
+/**
+ * The crawl ships in bursts — a quarter of five-minute windows genuinely have no
+ * pages — so an empty row is the common case rather than an edge one.
+ */
+class Metrics {}
+PHP
+
+clean ascii-only <<'PHP'
+<?php
+$label = '5-minute bucket';
+$range = "10:00-11:00";
+PHP
+
+clean curly-quotes-and-dashes <<'PHP'
+<?php
+// The en dash – and em dash — are visibly not hyphens, so nobody greps for one and misses.
+$copy = 'Don’t chart a gap as a zero.';
+PHP
+
+echo "==> the project's own source must pass"
+COUNT=0
+mapfile -t FILES < <(find /home/fabbs/dev/monolith/app /home/fabbs/dev/monolith/resources/views \
+                          /home/fabbs/dev/monolith/routes -type f -name '*.php' 2>/dev/null)
+COUNT=${#FILES[@]}
+if (( COUNT > 0 )) && ! out="$(python3 "$TOOL" "${FILES[@]}" 2>&1)"; then
+    echo "    FAIL: shipped source was flagged"
+    printf '%s\n' "$out" | head -6 | sed 's/^/          /'
+    FAILED=$((FAILED + 1))
+fi
+echo "    checked $COUNT shipped file(s)"
+
+echo
+if (( FAILED > 0 )); then
+    echo "$FAILED case(s) wrong."
+    exit 1
+fi
+echo "invisible-characters: every case correct."

@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""invisible-characters — characters in source that are not the character they look like.
+
+    tools/invisible-characters <file> [<file> ...]
+
+Exit 0 when clean, 1 when something was found, 2 when a file cannot be read.
+
+WHY THIS EXISTS
+
+A local model wrote `5‑minute` into a docblock — with U+2011 NON-BREAKING HYPHEN where a hyphen
+belonged. It did it twice, in two separate rounds, in the same position in the same phrase. Both
+rounds were ACCEPTED, 10 of 10 and 16 of 16 criteria, and shipped.
+
+Nothing could have caught it. It is valid UTF-8, it parses, it renders identically, and it reads
+correctly to a human reviewer at any font size. What it breaks is the next person's `grep
+"5-minute"`, which returns nothing and looks like an answer.
+
+That is the defect class this covers: a character that is visually indistinguishable from ASCII,
+so no reader will see it and every exact-match tool will disagree with them about what the file
+says.
+
+WHAT IS FLAGGED, AND WHAT IS NOT
+
+Flagged — invisible, or indistinguishable from ASCII at any size:
+
+    U+00A0  no-break space          looks like a space
+    U+2011  non-breaking hyphen     looks like -
+    U+2212  minus sign              looks like -
+    U+200B  zero width space        looks like nothing
+    U+200C  zero width non-joiner   looks like nothing
+    U+200D  zero width joiner       looks like nothing
+    U+2060  word joiner             looks like nothing
+    U+FEFF  zero width no-break     looks like nothing
+
+NOT flagged, deliberately:
+
+    U+2013 – and U+2014 —   en and em dashes. This codebase writes prose in its comments and uses
+                            them throughout; they are visibly not hyphens, so nobody greps for a
+                            hyphen and misses one. Flagging them would fire on almost every file
+                            here, and a gate that does that is a gate that gets disabled.
+    U+2018 U+2019 ‘ ’       curly quotes. Legitimate in user-facing strings, and again visibly
+                            different from the ASCII apostrophe.
+
+The rule is narrow on purpose: only characters that make a reader and a tool disagree about what
+the file says.
+"""
+
+from __future__ import annotations
+
+import sys
+import unicodedata
+
+SUSPECT: dict[str, str] = {
+    " ": "no-break space — looks like a space",
+    "‑": "non-breaking hyphen — looks like -",
+    "−": "minus sign — looks like -",
+    "​": "zero width space — invisible",
+    "‌": "zero width non-joiner — invisible",
+    "‍": "zero width joiner — invisible",
+    "⁠": "word joiner — invisible",
+    "﻿": "zero width no-break space — invisible",
+}
+
+
+def visible(line: str) -> str:
+    """The line with every suspect character replaced by its code point, so it can be seen.
+
+    Printing the raw line would reproduce the problem in the report: the reader sees a line that
+    looks entirely ordinary and is told it is wrong.
+    """
+    return "".join(f"<U+{ord(ch):04X}>" if ch in SUSPECT else ch for ch in line)
+
+
+def check(path: str) -> list[str]:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+    except UnicodeDecodeError:
+        return []                       # not text this tool can speak about
+    except OSError as exc:
+        return [f"{path}: cannot read: {exc}"]
+
+    problems: list[str] = []
+    for number, line in enumerate(lines, start=1):
+        found = {ch for ch in line if ch in SUSPECT}
+        if not found:
+            continue
+        for ch in sorted(found):
+            name = unicodedata.name(ch, "unnamed")
+            problems.append(f"{path}:{number}: U+{ord(ch):04X} {name} — {SUSPECT[ch]}")
+        problems.append(f"    {visible(line).strip()[:160]}")
+    return problems
+
+
+def main(argv: list[str]) -> int:
+    if not argv:
+        print("usage: invisible-characters <file> [...]", file=sys.stderr)
+        return 64
+
+    failed = 0
+    for path in argv:
+        problems = check(path)
+        if problems:
+            failed += 1
+            for problem in problems:
+                print(problem)
+
+    if failed:
+        print()
+        print(f"{failed} of {len(argv)} file(s) contain characters that are not what they look like.")
+        print("These parse, render and read correctly. They break the next exact-match search,")
+        print("which returns nothing and looks like an answer.")
+        return 1
+
+    print(f"{len(argv)} file(s): no invisible or ASCII-lookalike characters.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
