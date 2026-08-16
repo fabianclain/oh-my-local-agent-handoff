@@ -89,6 +89,44 @@ REPORT_TOOL = {"type": "function", "function": {
     "parameters": REPORT_SCHEMA}}
 
 
+SERVER_LOG = pathlib.Path.home() / ".cache" / "agent-handoff" / "llamacpp.log"
+
+
+def log_mark() -> int:
+    """Byte offset into llama-server's log, so a probe can be bracketed the way a round is.
+
+    providers/lcpp.sh already brackets token accounting this way; the same trick answers a
+    different question here.
+    """
+    try:
+        return SERVER_LOG.stat().st_size
+    except OSError:
+        return -1
+
+
+def discarded_since(mark: int) -> list[str]:
+    """Completions llama.cpp parsed and THREW AWAY while this probe ran.
+
+    This is the difference between "the model did not call the tool" and "the serving stack
+    discarded the call it made", and getting those two confused is the oldest, most expensive
+    mistake in this repository: qwen2.5-coder was recorded twice as fabricating a blocker to look
+    diligent while it was telling the truth, and LFM2.5 was written up as failing to edit files
+    when three of its write calls were silently dropped as unparseable.
+
+    The evidence is in llama-server's own log, under a warning nobody reads, and it does not
+    survive log rotation -- 99 archived samples were lost that way before anyone looked at them.
+    """
+    if mark < 0:
+        return []
+    try:
+        with SERVER_LOG.open("r", errors="replace") as handle:
+            handle.seek(mark)
+            return [line.split("unparsed peg-native output:", 1)[1].strip()[:300]
+                    for line in handle if "unparsed peg-native output" in line]
+    except OSError:
+        return []
+
+
 def post(path: str, payload: dict, timeout: int = TIMEOUT):
     request = urllib.request.Request(f"http://{HOST}:{PORT}{path}",
                                      data=json.dumps(payload).encode(),
@@ -172,10 +210,24 @@ def probe_call_after_result():
 
 
 def probe_large_arguments():
-    body = "<?php\n" + "\n".join(f"// filler {n}" for n in range(90))
+    """A REAL file in the argument, not a token-sized one.
+
+    The first version of this probe sent 1.1 KB and LFM2.5 passed it. In a real round the same
+    model emitted three write calls that llama.cpp could not parse and discarded -- as Python call
+    syntax, `write_file(path='...', content='<?php ...')` -- and every one of them was a write
+    carrying a multi-KB PHP file. Reads survived; the writes vanished; the round looked like a
+    model that explored and never edited, and once like a model that lied about having edited.
+    A probe that passes the case that breaks in production is worse than no probe, so this one
+    now carries what a plan's file actually weighs.
+    """
+    body = ("<?php\n\ndeclare(strict_types=1);\n\nnamespace Bench\\Fixture;\n\n"
+            "final class Big\n{\n"
+            + "\n".join(f"    /** filler {n} */\n    public function m{n}(): int {{ return {n}; }}"
+                        for n in range(70))
+            + "\n}\n")
     out = chat([{"role": "user", "content":
                  "Write src/Big.php with exactly this content, using write_file:\n\n" + body}],
-               [WRITE_TOOL], max_tokens=3000)
+               [WRITE_TOOL], max_tokens=8000)
     name, args = first_call(out["message"])
     facts = {"asked_bytes": len(body), "tokens": out["usage"].get("completion_tokens")}
     if name != "write_file" or args is None:
@@ -328,12 +380,22 @@ def capture(label: str | None) -> dict:
 
     results = {}
     for name, probe in PROBES:
+        mark = log_mark()
         try:
             status, detail, facts = probe()
         except urllib.error.HTTPError as error:
             status, detail, facts = "fail", f"HTTP {error.code}: {error.read()[:120]!r}", {}
         except (urllib.error.URLError, OSError) as error:
             status, detail, facts = "skip", f"transport: {error}", {}
+        # Whatever the verdict, say if the serving stack ate a completion while this ran. A probe
+        # that reports "no tool_calls" when the call was MADE and DISCARDED is describing the
+        # wrong component, and this project has attributed that to the model twice.
+        dropped = discarded_since(mark)
+        if dropped:
+            facts["discarded_completions"] = len(dropped)
+            facts["discarded_sample"] = dropped[0]
+            detail += (f"  [llama.cpp DISCARDED {len(dropped)} completion(s) during this probe — "
+                       f"the stack, not the model: {dropped[0][:90]!r}]")
         results[name] = {"status": status, "detail": detail, "facts": facts}
         mark = {"pass": "pass", "fail": "FAIL", "skip": "SKIP"}[status]
         print(f"  {mark:4}  {name:20} {detail}")

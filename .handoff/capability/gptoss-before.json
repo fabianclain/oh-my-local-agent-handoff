@@ -1,13 +1,13 @@
 {
   "model": "gpt-oss-20b (gpt-oss-20b-MXFP4.gguf)",
-  "label": "gpt-oss-20b MXFP4, pre-finetune",
+  "label": "gpt-oss-20b, harder large-arguments probe",
   "results": {
     "native-tool-call": {
       "status": "pass",
       "detail": "read_files('src/Discount.php')",
       "facts": {
         "tokens": 41,
-        "seconds": 0.9
+        "seconds": 1.0
       }
     },
     "call-after-result": {
@@ -16,16 +16,16 @@
       "facts": {
         "result_bytes": 19089,
         "tokens": 49,
-        "seconds": 4.2
+        "seconds": 1.6
       }
     },
     "large-arguments": {
       "status": "pass",
-      "detail": "1165 B argument survived",
+      "detail": "4739 B argument survived",
       "facts": {
-        "asked_bytes": 1165,
-        "tokens": 564,
-        "got_bytes": 1165
+        "asked_bytes": 4739,
+        "tokens": 1640,
+        "got_bytes": 4739
       }
     },
     "report-json": {
@@ -34,7 +34,7 @@
       "facts": {
         "chars": 106,
         "finish_reason": "stop",
-        "tokens": 90
+        "tokens": 100
       }
     },
     "report-tool": {
@@ -48,16 +48,16 @@
       "status": "pass",
       "detail": "status='complete'",
       "facts": {
-        "chars": 125,
+        "chars": 104,
         "finish_reason": "stop",
-        "tokens": 145
+        "tokens": 151
       }
     },
     "stop-discipline": {
       "status": "pass",
-      "detail": "34 tokens",
+      "detail": "43 tokens",
       "facts": {
-        "tokens": 34,
+        "tokens": 43,
         "finish_reason": "stop"
       }
     },

@@ -82,6 +82,31 @@ the value every gpt-oss number was measured at. A model that over-generates and 
 is what an over-hot sampler produces. Matching sampling keeps the comparison to one variable at the
 cost of running the model off its recommended profile, and a 0.2 arm is the honest follow-up.
 
+> **This verdict is NOT SAFE, and the reason was found the same day.** llama-server's own log shows
+> that during the LFM2.5 run it parsed and **discarded 3 of 189 completions (1.6%)** — and every
+> one of the three was a WRITE:
+>
+> ```
+> write_file(path='bench/fixtures/billing/Invoice.php', content='<?php\n\nnamespace Bench\ Fixture...')
+> write_file(path='bench/fixtures/billing/Invoice.php', content='<?php\n\nnamespace Bench\ Fixture...')
+> replace_in_file(path='bench/fixtures/billing/Proration.php', old='<?php ...')
+> ```
+>
+> Python call syntax, not the format the parser admits, each carrying a multi-KB PHP file. Reads
+> survived; the writes vanished. A model whose reads work and whose writes are silently dropped
+> produces exactly the two signatures recorded above: rounds that explore extensively and change
+> nothing, and one round that believed it had written the files and said so. **It was not lying.**
+>
+> This is the same fault family that had `qwen2.5-coder` recorded twice as fabricating a blocker to
+> look diligent while it was telling the truth, and it was attributed to the model here before the
+> log was read. 1.6% does not obviously account for every failure, so the honest statement is that
+> the mechanism was invisible and the verdict cannot stand on the evidence gathered.
+>
+> `tools/capability-baseline` passed LFM2.5 on `large-arguments` because that probe sent 1.1 KB.
+> It now sends ~4.7 KB, the weight of a real plan file, and every probe reports any completion the
+> stack discarded while it ran — so "the model did not call the tool" and "the stack threw the call
+> away" can no longer be confused.
+
 ### gemma-4-12B-agentic — passed the format gate its sibling fails, then ran out of room
 
 `gemma-4-12B-coder-fable5` is one of the four models rejected here for text tool calls.
@@ -183,6 +208,14 @@ present it restarts `monolith-llama.service`, whose `ExecStart` hardcodes
 took three attempts and two wrong diagnoses to see it. `LLAMACPP_UNIT=no-such-unit.service` is the
 workaround. The unit should read the model and context from the state files `llamacpp-serve`
 already writes, or `start` should refuse rather than serve something else.
+
+**Open — the most diagnostic artifact this stack produces is being deleted.** llama-server logs
+every completion it discards under `unparsed peg-native output:`, with the full text. Those logs
+are rotated on each server start and the old ones are pruned: **99 archived samples, the entire
+evidence base for the harmony fault, no longer exist on this machine.** Three survived, and those
+three overturned a model verdict. `providers/lcpp.sh` already brackets each round by byte offset
+into that log for token accounting; the same bracket would let a round copy its own discarded
+completions into its result directory, where they would outlive rotation.
 
 **Open — the unit and the manual server disagree about context.** The unit hardcodes `-c 65536`;
 the session had been running 98304. Whichever starts last wins, silently. Tonight's queue asserts
