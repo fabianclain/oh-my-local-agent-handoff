@@ -1464,6 +1464,16 @@ def main() -> int:
                     "type": "report_turn", "attempt": attempt,
                     "finishReason": choice.get("finish_reason"),
                     "chars": len(final),
+                    # WHERE the tokens went, which this event did not say and which is the whole
+                    # question when a report turn comes back empty. 14 of the archive's 40 lost
+                    # reports are a turn that generated 858, 1091, 1435, 2401 tokens against ZERO
+                    # characters of content -- and until now the log recorded only the zero, so
+                    # every diagnosis of it was inference. A turn with 1435 output tokens and 1400
+                    # reasoning characters is a model that thought and never answered; one with
+                    # 1435 output tokens and no reasoning either is something else entirely, and
+                    # the two were indistinguishable.
+                    "reasoningChars": len((choice.get("message") or {}).get(
+                        "reasoning_content") or ""),
                     "inputTokens": usage.get("prompt_tokens"),
                     "outputTokens": usage.get("completion_tokens")})
                 totals["in"] += usage.get("prompt_tokens") or 0
@@ -1478,6 +1488,20 @@ def main() -> int:
                                           "repaired": any(n.startswith(("NESTED", "PARTIAL"))
                                                           for n in provenance)})
                 if report is None:
+                    # The evidence, kept rather than described. A report that did not arrive is
+                    # the single most common non-success outcome here, and every past diagnosis
+                    # of it worked from token counts because the text itself was never written
+                    # down. Bounded, because a reasoning channel can run to thousands of tokens
+                    # and this is a diagnostic, not an archive.
+                    message = choice.get("message") or {}
+                    emit(log, "agent_event", {
+                        "type": "report_lost", "attempt": attempt,
+                        "finishReason": choice.get("finish_reason"),
+                        "contentChars": len(final),
+                        "reasoningChars": len(message.get("reasoning_content") or ""),
+                        "contentTail": final[-600:],
+                        "reasoningTail": (message.get("reasoning_content") or "")[-900:],
+                        "rawTail": (message.get("_raw_harmony") or "")[-600:]})
                     emit(log, "agent_event", {"type": "error", "error": {"message": (
                         f"report turn {attempt}: no JSON object in "
                         f"{len(final)} chars (finish_reason="

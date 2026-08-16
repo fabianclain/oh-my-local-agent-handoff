@@ -113,20 +113,44 @@ def _rule(schema: dict, path: list[str], rules: dict[str, str], root: str = "roo
         unknown = [r for r in required if r not in properties]
         if unknown:
             raise Unsupported(f"{_name(path, root)}: required names no such property: {unknown}")
-        if set(required) != set(properties):
-            # Optional properties need every subset in order, which is a combinatorial rule this
-            # does not build. Nothing in this project's schemas has one; say so rather than emit a
-            # grammar that quietly requires them all.
-            raise Unsupported(
-                f"{_name(path, root)}: optional properties are not implemented "
-                f"(missing from required: {sorted(set(properties) - set(required))})")
+        # OPTIONAL PROPERTIES, which the first version refused as combinatorial. They are not,
+        # because this grammar already fixes key ORDER: with the required members emitted first and
+        # each optional one wrapped as `( "," key ":" value )?` in a fixed sequence, every admissible
+        # document is matched and no subset needs enumerating. The refusal was correct about not
+        # approximating and wrong about the cost, and it fired on the first real schema this saw
+        # that was not the one it was written against.
+        #
+        # An all-optional object is still refused: the leading comma has nothing to attach to, and
+        # getting that wrong yields a grammar that accepts `{,"a":1}`.
+        optional = [k for k in properties if k not in required]
 
-        parts = []
-        for index, key in enumerate(properties):
+        def member(key: str) -> str:
             child = _rule(properties[key], path + [key], rules, root)
             literal = '"' + json.dumps(key).replace('"', '\\"') + '"'
+            return f'{literal} ws ":" ws {child}'
+
+        if optional and not required:
+            # Every member optional, so the comma cannot be attached to a fixed head. Still not
+            # combinatorial: key ORDER is fixed, so one alternative per possible FIRST member --
+            # each carrying the rest as optional tails -- matches every admissible document in n
+            # rules rather than 2^n. The first attempt refused this case outright; refusing was
+            # right about not approximating and wrong that there was no cheap construction.
+            alternatives = []
+            for index, key in enumerate(optional):
+                tail = "".join(f' (ws "," ws {member(later)})?' for later in optional[index + 1:])
+                alternatives.append(f"({member(key)}{tail})")
+            rule = _name(path, root)
+            if rule in rules:
+                raise Unsupported(f"rule name collision on {rule!r}")
+            rules[rule] = '"{" ws (' + " | ".join(alternatives) + ')? ws "}"'
+            return rule
+
+        parts = []
+        for index, key in enumerate(k for k in properties if k in required):
             separator = ' ws "," ws ' if index else " "
-            parts.append(f'{separator}{literal} ws ":" ws {child}')
+            parts.append(f'{separator}{member(key)}')
+        for key in optional:
+            parts.append(f' (ws "," ws {member(key)})?')
         rule = _name(path, root)
         if rule in rules:
             # Two different positions sanitised to the same rule name; the second would silently

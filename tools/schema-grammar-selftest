@@ -145,18 +145,34 @@ for label, schema in [
 else:
     pas("oneOf, $ref and tuple items each raise")
 
-print("==> 7/12 optional properties are refused rather than quietly required")
+print("==> 7/12 an optional property is optional, not quietly mandatory")
+# This case used to assert a REFUSAL. Optional properties were declined as combinatorial, and they
+# are not: key order is already fixed by this grammar, so each optional member is `( "," k : v )?`
+# in sequence and every admissible document matches. The refusal fired on the first schema this saw
+# that it had not been written against, which is how the cost got re-examined.
 optional = {"type": "object", "additionalProperties": False, "required": ["a"],
             "properties": {"a": {"type": "string"}, "b": {"type": "string"}}}
-try:
-    sg.schema_grammar(optional)
-except sg.Unsupported as error:
-    if "optional" in str(error):
-        pas("refused, and says which property is not required")
-    else:
-        bad("refused for the wrong reason", str(error))
+g7 = sg.schema_grammar(optional)
+root7 = roots_in(g7)[0]
+if '"\\"b\\""' not in root7:
+    bad("the optional property is missing from the grammar entirely", root7)
+elif "(ws \",\" ws \"\\\"b\\\"\"" not in root7:
+    bad("`b` is present but not wrapped as optional; a valid report omitting it would be rejected",
+        root7)
 else:
-    bad("an optional property was silently made mandatory; valid reports would be rejected")
+    pas("required `a` always, `b` in an optional group")
+
+print("==> 7b/12 an all-optional object needs no combinatorial blow-up")
+allopt = {"type": "object", "additionalProperties": False,
+          "properties": {"p": {"type": "string"}, "q": {"type": "string"}}}
+g7b = sg.schema_grammar(allopt)
+root7b = roots_in(g7b)[0]
+if root7b.count("|") != 1:
+    bad(f"expected one alternative per possible first member, got {root7b.count('|') + 1}", root7b)
+elif not root7b.startswith('root ::= "{" ws ('):
+    bad("the whole member list is not optional; `{}` would be rejected", root7b)
+else:
+    pas("one alternative per first member, and the empty object is admissible")
 
 print("==> 8/12 additionalProperties: true is refused")
 open_schema = {"type": "object", "additionalProperties": True, "required": ["a"],

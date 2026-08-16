@@ -234,7 +234,7 @@ def main() -> int:
                         help="a tools/wire-log session directory — exact bytes, nothing rebuilt")
     parser.add_argument("--exchange", type=int, default=None,
                         help="which captured exchange (1-based); default is the last, the report turn")
-    parser.add_argument("--variant", choices=sorted(ASKS), default="message")
+    parser.add_argument("--variant", choices=sorted(set(ASKS) | {"grammar"}), default="message")
     parser.add_argument("--repeat", type=int, default=8)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8071)
@@ -257,13 +257,15 @@ def main() -> int:
         # measure a different question; appending is only right when the last message is not
         # already the request for a report.
         if args.variant != "asis":
-            ask = ASKS[args.variant].replace("{schema}", json.dumps(schema, indent=2))
+            ask = ASKS["message" if args.variant == "grammar" else args.variant]\
+            .replace("{schema}", json.dumps(schema, indent=2))
             messages = messages + [{"role": "user", "content": ask}]
     else:
         if not args.result_dir:
             raise SystemExit("pass a result directory, or --wire <session>")
         messages, provenance = rebuild(args.result_dir, probe)
-        ask = ASKS[args.variant].replace("{schema}", json.dumps(schema, indent=2))
+        ask = ASKS["message" if args.variant == "grammar" else args.variant]\
+            .replace("{schema}", json.dumps(schema, indent=2))
         messages = messages + [{"role": "user", "content": ask}]
         tools = list(probe.TOOLS) + ([probe.REPORT_TOOL] if args.variant == "tool" else [])
 
@@ -316,11 +318,29 @@ def main() -> int:
     counts: dict[str, int] = {}
     depth_seen = 0
     for index in range(args.repeat):
-        payload = {"model": args.model, "messages": messages, "tools": tools, "stream": False,
-                   "temperature": args.temp, "seed": 2000 + index}
-        request = urllib.request.Request(
-            f"http://{args.host}:{args.port}/v1/chat/completions",
-            data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
+        if args.variant == "grammar":
+            # The report turn as providers/nativegrammar.sh asks it: the prompt built here, and a
+            # GBNF from the schema wrapped in the harmony final-message envelope. The point is
+            # that `tool-call` and `empty` are not shapes this grammar can produce -- so if the
+            # unconstrained variant fails at 41.7% and this one does not, the fix is mechanical
+            # rather than persuasive.
+            sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+            import harmony_render  # noqa: PLC0415
+            import schema_grammar  # noqa: PLC0415
+
+            prompt = harmony_render.render_prompt(messages, [])
+            payload = {"prompt": prompt, "n_predict": 2000, "temperature": args.temp,
+                       "seed": 2000 + index,
+                       "grammar": schema_grammar.harmony_report_grammar(schema)}
+            request = urllib.request.Request(
+                f"http://{args.host}:{args.port}/completions",
+                data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
+        else:
+            payload = {"model": args.model, "messages": messages, "tools": tools, "stream": False,
+                       "temperature": args.temp, "seed": 2000 + index}
+            request = urllib.request.Request(
+                f"http://{args.host}:{args.port}/v1/chat/completions",
+                data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
         try:
             with urllib.request.urlopen(request, timeout=args.timeout) as response:
                 body = json.loads(response.read().decode("utf-8", "replace"))
@@ -333,8 +353,17 @@ def main() -> int:
         except Exception as error:  # noqa: BLE001
             counts["http-error"] = counts.get("http-error", 0) + 1
             continue
-        depth_seen = (body.get("usage") or {}).get("prompt_tokens", depth_seen)
-        kind, _ = probe.classify_response(body, schema, args.variant == "tool")
+        if args.variant == "grammar":
+            depth_seen = body.get("tokens_evaluated", depth_seen)
+            raw = body.get("content") or ""
+            try:
+                obj = json.loads(raw.split("<|message|>")[-1].rsplit("<|return|>", 1)[0])
+                kind = "ok" if all(k in obj for k in (schema.get("required") or [])) else "partial"
+            except Exception:  # noqa: BLE001
+                kind = "unparsed"
+        else:
+            depth_seen = (body.get("usage") or {}).get("prompt_tokens", depth_seen)
+            kind, _ = probe.classify_response(body, schema, args.variant == "tool")
         counts[kind] = counts.get(kind, 0) + 1
 
     print()

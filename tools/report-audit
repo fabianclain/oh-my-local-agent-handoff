@@ -117,8 +117,19 @@ def analyse(run: pathlib.Path) -> dict:
     # Why it was lost, when it was. Ordered by which fix it argues for.
     reason = ""
     if channel == "none":
+        # ORDER MATTERS, and it was wrong. `turn-limit` was tested before the fallback's own shape,
+        # so 14 runs were labelled "turn limit reached" when the fallback had in fact run twice and
+        # come back EMPTY -- 858, 1091 and 1435 output tokens against zero characters of content.
+        # The model spent the report turn reasoning and never emitted a final message. That is a
+        # different fault with a different fix, and the label sent every reader to the turn cap.
+        spent = [t for t in report_turns
+                 if not (t.get("chars") or 0) and (t.get("outputTokens") or 0) > 40]
         if peg_faults and peg_faults > peg_retries:
             reason = "peg fault ended the call"
+        elif spent:
+            worst = max(spent, key=lambda t: t.get("outputTokens") or 0)
+            reason = (f"reasoned {worst.get('outputTokens')} tokens and emitted no final message "
+                      f"({len(spent)} of {len(report_turns)} report turns empty)")
         elif "turn-limit" in finishes:
             reason = "turn limit reached"
         elif "context-budget" in finishes:

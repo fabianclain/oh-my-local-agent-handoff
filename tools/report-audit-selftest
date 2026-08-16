@@ -103,6 +103,33 @@ CASES = [
     # The answerability rule, applied to this tool's own history. Every run archived before the
     # provenance events existed carries no evidence either way, and `False` would be a claim about
     # 114 real runs that nothing supports.
+    # The mis-attribution this tool shipped with. `turn-limit` was tested before the fallback's
+    # own shape, so a round whose fallback ran twice and came back EMPTY -- 1435 output tokens,
+    # zero characters -- was reported as "turn limit reached". 14 of the archive's 40 lost reports
+    # were labelled that way, sending every reader to the turn cap for a fault that has nothing to
+    # do with it: the model reasoned and never emitted a final message.
+    ("a fallback that reasoned and said nothing is not blamed on the turn limit",
+     [usage(21000),
+      ev({"type": "report_turn", "attempt": 1, "finishReason": "stop", "chars": 0,
+          "outputTokens": 1435}),
+      ev({"type": "report_turn", "attempt": 2, "finishReason": "stop", "chars": 0,
+          "outputTokens": 858}),
+      ev({"type": "run_result", "finishReason": "turn-limit"})],
+     {}, "patch-ok-no-report",
+     {"channel": "none", "reason": "reasoned 1435 tokens and emitted no final message "
+                                   "(2 of 2 report turns empty)"}),
+
+    # And the control that keeps the new label meaningful: a SHORT empty reply is a different
+    # thing. A model that stopped after 12 tokens did not spend the turn reasoning, and labelling
+    # it the same way would make "reasoned N tokens" mean nothing. The threshold is 40 tokens.
+    ("a turn that produced almost nothing is not called reasoning",
+     [usage(21000),
+      ev({"type": "report_turn", "attempt": 1, "finishReason": "stop", "chars": 0,
+          "outputTokens": 12}),
+      ev({"type": "content_end", "contentType": "text", "text": ""})],
+     {}, "patch-ok-no-report",
+     {"channel": "none", "reason": "fallback returned nothing"}),
+
     ("a run from before the instrumentation is UNKNOWN, not 'not repaired'",
      [usage(16300), ev({"type": "report_turn", "attempt": 1, "finishReason": "stop",
                         "chars": 400})],
