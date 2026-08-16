@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""blade-balance — every Blade control directive is closed, by the right closer.
+
+    tools/blade-balance <file.blade.php> [<file.blade.php> ...]
+
+Exit 0 when balanced, 1 when not, 2 when a file cannot be read.
+
+WHY THIS EXISTS
+
+A real round failed on one word: `@else` where `@endif` belonged. Nothing caught it.
+
+    php -l          passes. Blade directives are not PHP; the file it checks is the
+                    template, and the template is a valid PHP file containing text.
+    view-lint       passes. It checks HTML tag balance, the 100vh trap and headings —
+                    all real, none of them about directives.
+    the test suite   passes, unless a test happens to render that exact branch.
+
+The breakage exists only in the COMPILED view, which nothing in the harness looked at. So the
+gate that judged that round could see a well-formed HTML document wrapped around a template that
+cannot render, and said yes.
+
+That is the shape this project keeps paying for: a check that is real, and adjacent to the thing
+that broke.
+
+WHAT IS NOT CHECKED, AND WHY
+
+Named separately rather than omitted, because a gate that quietly checks less than you think is
+worse than no gate — it converts absence of evidence into apparent evidence of absence.
+
+  @section    `@section('title', 'Value')` is self-closing and `@section('body')` is not, and
+              telling them apart means parsing the argument list for a comma that is not inside
+              a string. Ambiguous input makes a false positive, and a gate that fires on correct
+              templates is one that gets deleted.
+  @component  the same shape, and superseded by class components in this codebase.
+  @include    takes no closer at all.
+
+Custom directives registered with Blade::directive() are unknown here by construction; anything
+this does not recognise is left alone rather than guessed at.
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+
+# opener -> the closers that may end it. Several directives accept more than one.
+BLOCKS: dict[str, set[str]] = {
+    "if": {"endif"},
+    "unless": {"endunless"},
+    "isset": {"endisset"},
+    "empty": {"endempty"},          # only the @empty($x) form; see split_empty below
+    "foreach": {"endforeach"},
+    "forelse": {"endforelse"},
+    "for": {"endfor"},
+    "while": {"endwhile"},
+    "switch": {"endswitch"},
+    "php": {"endphp"},              # only the block form; @php(...) is inline
+    "push": {"endpush"},
+    "pushonce": {"endpushonce"},
+    "prepend": {"endprepend"},
+    "once": {"endonce"},
+    "auth": {"endauth"},
+    "guest": {"endguest"},
+    "can": {"endcan"},
+    "cannot": {"endcannot"},
+    "canany": {"endcanany"},
+    "error": {"enderror"},
+    "verbatim": {"endverbatim"},
+    "fragment": {"endfragment"},
+    "session": {"endsession"},
+}
+
+CLOSERS: dict[str, str] = {
+    closer: opener for opener, closers in BLOCKS.items() for closer in closers
+}
+
+# A directive that is legal only inside a particular block, and does not open or close one.
+INSIDE: dict[str, set[str]] = {
+    "else": {"if", "unless", "isset", "empty", "auth", "guest", "can", "cannot", "canany", "error"},
+    "elseif": {"if"},
+    "elsecan": {"can"},
+    "elsecannot": {"cannot"},
+    "elseauth": {"auth"},
+    "elseguest": {"guest"},
+    "case": {"switch"},
+    "default": {"switch"},
+}
+
+DIRECTIVE = re.compile(r"@(\w+)")
+# `{{-- ... --}}` may span lines, so comments are stripped from the whole source first.
+COMMENT = re.compile(r"\{\{--.*?--\}\}", re.DOTALL)
+# `@@if` is an escaped literal, not a directive.
+ESCAPED = re.compile(r"@@\w+")
+
+
+def has_parens(source: str, end: int) -> bool:
+    """Does the directive at this position take an argument list?
+
+    `@empty` closes a @forelse; `@empty($items)` opens a block of its own. Same word, opposite
+    meaning, and the only thing separating them is the parenthesis. `@php` / `@php(...)` is the
+    same distinction: one opens a block, the other is a one-line statement.
+    """
+    rest = source[end:]
+    stripped = rest.lstrip(" \t")
+    return stripped.startswith("(")
+
+
+def check(path: str) -> list[str]:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            source = handle.read()
+    except OSError as exc:
+        return [f"cannot read: {exc}"]
+
+    source = COMMENT.sub(lambda m: "\n" * m.group(0).count("\n"), source)
+    source = ESCAPED.sub("", source)
+
+    problems: list[str] = []
+    stack: list[tuple[str, int]] = []
+    verbatim_depth = 0
+
+    for match in DIRECTIVE.finditer(source):
+        word = match.group(1)
+        line = source.count("\n", 0, match.start()) + 1
+
+        # Inside @verbatim everything is literal output, including things that look like
+        # directives. Only @endverbatim means anything.
+        if verbatim_depth:
+            if word == "endverbatim":
+                verbatim_depth -= 1
+                stack.pop()
+            continue
+
+        if word == "verbatim":
+            verbatim_depth += 1
+            stack.append((word, line))
+            continue
+
+        if word in CLOSERS:
+            opener = CLOSERS[word]
+            if not stack:
+                problems.append(f"{path}:{line}: @{word} closes nothing")
+            elif stack[-1][0] != opener:
+                open_word, open_line = stack[-1]
+                problems.append(
+                    f"{path}:{line}: @{word} does not close @{open_word} opened at line {open_line}"
+                )
+                stack.pop()
+            else:
+                stack.pop()
+            continue
+
+        if word in BLOCKS:
+            # See has_parens: these two words mean different things with and without an argument.
+            if word in ("empty", "php") and not has_parens(source, match.end()):
+                if word == "empty":
+                    # A bare @empty belongs to a @forelse and closes nothing.
+                    if not any(open_word == "forelse" for open_word, _ in stack):
+                        problems.append(f"{path}:{line}: @empty outside any @forelse")
+                    continue
+                # A bare @php opens a block that @endphp closes.
+                stack.append((word, line))
+                continue
+            if word == "php":
+                continue                      # @php(...) is a one-line statement
+            stack.append((word, line))
+            continue
+
+        if word in INSIDE:
+            allowed = INSIDE[word]
+            if not stack or stack[-1][0] not in allowed:
+                where = f"inside @{stack[-1][0]}" if stack else "outside any block"
+                expected = " or ".join("@" + name for name in sorted(allowed))
+                problems.append(
+                    f"{path}:{line}: @{word} appears {where}; it belongs to {expected}"
+                )
+            continue
+
+    for open_word, open_line in stack:
+        problems.append(
+            f"{path}:{open_line}: @{open_word} is never closed "
+            f"(expected {' or '.join('@' + c for c in sorted(BLOCKS[open_word]))})"
+        )
+
+    return problems
+
+
+def main(argv: list[str]) -> int:
+    if not argv:
+        print("usage: blade-balance <file.blade.php> [...]", file=sys.stderr)
+        return 64
+
+    failed = 0
+    for path in argv:
+        problems = check(path)
+        if problems:
+            failed += 1
+            for problem in problems:
+                print(problem)
+
+    if failed:
+        print()
+        print(f"{failed} of {len(argv)} template(s) have unbalanced directives.")
+        print("These parse as PHP and pass an HTML tag check. They break only when rendered.")
+        return 1
+
+    print(f"{len(argv)} template(s): every directive closed by its own closer.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

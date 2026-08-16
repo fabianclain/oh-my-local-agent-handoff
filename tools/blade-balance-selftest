@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+#
+# blade-balance-selftest — the directive gate, from both sides.
+#
+#   tools/blade-balance-selftest
+#
+# The permitted half matters more than the refused half here. This gate would run against every
+# view a plan touches, and a check that fires on a correct template is one a reader disables. So
+# every ordinary Blade construction below must pass, including the ones that look unbalanced and
+# are not: a bare @empty inside @forelse, an inline @php(...), directives quoted inside @verbatim,
+# and an escaped @@if.
+
+set -uo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+TOOL="$HERE/blade-balance"
+WORK="$(mktemp -d)"
+FAILED=0
+trap 'rm -rf "$WORK"' EXIT
+
+# balanced <name> <<'BLADE' ... BLADE
+balanced() {
+    local name="$1" file="$WORK/$1.blade.php"
+    cat >"$file"
+    if ! out="$(python3 "$TOOL" "$file" 2>&1)"; then
+        echo "    FAIL: '$name' is correct Blade but was reported unbalanced"
+        printf '%s\n' "$out" | sed 's/^/          /'
+        FAILED=$((FAILED + 1))
+    fi
+}
+
+unbalanced() {
+    local name="$1" expect="$2" file="$WORK/$1.blade.php"
+    cat >"$file"
+    if out="$(python3 "$TOOL" "$file" 2>&1)"; then
+        echo "    FAIL: '$name' is broken Blade and was reported balanced"
+        FAILED=$((FAILED + 1))
+    elif ! grep -qi -- "$expect" <<<"$out"; then
+        echo "    FAIL: '$name' was caught, but not for the stated reason (wanted /$expect/)"
+        printf '%s\n' "$out" | sed 's/^/          /'
+        FAILED=$((FAILED + 1))
+    fi
+}
+
+echo "==> the failure this exists for"
+unbalanced else-for-endif "never closed" <<'BLADE'
+<div>
+@if ($ready)
+    <p>ready</p>
+@else
+    <p>waiting</p>
+@else
+</div>
+BLADE
+
+echo "==> ordinary templates must pass"
+balanced simple-if <<'BLADE'
+@if ($a)
+    <p>a</p>
+@elseif ($b)
+    <p>b</p>
+@else
+    <p>c</p>
+@endif
+BLADE
+
+balanced nested <<'BLADE'
+@foreach ($rows as $row)
+    @if ($row->ok)
+        @foreach ($row->items as $item)
+            <span>{{ $item }}</span>
+        @endforeach
+    @endif
+@endforeach
+BLADE
+
+# A bare @empty belongs to @forelse and closes nothing. Reading it as a closer would fail every
+# forelse in the codebase.
+balanced forelse-empty <<'BLADE'
+@forelse ($items as $item)
+    <li>{{ $item }}</li>
+@empty
+    <li>none</li>
+@endforelse
+BLADE
+
+# The same word with an argument opens a block of its own.
+balanced empty-block <<'BLADE'
+@empty($items)
+    <p>nothing</p>
+@endempty
+BLADE
+
+balanced php-both-forms <<'BLADE'
+@php($total = 0)
+@php
+    $total = collect($rows)->sum();
+@endphp
+<p>{{ $total }}</p>
+BLADE
+
+balanced switch <<'BLADE'
+@switch ($state)
+    @case ('on')
+        <p>on</p>
+        @break
+    @default
+        <p>off</p>
+@endswitch
+BLADE
+
+# Everything inside @verbatim is literal output, including things that look like directives.
+balanced verbatim <<'BLADE'
+@verbatim
+    <div>@if (x) this is text, not a directive</div>
+@endverbatim
+BLADE
+
+balanced escaped-and-commented <<'BLADE'
+{{-- @if ($x) a commented directive @endif --}}
+<p>@@if is printed literally</p>
+@if ($y)
+    <p>y</p>
+@endif
+BLADE
+
+balanced auth-can-error <<'BLADE'
+@auth
+    @can ('edit', $post)
+        <p>edit</p>
+    @endcan
+@endauth
+@error ('name')
+    <p>{{ $message }}</p>
+@enderror
+BLADE
+
+echo "==> broken templates must be caught"
+unbalanced wrong-closer "does not close" <<'BLADE'
+@if ($a)
+    <p>a</p>
+@endforeach
+BLADE
+
+unbalanced orphan-else "belongs to" <<'BLADE'
+<p>hello</p>
+@else
+    <p>what</p>
+BLADE
+
+unbalanced closes-nothing "closes nothing" <<'BLADE'
+<p>hello</p>
+@endif
+BLADE
+
+unbalanced unclosed-foreach "never closed" <<'BLADE'
+@foreach ($rows as $row)
+    <p>{{ $row }}</p>
+BLADE
+
+unbalanced empty-outside-forelse "outside any @forelse" <<'BLADE'
+@foreach ($rows as $row)
+    <p>{{ $row }}</p>
+@empty
+@endforeach
+BLADE
+
+echo "==> the project's own views must pass"
+REAL=0
+while IFS= read -r view; do
+    REAL=$((REAL + 1))
+    if ! out="$(python3 "$TOOL" "$view" 2>&1)"; then
+        echo "    FAIL: a shipped view was reported unbalanced: $view"
+        printf '%s\n' "$out" | head -4 | sed 's/^/          /'
+        FAILED=$((FAILED + 1))
+    fi
+done < <(find /home/fabbs/dev/monolith/resources/views -name '*.blade.php' 2>/dev/null | head -400)
+echo "    checked $REAL shipped view(s)"
+
+echo
+if (( FAILED > 0 )); then
+    echo "$FAILED case(s) wrong."
+    exit 1
+fi
+echo "blade-balance: every case correct."
