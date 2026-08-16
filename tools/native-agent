@@ -735,7 +735,7 @@ RECIPIENT = re.compile(r"(?:to=)?functions\.([A-Za-z_][A-Za-z0-9_]*)")
 CHANNEL_NAME = re.compile(r"<\|channel\|>\s*([A-Za-z]+)")
 
 
-def parse_harmony(text: str) -> dict:
+def parse_harmony(text: str, notes: "list[str] | None" = None) -> dict:
     """Read gpt-oss's harmony output leniently, and return it in OpenAI message shape.
 
     llama.cpp discards a completion whose header it cannot map, and answers HTTP 500 with the text
@@ -763,12 +763,28 @@ def parse_harmony(text: str) -> dict:
     calls, reasoning, content = [], [], []
     for chunk in HARMONY_SPLIT.split(text):
         if "<|message|>" not in chunk:
+            if notes is not None and chunk.strip():
+                # Dropped on purpose -- see the docstring. Recorded because dropping a segment is
+                # the one place this parser can lose a tool call, and it did so silently.
+                notes.append("segment-dropped-no-message")
             continue
         header, _, body = chunk.partition("<|message|>")
 
         recipient = RECIPIENT.search(header)
         channels = CHANNEL_NAME.findall(header)
         channel = next((c for c in channels if c in ("analysis", "commentary", "final")), "")
+
+        if notes is not None:
+            # Each of the three documented tolerances, named only when it actually fired. A run
+            # where none fire is the common case and must stay silent, or the signal is worthless.
+            if recipient and "to=" not in recipient.group(0):
+                notes.append("recipient-without-to")
+            if "<|constrain|>" in header:
+                notes.append("constrain-ignored")
+            if len(channels) > 1:
+                notes.append("repeated-channel")
+            if not recipient and not channel:
+                notes.append("unreadable-channel-taken-as-final")
 
         if recipient:
             calls.append({"id": f"call-{len(calls) + 1}", "type": "function",
@@ -804,7 +820,8 @@ def call_model_raw(host: str, port: int, messages: list[dict], tools: list[dict]
     usage = {"prompt_tokens": body.get("tokens_evaluated") or 0,
              "completion_tokens": body.get("tokens_predicted") or 0}
     raw = body.get("content") or ""
-    message = parse_harmony(raw)
+    harmony_notes: list[str] = []
+    message = parse_harmony(raw, harmony_notes)
     # Keep the raw completion whenever the parse produced a tool call whose arguments are not
     # JSON. Owning the parser means owning its failures, and the first round of them was not
     # diagnosable at all: the loop reported "submit_report arguments did not parse as JSON" and
@@ -816,7 +833,10 @@ def call_model_raw(host: str, port: int, messages: list[dict], tools: list[dict]
         except (ValueError, TypeError):
             message["_raw_harmony"] = raw[-2000:]
             break
-    return {"choices": [{"message": message, "finish_reason": "stop"}], "usage": usage}
+    # Which tolerances this completion needed. Carried on the BODY rather than the message,
+    # because the message is appended to the conversation and sent back to the server.
+    return {"choices": [{"message": message, "finish_reason": "stop"}], "usage": usage,
+            "_harmony_notes": harmony_notes}
 
 
 def http_post(host: str, port: int, path: str, payload: dict, timeout: int) -> bytes:
@@ -846,11 +866,21 @@ def call_model(host: str, port: int, model: str, messages: list[dict], tools: li
         return json.loads(response.read().decode("utf-8", "replace"))
 
 
-def _balanced_objects(text: str):
-    """Every balanced {...} in `text` that parses to an object, in order of appearance.
+def _balanced_objects(text: str, nesting: int = 0):
+    """Every balanced {...} in `text` that parses to an object, as (object, nesting).
 
     Also descends into string VALUES that themselves contain JSON. That is not defensive
     generality — it is the observed case. See extract_json_object.
+
+    `nesting` is 0 for an object found in the text itself and 1+ for one dug out of a string
+    value. It is carried so the caller can say which happened, because those are very different
+    events: 0 is the model answering, and 1 is the harness reconstructing an answer from inside a
+    mangled tool call. Both used to be recorded as "reported".
+
+    Named `nesting`, not `depth`: `depth` is already this function's brace counter, and calling
+    the parameter that made every object report 0 because the counter is back to zero by the time
+    the yield runs. The selftest's nested case caught it immediately, which is the only reason it
+    is not still there.
     """
     candidates = []
     depth = 0
@@ -885,13 +915,14 @@ def _balanced_objects(text: str):
             continue
         if not isinstance(parsed, dict):
             continue
-        yield parsed
+        yield parsed, nesting
         for value in parsed.values():
             if isinstance(value, str) and "{" in value:
-                yield from _balanced_objects(value)
+                yield from _balanced_objects(value, nesting + 1)
 
 
-def extract_json_object(text: str, wanted: "frozenset[str] | set[str] | tuple" = ()):
+def extract_json_object(text: str, wanted: "frozenset[str] | set[str] | tuple" = (),
+                        notes: "list[str] | None" = None):
     """Find the REPORT inside whatever the model actually said.
 
     `wanted` is the set of keys the report schema declares. Without it this returns the last
@@ -916,12 +947,35 @@ def extract_json_object(text: str, wanted: "frozenset[str] | set[str] | tuple" =
     wanted = set(wanted)
     best = None
     best_score = -1
-    for candidate in _balanced_objects(text):
+    best_depth = 0
+    seen = 0
+    ties = 0
+    for candidate, nesting in _balanced_objects(text):
+        seen += 1
         score = len(wanted & set(candidate))
         # >= rather than > so that, on a tie, the LAST match wins: a model that reasons and then
         # answers puts the answer at the end.
+        if score == best_score:
+            ties += 1
         if score >= best_score:
-            best, best_score = candidate, score
+            best, best_score, best_depth = candidate, score, nesting
+    if notes is not None:
+        # What this cost. A report that arrived clean and one dug out of a mangled tool call used
+        # to produce identical logs, so the harness could not tell how often it was rescuing a
+        # round -- and a rescue rate is exactly the number you need before deciding whether to
+        # stop repairing and start preventing. See docs/answerability.md: the same objection as a
+        # gate that answers a question it could not ask.
+        notes.append(f"candidates={seen}")
+        if best is None:
+            notes.append("no-object")
+        else:
+            notes.append(f"score={best_score}/{len(wanted)}")
+            if best_depth:
+                notes.append(f"NESTED-depth-{best_depth}")
+            if ties:
+                notes.append(f"ties={ties}")
+            if wanted and best_score < len(wanted):
+                notes.append("PARTIAL-schema-match")
     return best
 
 
@@ -1088,6 +1142,11 @@ def main() -> int:
             if reasoning:
                 emit(log, "agent_event", {"type": "content_end", "contentType": "reasoning",
                                           "reasoning": reasoning})
+            if body.get("_harmony_notes"):
+                # Only when a tolerance actually fired. A silent completion is the common case and
+                # emitting it every turn would bury the ones that mattered.
+                emit(log, "agent_event", {"type": "harmony_tolerance",
+                                          "notes": body["_harmony_notes"]})
             if message.get("_raw_harmony"):
                 emit(log, "agent_event", {"type": "error", "error": {"message": (
                     "raw-harmony: a tool call parsed with non-JSON arguments; tail of the "
@@ -1234,7 +1293,15 @@ def main() -> int:
                     "outputTokens": usage.get("completion_tokens")})
                 totals["in"] += usage.get("prompt_tokens") or 0
                 totals["out"] += usage.get("completion_tokens") or 0
-                report = extract_json_object(final, report_keys)
+                provenance: list[str] = []
+                report = extract_json_object(final, report_keys, provenance)
+                # How hard the extractor had to work is a result, not a debug detail. A round
+                # rescued from depth 1 counts as reported today and is indistinguishable from one
+                # the model simply answered; tools/report-audit can now separate them.
+                emit(log, "agent_event", {"type": "report_provenance", "attempt": attempt,
+                                          "notes": provenance,
+                                          "repaired": any(n.startswith(("NESTED", "PARTIAL"))
+                                                          for n in provenance)})
                 if report is None:
                     emit(log, "agent_event", {"type": "error", "error": {"message": (
                         f"report turn {attempt}: no JSON object in "

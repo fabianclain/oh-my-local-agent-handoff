@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""repair-provenance-selftest — when the harness repairs something, does it say so?
+
+    tools/repair-provenance-selftest
+
+This harness repairs a great deal. `parse_harmony` is tolerant in three documented ways and
+recovers completions llama.cpp discards outright; `extract_json_object` scores every balanced
+object in the reply and will dig one out of a string value inside a mangled tool call. Both work.
+Neither used to leave a trace.
+
+So a report the model simply answered, and a report the harness reconstructed from wreckage, were
+BYTE-IDENTICAL in the log. Both counted as `reported`. That matters for one specific reason: the
+rescue rate is exactly the number you need before deciding whether to keep repairing or start
+preventing, and it could not be computed from any artefact this project produced.
+
+It is also the repository's oldest fault family pointed at its own recovery code. docs/answerability
+exists because five gates answered questions they could not ask; this is the same objection one
+layer down — an answer that arrived by reconstruction, presented as though it arrived by reply.
+
+The idea is borrowed from lm-format-enforcer, which exposes `output_scores` so you can see what the
+model WOULD have emitted against what the constraint forced. Same instinct from the other side:
+record what the machinery overrode.
+
+CASES 1 AND 6 ARE THE ONES THAT MAKE THE REST WORTH ANYTHING. A clean parse must record NO
+tolerance and NO repair. An implementation that appended a note unconditionally would satisfy every
+other check here and destroy the signal, so both directions are tested.
+"""
+
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import json
+import pathlib
+import sys
+
+HERE = pathlib.Path(__file__).resolve().parent
+spec = importlib.util.spec_from_loader(
+    "native_agent", importlib.machinery.SourceFileLoader("native_agent", str(HERE / "native-agent")))
+native = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(native)
+
+FAILURES = 0
+KEYS = ("status", "summary", "files_changed", "tests_run")
+
+
+def pas(what: str) -> None:
+    print(f"    PASS: {what}")
+
+
+def bad(what: str, detail: str = "") -> None:
+    global FAILURES
+    FAILURES += 1
+    print(f"    FAIL: {what}")
+    if detail:
+        for line in str(detail).splitlines()[:4]:
+            print(f"        {line}")
+
+
+print("==> 1/7 a clean reply records no repair at all")
+notes: list[str] = []
+clean = json.dumps({"status": "complete", "summary": "s", "files_changed": [], "tests_run": []})
+got = native.extract_json_object(clean, KEYS, notes)
+if got is None:
+    bad("the plain case stopped working", str(notes))
+elif any(n.startswith(("NESTED", "PARTIAL")) for n in notes):
+    bad("a clean reply was recorded as repaired — this makes the whole signal useless", str(notes))
+elif "score=4/4" not in notes:
+    bad("a full schema match was not recorded as one", str(notes))
+else:
+    pas("no NESTED, no PARTIAL, and a full-score note")
+
+print("==> 2/7 a report dug out of a string value is marked NESTED")
+# The real case, from a live round at 16.3k depth: the model emitted a write_file call as plain
+# text with the whole report nested inside its `content` argument.
+buried = ('{"path":"final_report.json","content":"'
+          + json.dumps({"status": "complete", "summary": "s",
+                        "files_changed": [], "tests_run": []}).replace('"', '\\"')
+          + '"}')
+notes = []
+got = native.extract_json_object(buried, KEYS, notes)
+if got is None or got.get("status") != "complete":
+    bad("the nested report was not recovered at all", f"{got} {notes}")
+elif not any(n.startswith("NESTED") for n in notes):
+    bad("recovered from inside a tool call and recorded as an ordinary reply", str(notes))
+else:
+    pas(f"recovered AND marked: {[n for n in notes if n.startswith('NESTED')]}")
+
+print("==> 3/7 an object missing schema keys is marked PARTIAL")
+notes = []
+native.extract_json_object('{"status":"complete"}', KEYS, notes)
+if not any(n == "PARTIAL-schema-match" for n in notes):
+    bad("a report matching 1 of 4 keys was recorded as though it matched all of them", str(notes))
+else:
+    pas("a partial match says it is partial")
+
+print("==> 4/7 no object at all is distinguishable from a bad one")
+notes = []
+got = native.extract_json_object("I could not finish the work.", KEYS, notes)
+if got is not None:
+    bad("prose produced an object")
+elif "no-object" not in notes:
+    bad("nothing came back and the log does not say that is what happened", str(notes))
+else:
+    pas("recorded as no-object, not as an empty report")
+
+print("==> 5/7 each harmony tolerance is named when it fires")
+# Two of the three, from the strings llama.cpp actually rejected. `to=` is absent from the first
+# and `<|constrain|>` present in the second, and both carry a repeated `<|channel|>`.
+garbled = "<|channel|>functions.write_file<|channel|>commentary json<|message|>{\"path\":\"a\"}<|call|>"
+notes = []
+message = native.parse_harmony(garbled, notes)
+if not (message.get("tool_calls") or []):
+    bad("the garbled header stopped being recovered", json.dumps(message)[:200])
+elif "recipient-without-to" not in notes:
+    bad("the recipient was found without `to=` and that was not recorded", str(notes))
+elif "repeated-channel" not in notes:
+    bad("a repeated <|channel|> was tolerated silently", str(notes))
+else:
+    pas(f"named: {notes}")
+
+constrained = "<|channel|>final <|constrain|>json<|message|>{\"status\":\"complete\"}<|return|>"
+notes = []
+native.parse_harmony(constrained, notes)
+if "constrain-ignored" not in notes:
+    bad("<|constrain|> was ignored silently — this is 18 of the 99 discarded completions",
+        str(notes))
+else:
+    pas("the <|constrain|> tolerance names itself")
+
+print("==> 6/7 an ordinary harmony completion records nothing")
+ordinary = "<|channel|>final<|message|>All done.<|return|>"
+notes = []
+message = native.parse_harmony(ordinary, notes)
+if message.get("content") != "All done.":
+    bad("the ordinary path changed behaviour", json.dumps(message)[:200])
+elif notes:
+    bad("a completion needing no tolerance still recorded one; the signal is now noise", str(notes))
+else:
+    pas("silent when nothing was repaired")
+
+print("==> 7/7 notes are optional, so every existing caller still works")
+try:
+    a = native.extract_json_object('{"status":"complete"}', KEYS)
+    b = native.parse_harmony(ordinary)
+except TypeError as error:
+    bad("the instrumented signature broke a positional caller", str(error))
+else:
+    if a is None or b.get("content") != "All done.":
+        bad("behaviour changed when notes were not passed", f"{a} {b}")
+    else:
+        pas("unchanged for callers that do not ask")
+
+print()
+print("all checks passed" if not FAILURES else f"{FAILURES} check(s) failed")
+sys.exit(1 if FAILURES else 0)
