@@ -138,7 +138,8 @@ def main(argv: list[str]) -> int:
             where = "— completed"
         elif run.steps:
             last = run.steps[-1]
-            where = f"step {last['n']} {last['slug'].replace('crawler-graphs-', '')} ({last['score'] or 'no verdict'})"
+            state = last["score"] or ("still running" if last["final"] is None else "no verdict")
+            where = f"step {last['n']} {last['slug'].replace('crawler-graphs-', '')} ({state})"
         else:
             where = "— never started a step"
         print(f"{run.name:<12} {run.mode:<8} {run.landed:>3} of {total_steps or '?':<2}  {where}")
@@ -150,12 +151,17 @@ def main(argv: list[str]) -> int:
         for s in run.steps:
             names[s["n"]] = s["slug"].replace("crawler-graphs-", "")
             per_step[s["n"]][s["final"] or "no-verdict"] += 1
-    print(f"{'step':<16} {'accepted':>9} {'rejected':>9} {'attempts':>9}")
-    print("-" * 48)
+    # "no verdict" is its own column, never folded into rejected. A step that was still running
+    # when the night ended did not fail, and reporting it as a failure would overstate exactly the
+    # thing this benchmark exists to measure.
+    print(f"{'step':<16} {'accepted':>9} {'rejected':>9} {'unfinished':>11} {'attempts':>9}")
+    print("-" * 60)
     for n in sorted(per_step):
         counts = per_step[n]
         attempts = sum(counts.values())
-        print(f"{names[n]:<16} {counts['ACCEPT']:>9} {attempts - counts['ACCEPT']:>9} {attempts:>9}")
+        unfinished = counts["no-verdict"]
+        rejected = attempts - counts["ACCEPT"] - unfinished
+        print(f"{names[n]:<16} {counts['ACCEPT']:>9} {rejected:>9} {unfinished:>11} {attempts:>9}")
 
     consulted = [s for r in runs for s in r.steps if s["consulted"]]
     print(f"\n## The orchestrator — {len(consulted)} consultation(s)\n")
