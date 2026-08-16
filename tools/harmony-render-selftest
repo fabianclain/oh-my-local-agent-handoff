@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""harmony-render-selftest — does our prompt say what llama.cpp's does not, and nothing else?
+
+    tools/harmony-render-selftest
+
+The nativeharmony arm replaces llama.cpp's chat template with OpenAI's own renderer, because the
+template loses two things the specification requires:
+
+    tool types      every nested object collapses to `any[]`, field names and descriptions gone
+    tool results    JSON-quoted, so a seven-line file arrives with ZERO newlines and seven literal
+                    \\n sequences
+
+An arm is only worth running if it changes the ONE thing it claims to change. These cases assert
+both halves: the losses are repaired, and nothing else moved. Case 5 is the one that keeps the rest
+honest -- the system message, channel rules and message order must be IDENTICAL to the control, or
+a difference in outcome cannot be attributed to the renderer.
+
+Needs no GPU and no server: both renderings are compared against fixed expectations, and the
+llama.cpp side is only consulted when a server happens to be there.
+"""
+
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import json
+import pathlib
+import sys
+
+HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
+FAILURES = 0
+
+
+def pas(what: str) -> None:
+    print(f"    PASS: {what}")
+
+
+def bad(what: str, detail: str = "") -> None:
+    global FAILURES
+    FAILURES += 1
+    print(f"    FAIL: {what}")
+    if detail:
+        for line in str(detail).splitlines()[:5]:
+            print(f"        {line}")
+
+
+try:
+    import harmony_render
+except Exception as error:  # noqa: BLE001
+    print(f"cannot import harmony_render: {error}", file=sys.stderr)
+    sys.exit(2)
+
+TOOLS = [{"type": "function", "function": {
+    "name": "read_files",
+    "description": "Read files from the repository.",
+    "parameters": {"type": "object", "required": ["files"], "properties": {
+        "files": {"type": "array", "items": {"type": "object", "properties": {
+            "path": {"type": "string"},
+            "start": {"type": "integer", "description": "first line, 1-based"},
+            "end": {"type": "integer", "description": "last line, inclusive"}}}}}}}}]
+
+FILE_RESULT = "--- src/Invoice.php ---\n<?php\n\nfinal class Invoice\n{\n}\n"
+
+MESSAGES = [
+    {"role": "system", "content": "You are the implementer. Follow the plan exactly."},
+    {"role": "user", "content": "Implement the plan."},
+    {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function",
+        "function": {"name": "read_files",
+                     "arguments": json.dumps({"files": [{"path": "src/Invoice.php"}]})}}]},
+    {"role": "tool", "tool_call_id": "c1", "content": FILE_RESULT},
+]
+
+try:
+    PROMPT = harmony_render.render_prompt(MESSAGES, TOOLS)
+except SystemExit as error:
+    print(f"{error}", file=sys.stderr)
+    sys.exit(2)
+
+print("==> 1/6 nested tool arguments keep their fields and descriptions")
+missing = [n for n in ("path?: string", "start?: number", "end?: number",
+                       "first line, 1-based", "last line, inclusive") if n not in PROMPT]
+if "any[]" in PROMPT:
+    bad("a nested argument still rendered as any[] — the whole point of this arm", PROMPT[:400])
+elif missing:
+    bad(f"the type lost {missing}", PROMPT[:400])
+else:
+    pas("path, start and end are in the type, with their descriptions")
+
+print("==> 2/6 a file read reaches the model with real newlines")
+segment = PROMPT[PROMPT.find("<|start|>functions.read_files"):]
+if "\\n" in segment:
+    bad("the tool result is JSON-escaped; the model still cannot see line structure",
+        repr(segment[:200]))
+elif segment.count("\n") < 4:
+    bad(f"only {segment.count(chr(10))} newlines in a 6-line file result", repr(segment[:200]))
+else:
+    pas(f"{segment.count(chr(10))} real newlines, 0 escaped")
+
+print("==> 3/6 the tool call goes to the commentary channel, addressed by name")
+if "to=functions.read_files" not in PROMPT:
+    bad("the call has no `to=functions.NAME` recipient", PROMPT[-400:])
+elif "<|channel|>commentary" not in PROMPT:
+    bad("the call is not on the commentary channel, which docs/format.md requires")
+else:
+    pas("to=functions.read_files on the commentary channel")
+
+print("==> 4/6 the tool RESULT is authored by the function and addressed back")
+if "<|start|>functions.read_files to=assistant" not in PROMPT:
+    bad("the tool result is not attributed to the function that produced it", PROMPT[-500:])
+else:
+    pas("functions.read_files to=assistant")
+
+print("==> 5/6 everything the control also says is still said")
+# The control that makes the arm readable. If the system message or the channel rules differ, an
+# outcome difference cannot be attributed to the renderer, and bench/compare would be right to
+# call it confounded.
+for needed, why in [
+        ("<|start|>system<|message|>", "no system message"),
+        ("Valid channels: analysis, commentary, final", "the channel list is missing"),
+        ("Calls to these tools must go to the commentary channel", "the commentary rule is missing"),
+        ("Current date:", "the current date line is missing, which llama.cpp emits"),
+        ("# Instructions", "the developer instructions block is missing"),
+        ("You are the implementer", "our system prompt did not survive into the developer message"),
+        ("namespace functions {", "the functions namespace is missing")]:
+    if needed not in PROMPT:
+        bad(f"{why} — the arm now differs from the control in more than one way", needed)
+        break
+else:
+    pas("system message, channel rules, date, instructions and namespace all present")
+
+print("==> 6/6 a missing library raises, and never silently renders the control's prompt")
+saved = harmony_render._VENV
+harmony_render._VENV = pathlib.Path("/nonexistent-for-this-test")
+for name in ("openai_harmony",):
+    sys.modules.pop(name, None)
+blocker = type(sys)("openai_harmony")
+real = sys.modules.get("openai_harmony")
+try:
+    import builtins
+    original = builtins.__import__
+
+    def refuse(name, *a, **k):
+        if name == "openai_harmony":
+            raise ImportError("blocked for this test")
+        return original(name, *a, **k)
+
+    builtins.__import__ = refuse
+    try:
+        harmony_render.render_prompt(MESSAGES, TOOLS)
+    except SystemExit as error:
+        if "install-harmony" in str(error):
+            pas("raises, and names the installer")
+        else:
+            bad("raised without saying how to fix it", str(error))
+    except Exception as error:  # noqa: BLE001
+        bad(f"raised the wrong thing: {type(error).__name__}", str(error))
+    else:
+        bad("rendered a prompt with no harmony library — the arm would run as the control")
+    finally:
+        builtins.__import__ = original
+finally:
+    harmony_render._VENV = saved
+    if real is not None:
+        sys.modules["openai_harmony"] = real
+
+print()
+print("all checks passed" if not FAILURES else f"{FAILURES} check(s) failed")
+sys.exit(1 if FAILURES else 0)

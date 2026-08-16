@@ -56,6 +56,8 @@ import time
 import urllib.error
 import urllib.request
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
 # The model's own directory, and the only place outside the plan's file list it may create
 # anything. templates/agent-rules.md has said so for a long time; nothing enforced it, and two of
 # four `wide` rounds were rejected for writing tmp/test_*.php and verify.sh instead. The tool now
@@ -856,10 +858,18 @@ def call_model_raw(host: str, port: int, messages: list[dict], tools: list[dict]
     /apply-template renders exactly the prompt /v1/chat/completions would build, so the prompt is
     not a reimplementation and cannot drift from the server's idea of it. Only the parsing is ours.
     """
-    rendered = json.loads(http_post(host, port, "/apply-template",
-                                    {"messages": messages, "tools": tools}, timeout))
+    if HARMONY_RENDER:
+        # OpenAI's own renderer instead of llama.cpp's template. See tools/harmony_render.py: the
+        # template loses every nested tool argument to `any[]` and JSON-quotes tool results, so the
+        # model has never seen either its tools' field names or a newline in a file it was reading.
+        import harmony_render  # noqa: PLC0415
+
+        prompt = harmony_render.render_prompt(messages, tools)
+    else:
+        prompt = json.loads(http_post(host, port, "/apply-template",
+                                      {"messages": messages, "tools": tools}, timeout))["prompt"]
     body = json.loads(http_post(host, port, "/completions",
-                                {"prompt": rendered["prompt"], "n_predict": -1,
+                                {"prompt": prompt, "n_predict": -1,
                                  "temperature": temperature}, timeout))
     usage = {"prompt_tokens": body.get("tokens_evaluated") or 0,
              "completion_tokens": body.get("tokens_predicted") or 0}
@@ -892,6 +902,9 @@ def http_post(host: str, port: int, path: str, payload: dict, timeout: int) -> b
 
 
 RAW_HARMONY = False
+# Render the prompt with OpenAI's harmony library rather than llama.cpp's template. Implies the
+# raw path, because a prompt we build ourselves can only be sent to /completions.
+HARMONY_RENDER = False
 
 
 def call_model(host: str, port: int, model: str, messages: list[dict], tools: list[dict],
@@ -1106,6 +1119,8 @@ def main() -> int:
                         help="drop replace_in_file, forcing whole-file writes (round 15)")
     parser.add_argument("--no-report-tool", action="store_true",
                         help="no submit_report tool; the report comes from the no-tools final turn")
+    parser.add_argument("--harmony-render", action="store_true",
+                        help="build the prompt with openai-harmony, not llama.cpp's template")
     parser.add_argument("--raw-harmony", action="store_true",
                         help="generate via /completions and parse harmony here, not in the server")
     parser.add_argument("--prune-superseded", action="store_true",
@@ -1119,6 +1134,11 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=600)
     args = parser.parse_args()
 
+    if args.harmony_render:
+        # Implies --raw-harmony: a prompt rendered here can only be sent to /completions, and
+        # /v1/chat/completions would rebuild it with the template this arm exists to replace.
+        globals()["HARMONY_RENDER"] = True
+        globals()["RAW_HARMONY"] = True
     if args.raw_harmony:
         globals()["RAW_HARMONY"] = True
     if args.no_replace:

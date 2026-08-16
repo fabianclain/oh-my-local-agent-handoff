@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+#
+# install-harmony — the venv providers/nativeharmony.sh needs.
+#
+#   tools/install-harmony
+#
+# openai-harmony is OpenAI's own renderer and parser for the format gpt-oss speaks. It goes in a
+# venv under the harness's state directory rather than into the system python, which PEP 668
+# refuses and which is not this project's to modify.
+set -euo pipefail
+VENV="${LLAMACPP_STATE:-$HOME/.cache/agent-handoff}/venv"
+python3 -m venv "$VENV"
+"$VENV/bin/pip" install -q --upgrade pip
+"$VENV/bin/pip" install -q openai-harmony
+"$VENV/bin/python" -c "import openai_harmony; print('openai-harmony ready in $VENV')"
