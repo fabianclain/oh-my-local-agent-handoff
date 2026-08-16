@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""schema-grammar-selftest — is the generated grammar well formed, and does it REFUSE?
+
+    tools/schema-grammar-selftest
+
+Three bugs were found building this converter, and llama-server's only complaint for all three was
+the same seven words: "failed to parse grammar", with no rule and no position. Each one is a case
+here, because none of them was visible by reading the code and all of them are invisible without a
+server otherwise.
+
+    the dropped root      schema_grammar filtered `name != root` to avoid emitting `root ::= root`,
+                          and thereby dropped the only rule the grammar needed. The output had no
+                          root rule at all.
+    underscores           llama.cpp's grammar parser takes [a-zA-Z0-9-] in rule names and rejects
+                          underscores. `files_changed`, `tests_run` and `follow_ups` all have one.
+    the name collision    wrapping the schema under another root emitted `report ::= root` beside a
+                          second `root ::= "{" ...`: circular, and duplicated.
+
+Cases 1 and 2 are structural and need no server: exactly one root rule, and every referenced rule
+defined. Between them they catch all three.
+
+The REFUSALS matter as much. A converter that ignores a keyword it does not implement emits a
+grammar PERMITTING what the schema forbids, and the caller believes the output was validated when
+it was not. Cases 5-8 assert that each unsupported construct raises rather than being approximated.
+"""
+
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import json
+import pathlib
+import re
+import sys
+
+HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
+import schema_grammar as sg  # noqa: E402
+
+FAILURES = 0
+
+
+def pas(what: str) -> None:
+    print(f"    PASS: {what}")
+
+
+def bad(what: str, detail: str = "") -> None:
+    global FAILURES
+    FAILURES += 1
+    print(f"    FAIL: {what}")
+    if detail:
+        for line in str(detail).splitlines()[:4]:
+            print(f"        {line}")
+
+
+def roots_in(grammar: str) -> list[str]:
+    """Lines defining `root`, matched on the rule NAME rather than on spacing.
+
+    The first version matched the literal "root ::=", so padding the wrapper to `root     ::=` for
+    alignment made it count zero and report "more than one root rule". A check that fails on
+    whitespace is testing its own formatting.
+    """
+    return [l for l in grammar.splitlines() if re.match(r"^root\s*::=", l)]
+
+
+def rules_of(grammar: str) -> tuple[set[str], set[str]]:
+    """(defined, referenced), with literals and character classes stripped out."""
+    defined, referenced = set(), set()
+    for line in grammar.splitlines():
+        if "::=" not in line:
+            continue
+        head, body = line.split("::=", 1)
+        defined.add(head.strip())
+        body = re.sub(r'"(\\.|[^"\\])*"', "", body)
+        body = re.sub(r"\[(\\.|[^\]\\])*\]", "", body)
+        referenced |= set(re.findall(r"[a-zA-Z][a-zA-Z0-9-]*", body))
+    return defined, referenced
+
+
+SCHEMA = json.loads((HERE.parent / "schemas" / "handoff.schema.json").read_text())
+
+print("==> 1/12 the real schema produces exactly one root rule")
+grammar = sg.schema_grammar(SCHEMA)
+roots = roots_in(grammar)
+if len(roots) != 1:
+    bad(f"{len(roots)} root rules, not 1; the grammar is unusable either way", "\n".join(roots)[:200])
+else:
+    pas("one root rule")
+
+print("==> 2/12 every referenced rule is defined")
+defined, referenced = rules_of(grammar)
+missing = sorted(referenced - defined)
+if missing:
+    bad(f"referenced but never defined: {missing}")
+else:
+    pas(f"{len(defined)} rules, no dangling references")
+
+print("==> 3/12 no rule name contains a character GBNF rejects")
+illegal = sorted(n for n in defined if not re.fullmatch(r"[a-zA-Z][a-zA-Z0-9-]*", n))
+if illegal:
+    bad(f"illegal rule names: {illegal} — llama.cpp takes [a-zA-Z0-9-] and rejects underscores")
+else:
+    pas("all rule names are [a-zA-Z0-9-]")
+
+print("==> 4/12 enum values become literals, so drift is impossible")
+if '"\\"complete\\""' not in grammar:
+    bad("the status enum did not become a literal", grammar[:300])
+elif '"\\"completed\\""' in grammar:
+    bad("a value the enum does not admit is in the grammar")
+else:
+    pas("complete | partial | blocked, and nothing else")
+
+print("==> 5/12 the harmony wrapper carries the final-message envelope")
+wrapped = sg.harmony_report_grammar(SCHEMA)
+# Checked across the whole grammar, not on the first line: once an analysis message is admitted the
+# root becomes `analysis? final` and the envelope lives on the `final` rule. Pinning it to line one
+# made this case fail the moment the shape improved, which is a check testing its own formatting.
+if "<|channel|>final<|message|>" not in wrapped or "<|return|>" not in wrapped:
+    bad("the envelope is missing; this grammar would force a brace where a channel belongs",
+        wrapped[:200])
+else:
+    dwrapped, rwrapped = rules_of(wrapped)
+    if rwrapped - dwrapped:
+        bad(f"the wrapper left dangling references: {sorted(rwrapped - dwrapped)}")
+    elif len(roots_in(wrapped)) != 1:
+        bad(f"the wrapper has {len(roots_in(wrapped))} root rules, not 1")
+    else:
+        pas("one root, enveloped, no dangling references")
+
+print("==> 6/12 an unimplemented keyword is REFUSED, not ignored")
+for label, schema in [
+        ("oneOf", {"type": "object", "additionalProperties": False, "required": ["a"],
+                   "properties": {"a": {"oneOf": [{"type": "string"}]}}}),
+        ("$ref", {"type": "object", "additionalProperties": False, "required": ["a"],
+                  "properties": {"a": {"$ref": "#/x"}}}),
+        ("tuple items", {"type": "object", "additionalProperties": False, "required": ["a"],
+                         "properties": {"a": {"type": "array", "items": [{"type": "string"}]}}})]:
+    try:
+        sg.schema_grammar(schema)
+    except sg.Unsupported:
+        continue
+    bad(f"{label} was silently accepted — the grammar would permit what the schema forbids")
+    break
+else:
+    pas("oneOf, $ref and tuple items each raise")
+
+print("==> 7/12 optional properties are refused rather than quietly required")
+optional = {"type": "object", "additionalProperties": False, "required": ["a"],
+            "properties": {"a": {"type": "string"}, "b": {"type": "string"}}}
+try:
+    sg.schema_grammar(optional)
+except sg.Unsupported as error:
+    if "optional" in str(error):
+        pas("refused, and says which property is not required")
+    else:
+        bad("refused for the wrong reason", str(error))
+else:
+    bad("an optional property was silently made mandatory; valid reports would be rejected")
+
+print("==> 8/12 additionalProperties: true is refused")
+open_schema = {"type": "object", "additionalProperties": True, "required": ["a"],
+               "properties": {"a": {"type": "string"}}}
+try:
+    sg.schema_grammar(open_schema)
+except sg.Unsupported:
+    pas("refused: a grammar cannot admit keys it was never shown")
+else:
+    bad("a schema admitting extra keys produced a grammar forbidding them")
+
+print("==> 9/12 an unknown TYPE is refused, not approximated as a string")
+# The keyword check above catches oneOf and $ref before the type switch is reached, so nothing
+# exercised the fallthrough. A converter that returned `string` for anything it did not recognise
+# would pass every case above while emitting a grammar that accepts a string where the schema
+# demands a date, an object, or a tuple.
+unknown = {"type": "object", "additionalProperties": False, "required": ["a"],
+           "properties": {"a": {"type": "date"}}}
+try:
+    sg.schema_grammar(unknown)
+except sg.Unsupported as error:
+    if "date" in str(error):
+        pas("refused, naming the type it does not implement")
+    else:
+        bad("refused without naming the unsupported type", str(error))
+else:
+    bad("an unknown type was approximated; the grammar validates something the schema does not")
+
+print("==> 10/12 the report turn may reason first, and still cannot escape the schema")
+# The first version forbade the analysis channel outright, justified by a recorded failure --
+# reasoning truncated mid-sentence -- which is a BUDGET failure and does not argue for forbidding a
+# reasoning model from reasoning. Measured both ways on a real report: identical status, files and
+# tests; 367 tokens against 211. Allowing it is the smaller intervention.
+loose = sg.harmony_report_grammar(SCHEMA)
+if "analysis? final" not in loose.splitlines()[0]:
+    bad("the default no longer admits an analysis message", loose.splitlines()[0])
+elif '"<|channel|>analysis<|message|>"' not in loose:
+    bad("the analysis rule is missing its channel marker")
+elif '([^<] | "<" [^|])*' not in loose:
+    bad("`thought` does not permit a bare `<`; reasoning about PHP generics would be unspellable")
+else:
+    dl, rl = rules_of(loose)
+    if rl - dl:
+        bad(f"dangling references with analysis admitted: {sorted(rl - dl)}")
+    else:
+        pas("analysis optional, `<` allowed inside it, no dangling references")
+
+print("==> 11/12 the strict shape is still available and still one root")
+strict = sg.harmony_report_grammar(SCHEMA, allow_analysis=False)
+if "analysis" in strict:
+    bad("allow_analysis=False still admits an analysis message")
+elif len(roots_in(strict)) != 1:
+    bad(f"the strict shape has {len(roots_in(strict))} root rules, not 1")
+else:
+    pas("one root, no analysis")
+
+print("==> 12/12 only the primitives the schema uses are emitted")
+emitted = {l.split()[0] for l in grammar.splitlines() if "::=" in l} & set(sg.PRIMITIVE_RULES)
+if "number" in emitted or "integer" in emitted:
+    bad(f"unused primitives emitted: {sorted(emitted)} — this schema has no numeric field")
+elif not {"ws", "string"} <= emitted:
+    bad(f"a primitive the schema DOES use is missing: {sorted(emitted)}")
+else:
+    pas(f"{sorted(emitted)} and nothing else")
+
+print()
+print("all checks passed" if not FAILURES else f"{FAILURES} check(s) failed")
+sys.exit(1 if FAILURES else 0)

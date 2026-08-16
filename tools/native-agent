@@ -852,7 +852,7 @@ def parse_harmony(text: str, notes: "list[str] | None" = None) -> dict:
 
 
 def call_model_raw(host: str, port: int, messages: list[dict], tools: list[dict],
-                   temperature: float, timeout: int) -> dict:
+                   temperature: float, timeout: int, grammar: str | None = None) -> dict:
     """Generate through /completions, with the server's own template but not its parser.
 
     /apply-template renders exactly the prompt /v1/chat/completions would build, so the prompt is
@@ -870,7 +870,8 @@ def call_model_raw(host: str, port: int, messages: list[dict], tools: list[dict]
                                       {"messages": messages, "tools": tools}, timeout))["prompt"]
     body = json.loads(http_post(host, port, "/completions",
                                 {"prompt": prompt, "n_predict": -1,
-                                 "temperature": temperature}, timeout))
+                                 "temperature": temperature,
+                                 **({"grammar": grammar} if grammar else {})}, timeout))
     usage = {"prompt_tokens": body.get("tokens_evaluated") or 0,
              "completion_tokens": body.get("tokens_predicted") or 0}
     raw = body.get("content") or ""
@@ -917,10 +918,17 @@ CARRY_REASONING = False
 # output, rather than as a tool's parameters. None when the arm is off. Set in main(), because the
 # schema is not known until the plan is loaded.
 RESPONSE_SECTION: dict | None = None
+# Constrain the REPORT TURN on the raw path with a grammar derived from the schema and wrapped in
+# the harmony final-message envelope. This is the half docs/format.md says the declaration alone
+# does not provide: "you still need to construct your own grammar and enforce the schema during
+# sampling". response_format cannot do it here -- it constrains the whole completion, which on this
+# path starts with a channel marker rather than a brace.
+HARMONY_GRAMMAR = False
 
 
 def call_model(host: str, port: int, model: str, messages: list[dict], tools: list[dict],
-               temperature: float, timeout: int, response_format: dict | None = None) -> dict:
+               temperature: float, timeout: int, response_format: dict | None = None,
+               grammar: str | None = None) -> dict:
     # The raw path takes llama.cpp's chat parser off the critical path: same prompt, our parsing.
     if RAW_HARMONY:
         if response_format is not None:
@@ -934,7 +942,7 @@ def call_model(host: str, port: int, model: str, messages: list[dict], tools: li
                 "nativejson and nativeraw cannot be combined: a json_schema grammar constrains "
                 "the whole completion, and the raw path's completion starts with harmony channel "
                 "tokens. Run them as separate arms.")
-        return call_model_raw(host, port, messages, tools, temperature, timeout)
+        return call_model_raw(host, port, messages, tools, temperature, timeout, grammar)
     payload = {"model": model, "messages": messages, "stream": False,
                "temperature": temperature}
     if tools:
@@ -1063,7 +1071,8 @@ def extract_json_object(text: str, wanted: "frozenset[str] | set[str] | tuple" =
 
 def call_model_retrying(host: str, port: int, model: str, messages: list[dict], tools: list[dict],
                         temperature: float, timeout: int, log, where: str,
-                        response_format: dict | None = None) -> dict:
+                        response_format: dict | None = None,
+                        grammar: str | None = None) -> dict:
     """Re-ask a completion that llama.cpp refused to parse, instead of losing the round to it.
 
     The fault is in the serving stack, not in the conversation. The model generated output,
@@ -1092,7 +1101,7 @@ def call_model_retrying(host: str, port: int, model: str, messages: list[dict], 
     for attempt in range(1, PEG_RETRIES + 2):
         try:
             return call_model(host, port, model, messages, tools, temperature, timeout,
-                              response_format)
+                              response_format, grammar)
         except urllib.error.HTTPError as error:
             detail = error.read().decode("utf-8", "replace")[:300]
             # Logged on every occurrence, recovered or not, so tools/peg-audit and the journal
@@ -1131,6 +1140,9 @@ def main() -> int:
                         help="drop replace_in_file, forcing whole-file writes (round 15)")
     parser.add_argument("--no-report-tool", action="store_true",
                         help="no submit_report tool; the report comes from the no-tools final turn")
+    parser.add_argument("--harmony-grammar", action="store_true",
+                        help="constrain the raw-path report turn with a schema-derived GBNF, "
+                             "wrapped in the harmony final-message envelope")
     parser.add_argument("--response-format-section", action="store_true",
                         help="declare the report schema in the developer message, as "
                              "docs/format.md's structured-output section defines it")
@@ -1171,6 +1183,10 @@ def main() -> int:
 
     schema = json.loads(args.schema.read_text())
 
+    if args.harmony_grammar:
+        globals()["HARMONY_GRAMMAR"] = True
+        globals()["HARMONY_RENDER"] = True
+        globals()["RAW_HARMONY"] = True
     if args.response_format_section:
         globals()["RESPONSE_SECTION"] = {
             "name": "completion_report",
@@ -1407,10 +1423,21 @@ def main() -> int:
                     enforced = {"type": "json_schema",
                                 "json_schema": {"name": "report", "schema": schema,
                                                 "strict": True}}
+                # The grammar half of docs/format.md's structured output, on the path where a
+                # response_format cannot reach: the envelope is part of the constraint, so the
+                # model must emit `<|channel|>final<|message|>{...}<|return|>` and the object
+                # inside it must satisfy the schema. Measured: 118 tokens, status inside the enum,
+                # every required key, no extra keys -- where the same turn unconstrained answered
+                # "completed", which the enum does not admit.
+                report_grammar = None
+                if HARMONY_GRAMMAR:
+                    import schema_grammar  # noqa: PLC0415
+
+                    report_grammar = schema_grammar.harmony_report_grammar(schema)
                 body = call_model_retrying(args.host, args.port, args.model,
                                            messages + [{"role": "user", "content": ask}],
                                            [], args.temp, args.timeout, log,
-                                           f"report-{attempt}", enforced)
+                                           f"report-{attempt}", enforced, report_grammar)
                 choice = (body.get("choices") or [{}])[0]
                 final = (choice.get("message") or {}).get("content") or ""
                 usage = body.get("usage") or {}
