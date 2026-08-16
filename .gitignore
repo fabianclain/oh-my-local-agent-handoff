@@ -20,3 +20,8 @@ __pycache__/
 
 # Overnight queue output: logs and per-job state, regenerated every run.
 .overnight/
+
+# Regenerated from the bench archive by tools/build-trace-dataset. Megabytes of derived
+# data with an authoritative source; the baselines under .handoff/capability/ are kept because
+# they are reference points a later diff needs, and are kilobytes.
+.handoff/datasets/

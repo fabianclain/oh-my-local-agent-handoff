@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+"""build-trace-dataset — turn archived rounds into training examples, and say what they are worth.
+
+    tools/build-trace-dataset [--out FILE] [--max-result-bytes N] [--per-plan N]
+
+Reconstructs the conversation from each archived round's provider.log: the assistant turns with
+their tool calls, the tool results that came back, and the completion report at the end. Only
+rounds the GATES accepted are included -- the label is a machine verdict over the tree, never the
+model's own report, which this project treats as untrusted metadata throughout.
+
+WHAT THIS DATA IS, AND WHAT IT IS NOT
+
+There are 217 accepted rounds and they look like a dataset. They are not, and the header says so
+because the number is misleading in a way that would cost days:
+
+    98  wide          48  semantic       30  site-dark      19  site       4  ledger      3  surgical
+
+Six tasks, solved thirty-odd times each. The diversity is in the SAMPLING, not in the problems.
+Fine-tuning on it teaches a model to solve those six plans, which is overfitting with extra steps.
+
+What IS repeated across every trace, and is task-independent, is the loop discipline: call a tool,
+read the result, edit, run the verification the plan names, submit a structured report. That is
+worth teaching a model that lacks it -- and gpt-oss already scores 8/8 on it in
+tools/capability-baseline, so there is nothing there to gain and a working capability to risk.
+
+So the honest uses of this file are, in order:
+
+    1. an EVAL set and a source of held-out traces
+    2. training material for a model that fails the capability probes but codes well
+    3. a base to extend -- more distinct plans is the missing ingredient, not more runs
+
+It is emitted anyway because building it is how the diversity problem became visible, and because
+none of that is a reason to leave the extraction unwritten.
+
+TRUNCATION
+
+Tool results are file contents and command output; one round can carry 300 KB of them. They are
+inputs, never targets, so they are truncated with a marker. A trainer masking loss to assistant
+turns loses nothing; one that does not was going to learn to recite the fixture either way.
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import hashlib
+import json
+import pathlib
+import sys
+
+REPO = pathlib.Path(__file__).resolve().parent.parent
+
+
+def outcome_of(run: pathlib.Path) -> str:
+    metrics = run / "metrics"
+    if not metrics.is_file():
+        return ""
+    for line in metrics.read_text(errors="replace").splitlines():
+        if line.startswith("outcome="):
+            return line.split("=", 1)[1].strip()
+    return ""
+
+
+def plan_of(run: pathlib.Path) -> str:
+    """The plan slug, from the path. results/<plan>/<arm>/<n> or archive/<plan>-<arm>-<stamp>/<n>."""
+    parts = run.parts
+    for anchor in ("results", "archive"):
+        if anchor in parts:
+            index = parts.index(anchor)
+            if anchor == "results" and len(parts) > index + 1:
+                return parts[index + 1]
+            if anchor == "archive" and len(parts) > index + 1:
+                return parts[index + 1].split("-")[0]
+    return "?"
+
+
+def reconstruct(log: pathlib.Path, max_result: int) -> tuple[list[dict], dict]:
+    """The conversation, in OpenAI chat shape, from one round's event log."""
+    messages: list[dict] = []
+    pending_text: list[str] = []
+    calls: list[dict] = []
+    results: list[dict] = []
+    stats = collections.Counter()
+
+    def flush() -> None:
+        """Close the current assistant turn and the tool results that answered it."""
+        nonlocal calls, results, pending_text
+        if calls:
+            message = {"role": "assistant", "content": "".join(pending_text).strip()}
+            message["tool_calls"] = calls
+            messages.append(message)
+            messages.extend(results)
+        elif pending_text:
+            messages.append({"role": "assistant", "content": "".join(pending_text).strip()})
+        calls, results, pending_text = [], [], []
+
+    for line in log.read_text(errors="replace").splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if event.get("type") == "run_result":
+            flush()
+            text = event.get("text") or ""
+            if text:
+                messages.append({"role": "assistant", "content": text})
+                stats["report"] += 1
+            continue
+        payload = event.get("event") or {}
+        if payload.get("type") == "iteration_start":
+            flush()
+            continue
+        if payload.get("type") != "content_end":
+            continue
+        kind = payload.get("contentType")
+        if kind == "text":
+            pending_text.append(payload.get("text") or "")
+        elif kind == "tool":
+            output = payload.get("output") or {}
+            # Cline-shaped logs put a LIST here; the native loop puts an object. Skip rather than
+            # guess at a shape this reconstruction was not written for -- a mis-parsed trace is a
+            # training example that teaches the wrong wire format, which is the one thing this
+            # whole exercise is trying not to do.
+            if not isinstance(output, dict):
+                stats["foreign-log-shape"] += 1
+                continue
+            call_id = payload.get("toolCallId") or f"call-{len(calls) + 1}"
+            calls.append({"id": call_id, "type": "function", "function": {
+                "name": payload.get("toolName"), "arguments": output.get("query") or "{}"}})
+            body = output.get("result") or ""
+            if len(body) > max_result:
+                body = body[:max_result] + f"\n[... {len(body) - max_result} bytes truncated]"
+                stats["truncated"] += 1
+            results.append({"role": "tool", "tool_call_id": call_id, "content": body})
+            stats["tool_calls"] += 1
+        # reasoning is deliberately dropped: it is the model's own channel, it is not part of the
+        # wire format a trainer should reproduce, and for gpt-oss it is harmony-specific.
+    flush()
+    return messages, stats
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--out", type=pathlib.Path,
+                        default=REPO / ".handoff" / "datasets" / "accepted-traces.jsonl")
+    parser.add_argument("--max-result-bytes", type=int, default=4000)
+    parser.add_argument("--per-plan", type=int, default=0,
+                        help="cap examples per plan, so one task cannot dominate (0 = no cap)")
+    parser.add_argument("--roots", nargs="*", type=pathlib.Path,
+                        default=[pathlib.Path.home() / "dev" / "agent-handoff-bench" / "bench"])
+    args = parser.parse_args()
+
+    runs = []
+    for root in args.roots:
+        if not root.is_dir():
+            print(f"UNKNOWN  {root} does not exist, so nothing was read", file=sys.stderr)
+            print("         This is not 'no accepted runs'. Point --roots at the bench clone.",
+                  file=sys.stderr)
+            return 2
+        runs.extend(p.parent for p in root.rglob("provider.log"))
+    if not runs:
+        print("UNKNOWN  no provider.log found under the given roots", file=sys.stderr)
+        return 2
+
+    per_plan: collections.Counter = collections.Counter()
+    kept, seen_hashes = [], set()
+    rejected = collections.Counter()
+    totals = collections.Counter()
+
+    for run in sorted(runs):
+        outcome = outcome_of(run)
+        if outcome != "accepted":
+            rejected[outcome or "no-metrics"] += 1
+            continue
+        plan = plan_of(run)
+        if args.per_plan and per_plan[plan] >= args.per_plan:
+            rejected["over per-plan cap"] += 1
+            continue
+        messages, stats = reconstruct(run / "provider.log", args.max_result_bytes)
+        if not any(m.get("tool_calls") for m in messages):
+            # A trace with no tool call teaches nothing about the loop, and is usually a Cline-shaped
+            # log whose tool events this reconstruction does not read.
+            rejected["no tool calls in log"] += 1
+            continue
+        # Deduplicate on the assistant side only. Two rounds of the same plan differ in the file
+        # contents they were shown; if the model's own turns are identical, it is one example.
+        fingerprint = hashlib.sha256(json.dumps(
+            [m for m in messages if m["role"] == "assistant"], sort_keys=True).encode()).hexdigest()
+        if fingerprint in seen_hashes:
+            rejected["duplicate assistant turns"] += 1
+            continue
+        seen_hashes.add(fingerprint)
+        per_plan[plan] += 1
+        totals["tool_calls"] += stats["tool_calls"]
+        totals["truncated"] += stats["truncated"]
+        totals["reports"] += stats["report"]
+        kept.append({"plan": plan, "run": str(run), "messages": messages})
+
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    with args.out.open("w") as handle:
+        for example in kept:
+            handle.write(json.dumps(example) + "\n")
+
+    size = args.out.stat().st_size
+    print(f"{len(kept)} example(s) -> {args.out}  ({size / 1e6:.1f} MB)")
+    print(f"  {totals['tool_calls']} tool calls, {totals['reports']} reports, "
+          f"{totals['truncated']} results truncated at {args.max_result_bytes} B")
+    print("\nexamples per plan — READ THIS BEFORE TRAINING:")
+    for plan, count in per_plan.most_common():
+        print(f"  {plan:16} {count:4}")
+    distinct = len(per_plan)
+    print(f"\n  {distinct} distinct task(s) across {len(kept)} example(s).")
+    if distinct and len(kept) / distinct > 3:
+        print("  That is sampling diversity, not task diversity. A model trained on this learns")
+        print("  these tasks. More distinct PLANS is the missing ingredient, not more runs.")
+    print("\nskipped:")
+    for reason, count in rejected.most_common():
+        print(f"  {count:5}  {reason}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
