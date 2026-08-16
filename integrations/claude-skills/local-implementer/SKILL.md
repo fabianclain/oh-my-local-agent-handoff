@@ -434,7 +434,37 @@ A criterion whose gate says `UNKNOWN` is a criterion you have not written yet.
 ### 7. Run it
 
 ```bash
-HANDOFF_PROVIDER=native handoff do <slug> >/tmp/run.log 2>&1; echo "verdict exit=$?"
+HANDOFF_PROVIDER=${HANDOFF_PROVIDER:-native} handoff do <slug> >/tmp/run.log 2>&1; echo "verdict exit=$?"
+```
+
+**The provider is the user's to choose, and this line no longer overrides them.** It used to read
+`HANDOFF_PROVIDER=native`, which quietly ignored `~/.config/agent-handoff/config.sh` and every
+environment variable — so a person who had deliberately selected a different stack got `native`
+anyway and had no way to tell from the output.
+
+Which stack, and what is actually known about each:
+
+| provider | what it changes | evidence |
+| --- | --- | --- |
+| `native` | the path every published number here was measured on | 29/30 on the six-file task |
+| `nativeharmony` | OpenAI's renderer instead of llama.cpp's template | fixes two measured defects, below |
+| `nativelow` | that, plus the report declared and grammar-enforced, reasoning `low` | 2/2 accepted on a real plan, 5 reports, none repaired |
+
+The two defects `nativeharmony` fixes are mechanical, not preferences. llama.cpp's template
+collapses every nested tool argument to `any[]`, so `read_files`' `start` and `end` are not in the
+type the model is shown at all; and it JSON-quotes tool results, so a seven-line file arrives with
+**zero newlines** and seven literal `\n` sequences. The model has never seen the line structure of
+anything it was asked to edit.
+
+**Unresolved, and the reason `native` is still the default here.** On the one real comparison so
+far, green-on-first-attempt went 4/4 to 0/2 (p = 0.07) while generated tokens went *down* and
+acceptance held — more attempts to reach the same place. That comparison was confounded and n=2.
+Until the screen settles it, changing the default would be choosing on a hunch.
+
+To run a different stack every time, set it once rather than per-invocation:
+
+```bash
+echo ': "${HANDOFF_PROVIDER:=nativelow}"' >> ~/.config/agent-handoff/config.sh
 ```
 
 **Redirect; do not pipe.** `handoff do x | tail` returns *tail's* exit status, not the verdict, and
