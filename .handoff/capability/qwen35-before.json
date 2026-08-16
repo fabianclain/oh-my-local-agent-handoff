@@ -1,0 +1,70 @@
+{
+  "model": "sha256-9871f5750cd1ebf1e5deb180cf44c9f672a8fd0b3ef375b746e7ec584b049010",
+  "label": "qwen35-cc-9b baseline",
+  "results": {
+    "native-tool-call": {
+      "status": "pass",
+      "detail": "read_files('src/Discount.php')",
+      "facts": {
+        "tokens": 49,
+        "seconds": 2.8
+      }
+    },
+    "call-after-result": {
+      "status": "pass",
+      "detail": "write_file after 19089 B of tool output",
+      "facts": {
+        "result_bytes": 19089,
+        "tokens": 62,
+        "seconds": 11.3
+      }
+    },
+    "large-arguments": {
+      "status": "pass",
+      "detail": "1165 B argument survived",
+      "facts": {
+        "asked_bytes": 1165,
+        "tokens": 620,
+        "got_bytes": 1165
+      }
+    },
+    "report-json": {
+      "status": "pass",
+      "detail": "status='complete', 2 files",
+      "facts": {
+        "chars": 145,
+        "finish_reason": "stop",
+        "tokens": 179
+      }
+    },
+    "report-tool": {
+      "status": "pass",
+      "detail": "submit_report(status='complete')",
+      "facts": {
+        "tokens": 169
+      }
+    },
+    "response-format": {
+      "status": "pass",
+      "detail": "status='complete'",
+      "facts": {
+        "chars": 126,
+        "finish_reason": "stop",
+        "tokens": 85
+      }
+    },
+    "stop-discipline": {
+      "status": "pass",
+      "detail": "29 tokens",
+      "facts": {
+        "tokens": 29,
+        "finish_reason": "stop"
+      }
+    },
+    "harmony-channels": {
+      "status": "skip",
+      "detail": "not a harmony model ('sha256-9871f5750cd1ebf1e5deb180cf44c9f672a8fd0b3ef375b746e7ec584b049010'); this probe is gpt-oss only",
+      "facts": {}
+    }
+  }
+}

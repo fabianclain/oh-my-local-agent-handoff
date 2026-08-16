@@ -1,0 +1,72 @@
+{
+  "model": "gpt-oss-20b (gpt-oss-20b-MXFP4.gguf)",
+  "label": "gpt-oss-20b MXFP4, pre-finetune",
+  "results": {
+    "native-tool-call": {
+      "status": "pass",
+      "detail": "read_files('src/Discount.php')",
+      "facts": {
+        "tokens": 41,
+        "seconds": 0.9
+      }
+    },
+    "call-after-result": {
+      "status": "pass",
+      "detail": "write_file after 19089 B of tool output",
+      "facts": {
+        "result_bytes": 19089,
+        "tokens": 49,
+        "seconds": 4.2
+      }
+    },
+    "large-arguments": {
+      "status": "pass",
+      "detail": "1165 B argument survived",
+      "facts": {
+        "asked_bytes": 1165,
+        "tokens": 564,
+        "got_bytes": 1165
+      }
+    },
+    "report-json": {
+      "status": "pass",
+      "detail": "status='complete', 2 files",
+      "facts": {
+        "chars": 106,
+        "finish_reason": "stop",
+        "tokens": 90
+      }
+    },
+    "report-tool": {
+      "status": "pass",
+      "detail": "submit_report(status='complete')",
+      "facts": {
+        "tokens": 109
+      }
+    },
+    "response-format": {
+      "status": "pass",
+      "detail": "status='complete'",
+      "facts": {
+        "chars": 125,
+        "finish_reason": "stop",
+        "tokens": 145
+      }
+    },
+    "stop-discipline": {
+      "status": "pass",
+      "detail": "34 tokens",
+      "facts": {
+        "tokens": 34,
+        "finish_reason": "stop"
+      }
+    },
+    "harmony-channels": {
+      "status": "pass",
+      "detail": "channels intact",
+      "facts": {
+        "chars": 190
+      }
+    }
+  }
+}

@@ -75,6 +75,37 @@ model_path() {
     # not about what the model emits -- every Qwen tried here also declared tools and emitted them
     # as TEXT. tools/engine-conformance is the gate, and it runs before any round.
     lfm2.5-8b) echo "${LFM_GGUF:-$HOME/.cache/agent-handoff/models/LFM2.5-8B-A1B-Q8_0.gguf}" ;;
+    # gemma-4-12B-agentic-fable5-composer2.5-v2-3.5x-tau2, Q8_0, pulled with
+    # `ollama pull hf.co/yuxinlu1/...`. Pointed at ollama's blob because an hf.co pull stores the
+    # publisher's GGUF unmodified, unlike ollama's own builds.
+    #
+    # THE THING TO CHECK FIRST is the tool-call format, not the benchmark. A sibling build --
+    # `gemma-4-12B-coder-fable5` -- is one of four models this project rejected for emitting
+    # correct tool calls as TEXT rather than as tool_calls, while `gemma4:12b-128k` from the ollama
+    # library emits them natively. Same architecture, same family, opposite answers: the format is
+    # decided by whichever template that specific package ships and is not predictable from the
+    # model card.
+    #
+    # And ollama declares stop tokens for this model -- <|turn>, <turn|>, <|turn>user -- in its
+    # Modelfile layer, which is OUTSIDE the GGUF. llama.cpp does not see that layer, so if the
+    # GGUF carries no template of its own this is a template-stripped model and any result is
+    # about the packaging rather than the weights.
+    gemma4-agentic-12b) echo "${GEMMA4_AGENTIC_GGUF:-/usr/share/ollama/.ollama/models/blobs/sha256-2c20a496baf3e9a3ead59d37c7afe228a863662d58155f360d44eb8b2465cb7f}" ;;
+    # Qwen3.5-9B-Claude-Code, Q8_0, `ollama pull hf.co/empero-ai/...`. Pointed at ollama's blob
+    # because an hf.co pull stores the publisher's GGUF unmodified.
+    #
+    # 8.9 GB of weights leaves ~5.5 GB for KV on this card -- the thing gemma4-agentic at 12.67 GB
+    # did not have, where two rounds of three overflowed a 16384 window and were scored as model
+    # failures until bench/compare flagged them as configuration results.
+    #
+    # THE GATE IS THE TOOL-CALL FORMAT, and this card advertises the exact shape that has failed
+    # here four times: "calls tools with XML-style <tool_call> blocks". qwen2.5-coder,
+    # Qwen3-Coder-30B-A3B, JanusCoder-14B and gemma-4-12B-coder-fable5 were all rejected for
+    # emitting correct calls as TEXT rather than as tool_calls -- and one of them was recorded
+    # twice as fabricating a blocker when it was telling the truth, because the client never ran
+    # the call it made. Whether llama.cpp's --jinja parser promotes this build's format into
+    # tool_calls is a property of THIS package, and is probed before any round.
+    qwen35-cc-9b) echo "${QWEN35_CC_GGUF:-/usr/share/ollama/.ollama/models/blobs/sha256-9871f5750cd1ebf1e5deb180cf44c9f672a8fd0b3ef375b746e7ec584b049010}" ;;
     # ornith 9B, `ollama pull ornith:9b`. Pointed straight at ollama's blob, which is
     # world-readable and carries the GGUF magic, so no copy is needed.
     #

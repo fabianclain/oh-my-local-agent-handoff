@@ -1,0 +1,446 @@
+#!/usr/bin/env python3
+"""capability-baseline — what can this model still do, and what did training take away?
+
+    tools/capability-baseline capture [--model NAME] [--out FILE]
+    tools/capability-baseline diff BEFORE.json AFTER.json
+    tools/capability-baseline show FILE.json
+
+WHY
+
+Fine-tuning a model that already works is a trade, and the thing most likely to be traded away is
+not coding ability -- it is the machinery around it. Four models have been rejected in this
+project for emitting correct tool calls as TEXT rather than as `tool_calls`, and one of them was
+recorded twice as fabricating a blocker when it was telling the truth: the client never executed
+the call it made. A LoRA that costs gpt-oss its harmony channel format or its `submit_report`
+discipline would be worthless here no matter how much repository code it had absorbed, and it
+would present as "the model got worse at coding".
+
+So: capture what works BEFORE training, capture it again AFTER, and diff. A regression is a
+probe that passed and now does not. That is a fact, not an impression, and it takes ~2 minutes.
+
+WHAT IS PROBED, and why each one is here
+
+    native-tool-call      the gate everything else depends on. A tool call must arrive in
+                          `tool_calls`, not as text in `content`.
+    call-after-result     a second call AFTER a substantial tool result. This is the case that
+                          broke ollama and that a single-shot smoke test never reaches: the
+                          conversation already contains an assistant tool call and ~20 KB of tool
+                          output when the model is asked to act again.
+    large-arguments       ~1 KB of argument text, intact and parseable. Argument size was blamed
+                          for a real failure and ruled out; the probe stays to keep it ruled out.
+    report-json           the completion report, asked for with NO tools registered. This is the
+                          fallback channel, and it carried every round on the deepest plan.
+    report-tool           the same report through `submit_report`. Below ~9k it carries 6 of 7
+                          rounds, so both channels matter and they fail independently.
+    response-format       a schema-constrained answer. llama.cpp enforces it; a fine-tune cannot
+                          break the grammar, but it CAN start fighting it -- which shows up as
+                          truncation or refusal rather than as malformed JSON.
+    stop-discipline       does it stop. LFM2.5 emitted 11,625 tokens for a probe answerable in
+                          fifty, and a model that will not stop is unusable regardless of quality.
+    harmony-channels      gpt-oss only, and skipped with a reason otherwise. The raw completion
+                          must still carry <|channel|> and a `final` message, because
+                          tools/native-agent parses that format itself.
+
+SKIPPED IS NOT PASSED, AND NOT FAILED
+
+A probe that could not run reports `skip` with a reason and is excluded from the verdict. The
+alternative -- counting it either way -- is the fault docs/answerability.md exists for, and five
+separate gates in this repository got it wrong before it was written down.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import sys
+import time
+import urllib.error
+import urllib.request
+
+HOST = "127.0.0.1"
+PORT = 8071
+TIMEOUT = 300
+
+READ_TOOL = {"type": "function", "function": {
+    "name": "read_files",
+    "description": "Read a file from the repository.",
+    "parameters": {"type": "object", "required": ["path"],
+                   "properties": {"path": {"type": "string"}}}}}
+
+WRITE_TOOL = {"type": "function", "function": {
+    "name": "write_file",
+    "description": "Write a file in full.",
+    "parameters": {"type": "object", "required": ["path", "content"],
+                   "properties": {"path": {"type": "string"}, "content": {"type": "string"}}}}}
+
+REPORT_SCHEMA = {
+    "type": "object",
+    "required": ["status", "summary", "files_changed"],
+    "additionalProperties": False,
+    "properties": {
+        "status": {"type": "string", "enum": ["complete", "partial", "blocked"]},
+        "summary": {"type": "string"},
+        "files_changed": {"type": "array", "items": {"type": "string"}}}}
+
+REPORT_TOOL = {"type": "function", "function": {
+    "name": "submit_report",
+    "description": "Submit the completion report. Call this when the work is finished.",
+    "parameters": REPORT_SCHEMA}}
+
+
+def post(path: str, payload: dict, timeout: int = TIMEOUT):
+    request = urllib.request.Request(f"http://{HOST}:{PORT}{path}",
+                                     data=json.dumps(payload).encode(),
+                                     headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8", "replace"))
+
+
+def chat(messages, tools=None, response_format=None, max_tokens=2000, temperature=0.2):
+    payload = {"model": "probe", "messages": messages, "max_tokens": max_tokens,
+               "temperature": temperature}
+    if tools:
+        payload["tools"] = tools
+    if response_format:
+        payload["response_format"] = response_format
+    started = time.time()
+    body = post("/v1/chat/completions", payload)
+    choice = (body.get("choices") or [{}])[0]
+    return {"message": choice.get("message") or {},
+            "finish_reason": choice.get("finish_reason"),
+            "usage": body.get("usage") or {},
+            "seconds": round(time.time() - started, 1)}
+
+
+def first_call(message: dict):
+    """The first tool call, and its parsed arguments, or (None, None)."""
+    for call in message.get("tool_calls") or []:
+        function = call.get("function") or {}
+        try:
+            return function.get("name"), json.loads(function.get("arguments") or "{}")
+        except ValueError:
+            return function.get("name"), None
+    return None, None
+
+
+# ------------------------------------------------------------------------------------------------
+# probes. each returns (status, detail, facts) where status is pass | fail | skip
+
+
+def probe_native_tool_call():
+    out = chat([{"role": "user", "content":
+                 "Read the file src/Discount.php. Use the read_files tool."}], [READ_TOOL])
+    name, args = first_call(out["message"])
+    facts = {"tokens": out["usage"].get("completion_tokens"), "seconds": out["seconds"]}
+    if name is None:
+        # The failure that matters, and it is worth naming precisely: the model may well have
+        # emitted a perfectly good call, as text, where nothing will ever execute it.
+        content = (out["message"].get("content") or "")[:200]
+        return "fail", f"no tool_calls; content was {content!r}", facts
+    if name != "read_files":
+        return "fail", f"called {name!r}, not read_files", facts
+    if args is None:
+        return "fail", "arguments did not parse as JSON", facts
+    if "Discount" not in str(args.get("path", "")):
+        return "fail", f"wrong path argument: {args!r}", facts
+    return "pass", f"read_files({args.get('path')!r})", facts
+
+
+def probe_call_after_result():
+    """A call AFTER a large tool result. The condition that broke ollama."""
+    bulk = "\n".join(f"    // line {n} of a large file" for n in range(600))
+    messages = [
+        {"role": "user", "content": "Read src/Discount.php, then write src/Out.php with 'ok'."},
+        {"role": "assistant", "content": "",
+         "tool_calls": [{"id": "c1", "type": "function", "function": {
+             "name": "read_files", "arguments": json.dumps({"path": "src/Discount.php"})}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": bulk},
+        {"role": "user", "content": "Now write src/Out.php containing exactly: ok"},
+    ]
+    out = chat(messages, [READ_TOOL, WRITE_TOOL])
+    name, args = first_call(out["message"])
+    facts = {"result_bytes": len(bulk), "tokens": out["usage"].get("completion_tokens"),
+             "seconds": out["seconds"]}
+    if name is None:
+        return "fail", "no tool call after a 20 KB tool result", facts
+    if name != "write_file":
+        return "fail", f"called {name!r} rather than write_file", facts
+    if args is None:
+        return "fail", "arguments did not parse after a large result", facts
+    return "pass", f"write_file after {len(bulk)} B of tool output", facts
+
+
+def probe_large_arguments():
+    body = "<?php\n" + "\n".join(f"// filler {n}" for n in range(90))
+    out = chat([{"role": "user", "content":
+                 "Write src/Big.php with exactly this content, using write_file:\n\n" + body}],
+               [WRITE_TOOL], max_tokens=3000)
+    name, args = first_call(out["message"])
+    facts = {"asked_bytes": len(body), "tokens": out["usage"].get("completion_tokens")}
+    if name != "write_file" or args is None:
+        return "fail", f"expected write_file with parseable args, got {name!r}", facts
+    got = args.get("content") or ""
+    facts["got_bytes"] = len(got)
+    if len(got) < len(body) * 0.5:
+        return "fail", f"argument truncated: {len(got)} B of {len(body)} B", facts
+    return "pass", f"{len(got)} B argument survived", facts
+
+
+def probe_report_json():
+    """The report with NO tools registered — the fallback channel."""
+    ask = ("The work is finished. Reply with ONLY a JSON object matching this schema, as your "
+           "final message. No prose, no code fence.\n\n" + json.dumps(REPORT_SCHEMA, indent=2))
+    out = chat([{"role": "user", "content": "You edited src/A.php and src/B.php."},
+                {"role": "user", "content": ask}], None)
+    text = out["message"].get("content") or ""
+    facts = {"chars": len(text), "finish_reason": out["finish_reason"],
+             "tokens": out["usage"].get("completion_tokens")}
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        return "fail", f"no JSON object in {len(text)} chars", facts
+    try:
+        obj = json.loads(text[start:end + 1])
+    except ValueError as error:
+        return "fail", f"object did not parse: {error}", facts
+    missing = [k for k in REPORT_SCHEMA["required"] if k not in obj]
+    if missing:
+        return "fail", f"missing required keys: {missing}", facts
+    if obj.get("status") not in REPORT_SCHEMA["properties"]["status"]["enum"]:
+        return "fail", f"status {obj.get('status')!r} is not in the enum", facts
+    return "pass", f"status={obj.get('status')!r}, {len(obj.get('files_changed') or [])} files", facts
+
+
+def probe_report_tool():
+    out = chat([{"role": "user", "content":
+                 "You edited src/A.php and src/B.php. The work is finished. "
+                 "Call submit_report now."}], [REPORT_TOOL])
+    name, args = first_call(out["message"])
+    facts = {"tokens": out["usage"].get("completion_tokens")}
+    if name != "submit_report":
+        return "fail", f"called {name!r} rather than submit_report", facts
+    if args is None:
+        return "fail", "submit_report arguments did not parse as JSON", facts
+    missing = [k for k in REPORT_SCHEMA["required"] if k not in args]
+    if missing:
+        return "fail", f"report missing {missing}", facts
+    return "pass", f"submit_report(status={args.get('status')!r})", facts
+
+
+def probe_response_format():
+    out = chat([{"role": "user", "content": "You edited src/A.php. Report completion."}], None,
+               response_format={"type": "json_schema", "json_schema": {
+                   "name": "report", "schema": REPORT_SCHEMA, "strict": True}})
+    text = out["message"].get("content") or ""
+    facts = {"chars": len(text), "finish_reason": out["finish_reason"],
+             "tokens": out["usage"].get("completion_tokens")}
+    if not text.strip():
+        # A constrained model that answers with nothing is the failure to watch for: the grammar
+        # cannot produce invalid JSON, so a fine-tune fighting it shows up as silence, not as junk.
+        return "fail", "constrained answer was empty", facts
+    try:
+        obj = json.loads(text)
+    except ValueError as error:
+        return "fail", f"constrained output did not parse: {error}", facts
+    return "pass", f"status={obj.get('status')!r}", facts
+
+
+def probe_stop_discipline():
+    out = chat([{"role": "user", "content": "Reply with exactly the word: ready"}], None,
+               max_tokens=4000)
+    used = out["usage"].get("completion_tokens") or 0
+    facts = {"tokens": used, "finish_reason": out["finish_reason"]}
+    if out["finish_reason"] == "length":
+        return "fail", f"never stopped: hit the {used}-token cap", facts
+    if used > 400:
+        # LFM2.5 spent 11,625 tokens on a probe of this shape. Generous, because a reasoning model
+        # legitimately thinks first; anything past this is not thinking, it is not stopping.
+        return "fail", f"{used} tokens for a one-word answer", facts
+    return "pass", f"{used} tokens", facts
+
+
+def probe_harmony_channels(model: str):
+    """gpt-oss only: the raw completion must still carry harmony channels.
+
+    tools/native-agent parses this format itself under --raw-harmony, and llama.cpp's own parser
+    discards completions it cannot map -- 99 of 3,131 in one night. A fine-tune that blurs the
+    channel markers breaks both.
+    """
+    if "gpt-oss" not in (model or "").lower():
+        return "skip", f"not a harmony model ({model!r}); this probe is gpt-oss only", {}
+    try:
+        rendered = post("/apply-template",
+                        {"messages": [{"role": "user", "content": "Say ready."}], "tools": []})
+        body = post("/completions", {"prompt": rendered["prompt"], "n_predict": 200,
+                                     "temperature": 0.2})
+    except (urllib.error.URLError, OSError, KeyError) as error:
+        return "skip", f"raw endpoints unavailable: {error}", {}
+    raw = body.get("content") or ""
+    facts = {"chars": len(raw)}
+    if "<|channel|>" not in raw:
+        return "fail", f"no <|channel|> marker in {len(raw)} chars: {raw[:120]!r}", facts
+    if "final" not in raw:
+        return "fail", "no `final` channel in the completion", facts
+    return "pass", "channels intact", facts
+
+
+PROBES = [
+    ("native-tool-call", probe_native_tool_call),
+    ("call-after-result", probe_call_after_result),
+    ("large-arguments", probe_large_arguments),
+    ("report-json", probe_report_json),
+    ("report-tool", probe_report_tool),
+    ("response-format", probe_response_format),
+    ("stop-discipline", probe_stop_discipline),
+]
+
+
+def served_model() -> str | None:
+    """The REGISTERED name of what is serving, falling back to the file it loaded.
+
+    llamacpp-serve writes the registered name; /props reports the path, which for an ollama-blob
+    model is a sha256 and says nothing about the family. That matters because the harmony probe
+    keys on the name: served from a blob, gpt-oss would be unrecognisable, the probe would SKIP,
+    and a skip reads as benign. A capability that quietly stops being measured is the failure this
+    file's header is about, aimed at this file.
+    """
+    try:
+        with urllib.request.urlopen(f"http://{HOST}:{PORT}/props", timeout=15) as response:
+            path = json.load(response).get("model_path", "").split("/")[-1]
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    state = pathlib.Path.home() / ".cache" / "agent-handoff" / "llamacpp.model"
+    try:
+        registered = state.read_text().strip()
+    except OSError:
+        registered = ""
+    return f"{registered} ({path})" if registered else path
+
+
+def capture(label: str | None) -> dict:
+    model = served_model()
+    if model is None:
+        print(f"UNKNOWN  nothing is answering on {HOST}:{PORT}, so no capability was measured.",
+              file=sys.stderr)
+        print("         This is not 'the model failed'. Start llama-server and ask again.",
+              file=sys.stderr)
+        raise SystemExit(2)
+
+    results = {}
+    for name, probe in PROBES:
+        try:
+            status, detail, facts = probe()
+        except urllib.error.HTTPError as error:
+            status, detail, facts = "fail", f"HTTP {error.code}: {error.read()[:120]!r}", {}
+        except (urllib.error.URLError, OSError) as error:
+            status, detail, facts = "skip", f"transport: {error}", {}
+        results[name] = {"status": status, "detail": detail, "facts": facts}
+        mark = {"pass": "pass", "fail": "FAIL", "skip": "SKIP"}[status]
+        print(f"  {mark:4}  {name:20} {detail}")
+
+    status, detail, facts = probe_harmony_channels(model)
+    results["harmony-channels"] = {"status": status, "detail": detail, "facts": facts}
+    mark = {"pass": "pass", "fail": "FAIL", "skip": "SKIP"}[status]
+    print(f"  {mark:4}  {'harmony-channels':20} {detail}")
+
+    return {"model": model, "label": label or model, "results": results}
+
+
+def verdict(snapshot: dict) -> tuple[int, int, int]:
+    values = [r["status"] for r in snapshot["results"].values()]
+    return values.count("pass"), values.count("fail"), values.count("skip")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="mode", required=True)
+
+    cap = sub.add_parser("capture")
+    cap.add_argument("--label", default=None)
+    cap.add_argument("--out", type=pathlib.Path, default=None)
+
+    dif = sub.add_parser("diff")
+    dif.add_argument("before", type=pathlib.Path)
+    dif.add_argument("after", type=pathlib.Path)
+
+    shw = sub.add_parser("show")
+    shw.add_argument("file", type=pathlib.Path)
+
+    args = parser.parse_args()
+
+    if args.mode == "capture":
+        snapshot = capture(args.label)
+        passed, failed, skipped = verdict(snapshot)
+        print(f"\n{passed} pass, {failed} fail, {skipped} skip — model {snapshot['model']}")
+        if args.out:
+            args.out.parent.mkdir(parents=True, exist_ok=True)
+            args.out.write_text(json.dumps(snapshot, indent=2))
+            print(f"written to {args.out}")
+        return 1 if failed else 0
+
+    if args.mode == "show":
+        snapshot = json.loads(args.file.read_text())
+        print(f"{snapshot['label']}  ({snapshot['model']})")
+        for name, r in snapshot["results"].items():
+            print(f"  {r['status'].upper():4}  {name:20} {r['detail']}")
+        return 0
+
+    before = json.loads(args.before.read_text())
+    after = json.loads(args.after.read_text())
+    print(f"# {before['label']} -> {after['label']}\n")
+    regressed, recovered, still = [], [], []
+    for name in before["results"]:
+        was = before["results"][name]["status"]
+        now = (after["results"].get(name) or {}).get("status", "missing")
+        if was == "pass" and now == "fail":
+            regressed.append((name, after["results"][name]["detail"]))
+        elif was == "fail" and now == "pass":
+            recovered.append(name)
+        elif was == "pass" and now == "skip":
+            # Not a regression and not a pass. A probe that stopped being answerable is a hole in
+            # the measurement, and calling it either way would be the fault this file's header is
+            # about.
+            still.append((name, "was measurable, now SKIPPED — the comparison has a hole here"))
+
+    if regressed:
+        print("REGRESSED — these worked before training and do not now:")
+        for name, detail in regressed:
+            print(f"  {name:20} {detail}")
+    if recovered:
+        print("\nrecovered: " + ", ".join(recovered))
+    if still:
+        print("\nno longer measurable:")
+        for name, detail in still:
+            print(f"  {name:20} {detail}")
+    if not regressed and not still:
+        print("no capability regressed.")
+
+    # Token counts, because a fine-tune that keeps every capability and triples the token cost has
+    # still made the model worse in the way that matters on a 16 GB card.
+    print("\n| probe | before tokens | after tokens |")
+    print("| --- | ---: | ---: |")
+    for name in before["results"]:
+        b = (before["results"][name].get("facts") or {}).get("tokens")
+        a = ((after["results"].get(name) or {}).get("facts") or {}).get("tokens")
+        if b or a:
+            print(f"| {name} | {b if b is not None else '-'} | {a if a is not None else '-'} |")
+
+    # The three exit codes docs/answerability.md is about, applied to this comparison.
+    #
+    #   0  compared, nothing regressed
+    #   1  compared, something regressed
+    #   2  COULD NOT fully compare -- a probe that used to answer no longer does
+    #
+    # 2 rather than 0 for the hole. "No regression found" and "I could not look" are different
+    # answers, and returning the first for the second is how a fine-tune that broke the harmony
+    # channel would ship looking clean: the probe that would have caught it merely stopped running.
+    if regressed:
+        return 1
+    if still:
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
