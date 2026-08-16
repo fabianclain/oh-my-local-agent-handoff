@@ -107,6 +107,18 @@ Four models were rejected by the tool-call probe: `qwen2.5-coder:14b`, `JanusCod
 not capability**, and the distinction matters because Qwen3-Coder is marketed specifically for
 agentic coding.
 
+> **Update, 2026-08-16. Those four verdicts are about the ENGINE as much as the model, and are
+> due a re-test.** `Qwen3.5-9B-Claude-Code` advertises on its own model card that it "calls tools
+> with XML-style `<tool_call>` blocks" — the exact shape that produced all four rejections. Probed
+> through **llama.cpp with `--jinja`** it returns native `tool_calls`: correct name, correct
+> argument, 56 tokens. llama.cpp carries format-specific parsers and promotes the XML; ollama, where
+> every one of those four was probed, does not.
+>
+> So a card describing XML tool calls is not by itself a rejection, and "the Qwen family emits
+> correct tool calls as text" is really "ollama does not parse what the Qwen family emits". Gate 0
+> again, in the direction this section did not anticipate. The four should be re-probed on
+> llama.cpp before any of them stays rejected. See [changing-the-model.md](changing-the-model.md).
+
 Probed at ollama's API directly, with tools in the payload:
 
 ```

@@ -412,6 +412,7 @@ dishonest:
 | [queueing.md](queueing.md) | Several projects, one model: the lock, your place in the queue, the spool, callbacks |
 | [answerability.md](answerability.md) | The three exit codes every gate uses, and what a check must do when it cannot answer |
 | [local-models.md](local-models.md) | Every measured finding, and the register of conclusions that turned out wrong |
+| [changing-the-model.md](changing-the-model.md) | Swapping or fine-tuning the model: the capability gate, three models tried, and why fine-tuning waits |
 | [../bench/COMPARISON.md](../bench/COMPARISON.md) | Round-by-round results |
 
 If you take one thing from the rest of the documentation, take this: **fifteen harness defects have
