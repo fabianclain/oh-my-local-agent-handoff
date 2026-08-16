@@ -864,7 +864,7 @@ def call_model_raw(host: str, port: int, messages: list[dict], tools: list[dict]
         # model has never seen either its tools' field names or a newline in a file it was reading.
         import harmony_render  # noqa: PLC0415
 
-        prompt = harmony_render.render_prompt(messages, tools)
+        prompt = harmony_render.render_prompt(messages, tools, RESPONSE_SECTION)
     else:
         prompt = json.loads(http_post(host, port, "/apply-template",
                                       {"messages": messages, "tools": tools}, timeout))["prompt"]
@@ -913,6 +913,10 @@ HARMONY_RENDER = False
 # it is a separate claim, and because it is not free: analysis is the bulk of what gpt-oss
 # generates, and carrying it grows the context it is trying to help.
 CARRY_REASONING = False
+# The report schema, declared in the DEVELOPER message the way docs/format.md defines structured
+# output, rather than as a tool's parameters. None when the arm is off. Set in main(), because the
+# schema is not known until the plan is loaded.
+RESPONSE_SECTION: dict | None = None
 
 
 def call_model(host: str, port: int, model: str, messages: list[dict], tools: list[dict],
@@ -1127,6 +1131,9 @@ def main() -> int:
                         help="drop replace_in_file, forcing whole-file writes (round 15)")
     parser.add_argument("--no-report-tool", action="store_true",
                         help="no submit_report tool; the report comes from the no-tools final turn")
+    parser.add_argument("--response-format-section", action="store_true",
+                        help="declare the report schema in the developer message, as "
+                             "docs/format.md's structured-output section defines it")
     parser.add_argument("--carry-reasoning", action="store_true",
                         help="keep the analysis channel in context between tool calls, as "
                              "docs/format.md's worked example does")
@@ -1163,6 +1170,14 @@ def main() -> int:
     (args.repo / SCRATCH).mkdir(parents=True, exist_ok=True)
 
     schema = json.loads(args.schema.read_text())
+
+    if args.response_format_section:
+        globals()["RESPONSE_SECTION"] = {
+            "name": "completion_report",
+            "schema": schema,
+            "description": ("The completion report. When the work is finished, emit it as your "
+                            "final message: a single JSON object matching this schema, and "
+                            "nothing else.")}
     # The keys that identify a report, used to tell it apart from any other JSON object in the
     # model's final message — a tool call's arguments, most importantly. See extract_json_object.
     report_keys = set(schema.get("properties") or {}) | set(schema.get("required") or [])

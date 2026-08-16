@@ -80,8 +80,44 @@ def _today() -> str:
     return datetime.date.today().isoformat()
 
 
-def render_prompt(messages: list[dict], tools: list[dict]) -> str:
-    """The completion prompt for this conversation, rendered by openai-harmony."""
+def response_format_section(name: str, schema: dict, description: str = "") -> str:
+    """The `# Response Formats` block, exactly as docs/format.md defines it.
+
+        # Response Formats
+
+        ## {format name}
+
+        // {description or context}
+        {schema}
+
+    openai-harmony's DeveloperContent exposes `with_instructions` and `with_function_tools` and
+    nothing for this, so it is built here from the specification rather than left unused. The
+    schema is a JSON Schema, minified, because it is data the model reads once per conversation
+    rather than prose.
+
+    The spec is candid about what this buys on its own: "This prompt alone will, however, only
+    influence the model's behavior but doesn't guarantee the full adherence to the schema. For this
+    you still need to construct your own grammar and enforce the schema during sampling." That
+    grammar is what providers/nativejson.sh applies. The two halves belong together, and until now
+    this project had only the second one.
+    """
+    lines = ["# Response Formats", "", f"## {name}", ""]
+    if description:
+        lines.append(f"// {' '.join(description.split())}")
+    lines.append(json.dumps(schema, separators=(",", ":")))
+    return "\n".join(lines)
+
+
+def render_prompt(messages: list[dict], tools: list[dict],
+                  response_format: dict | None = None) -> str:
+    """The completion prompt for this conversation, rendered by openai-harmony.
+
+    `response_format`, when given, is {"name", "schema", "description"} and is appended to the END
+    of the developer message, which is where docs/format.md puts it -- after the tools, not before.
+    The library builds the developer message as a unit, so the section is spliced in before that
+    message's terminator rather than folded into the instructions, which would place it above
+    `# Tools` and no longer be what the spec describes.
+    """
     h = _load()
     encoding = h.load_harmony_encoding(h.HarmonyEncodingName.HARMONY_GPT_OSS)
 
@@ -160,7 +196,26 @@ def render_prompt(messages: list[dict], tools: list[dict]) -> str:
 
     conversation = h.Conversation.from_messages(rendered)
     tokens = encoding.render_conversation_for_completion(conversation, h.Role.ASSISTANT)
-    return encoding.decode_utf8(tokens)
+    prompt = encoding.decode_utf8(tokens)
+
+    if response_format:
+        section = response_format_section(response_format.get("name") or "report",
+                                          response_format.get("schema") or {},
+                                          response_format.get("description") or "")
+        # Spliced before the developer message's terminator, so it lands after `# Tools` as the
+        # spec has it. Located by the developer marker rather than by counting <|end|>s, because
+        # tool results and assistant turns produce plenty of those.
+        marker = "<|start|>developer<|message|>"
+        start = prompt.find(marker)
+        if start < 0:
+            raise SystemExit("no developer message to attach the response format to; "
+                             "the renderer changed shape and this splice is no longer valid")
+        end = prompt.find("<|end|>", start)
+        if end < 0:
+            raise SystemExit("the developer message is unterminated; refusing to guess where "
+                             "the response format belongs")
+        prompt = prompt[:end] + "\n\n" + section + prompt[end:]
+    return prompt
 
 
 if __name__ == "__main__":

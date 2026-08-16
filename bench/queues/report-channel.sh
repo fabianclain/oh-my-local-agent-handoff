@@ -7,8 +7,10 @@
 #
 # Every defence this harness has against a malformed completion report is post-hoc. A lenient
 # harmony parser, a brace-balanced scan that descends into string values, schema-key scoring, a
-# second ask. All repair; none prevention. Three of these four arms ask whether prevention is
-# available, and the fourth settles a comparison that already exists but cannot be read.
+# second ask. All repair; none prevention.
+#
+# Two of these arms go further than prevention: they fix what the model is TOLD, rather than how
+# its answer is read. One settles a comparison that already exists but cannot be read.
 #
 #   1. nativeraw against native, UNDER ONE TREE. This comparison already has 12 runs on `wide`
 #      and bench/compare refuses to read them: control b91dc3b, treatment 6bbd0cd. As it stands
@@ -17,33 +19,33 @@
 #      under today's tree is the cheapest real result on this list: it converts existing data
 #      rather than gathering new.
 #
-#   2. nativejson -- response_format: json_schema on the report turn. llama.cpp has accepted this
-#      on this server the whole time and nothing here ever sent one. Probed against the real
-#      schema before the arm was written: 7 of 7 required keys, valid JSON. Against a bare
-#      json_object the same request answered {"status":"completed"} -- not a value the enum admits
-#      -- and `message` for `summary`.
+#   2. nativeharmony against NATIVERAW -- OpenAI's own renderer instead of llama.cpp's template.
+#      Measured on identical conversations, llama.cpp's template loses two things the spec
+#      requires. Every nested tool argument collapses to `any[]`: read_files.files, and
+#      submit_report's files_changed, tests_run and deviations. The `start`/`end` window -- the
+#      change that turned three dead rounds into an accepted one -- is not in the type the model
+#      is shown at all. And tool results are JSON-quoted, so a seven-line file arrives with ZERO
+#      newlines and seven literal \n sequences: the model has never seen the line structure of
+#      anything it was asked to edit.
 #
-#      It cannot be a cure. Of the four recorded report-turn failures at depth, a grammar
-#      precludes two (prose; a tool call emitted as text with the report nested inside) and is
-#      powerless against two (truncation; an empty response). Expect half.
+#      The control is nativeraw, not native. Both parse harmony locally and differ only in who
+#      builds the prompt; comparing against native would fold the parser change in with it.
 #
-#      It may also BACKFIRE, which is why it is an arm. 18 of the 99 completions llama.cpp
-#      discarded in one night were a `final` message tagged `<|constrain|>json` -- the marker
-#      harmony emits when told to produce JSON. Asking for constrained JSON may raise the rate of
-#      the fault that eats reports. That is a mechanism, and it is measurable here.
+#   3. nativecot against NATIVEHARMONY -- the chain of thought carried between tool calls, which
+#      docs/format.md's worked example does explicitly and this harness never has. Every turn has
+#      started its reasoning from nothing. That is a candidate cause for rounds that re-read a
+#      file they already read, and for the circling tools/repeat-guard exists to detect.
 #
-#   3. nativetype -- the report's shape shown as a type definition rather than JSON Schema. 762
-#      tokens to 339 on the real schema, measured with this model's tokenizer, every property,
-#      enum value and description preserved.
+#      Not free: analysis is the bulk of what gpt-oss generates, so carrying it grows the context
+#      it is meant to help, on a plan that already reaches 14-33k. It may cost more than it
+#      returns, which is what the arm is for.
 #
-#      The reason is not the tokens. --report-tool-max-depth exists because the schema costs so
-#      much context that the chosen fix was to stop offering the report TOOL past a depth -- the
-#      tool whose absence is this project's largest non-success outcome. This relieves that
-#      pressure instead of trading the report away to relieve it.
-#
-#   4. nativesym on `ledger` -- the symbols tool, which has never been measured. Its bench was
-#      launched, archived one directory, and died at a reboot. `ledger` rather than `wide`
-#      because symbols addresses big-file anchoring, which is what ledger exercises.
+#   4. WHAT IS DELIBERATELY ABSENT. nativesym on `ledger` was in an earlier draft and is dropped:
+#      tools/symbols exists because locating a declaration was hard, and one reason it was hard is
+#      that files arrived with no newlines. Measuring it on the old renderer produces a number that
+#      goes stale the moment arm 2 is settled. nativejson, nativetype and nativersp are built and
+#      also absent -- none of them sits on this ladder, and four arms at eight waves buys n=24
+#      where six arms would buy n=16 and the noise floor would eat the difference.
 #
 # WHAT THIS QUEUE CANNOT ANSWER
 #
@@ -54,17 +56,28 @@
 # at this n and are where a real difference will show first. Read them first, and do not let a
 # 4/18-against-2/18 be reported as a result.
 #
-# nativejson and nativeraw are NOT combinable and are not combined here. A json_schema grammar
-# constrains the whole completion, and the raw path's completion begins with harmony channel
-# tokens rather than `{`; native-agent refuses the pairing rather than producing nonsense.
+# nativejson, nativetype and nativersp are BUILT and are deliberately NOT in this queue. Five arms
+# at six waves buys n=18 each; four buys the same n on the questions most likely to move. The
+# renderer defects are mechanical and measured, so they are the ones worth the night. nativersp
+# in particular should wait: it costs +145 tokens per request against submit_report and its case
+# is adherence, which is only readable once the renderer question is settled.
+#
+# THE LADDER. Every adjacent pair differs by exactly ONE thing, which is what makes each rung
+# readable, and the whole thing readable against native -- the arm every published number here was
+# measured on.
+#
+#   native          llama.cpp parses, llama.cpp renders, chain of thought dropped
+#   nativeraw       WE parse            llama.cpp renders          -> isolates the parser
+#   nativeharmony   we parse            WE render                  -> isolates the renderer
+#   nativecot       we parse            we render      CoT CARRIED  -> isolates the chain of thought
 #
 # SIZING, from measured medians rather than hope
 #
 #   wide/native 204s   wide/nativeraw 222s
 #
-# A wide wave is 3 reps x 4 arms, roughly 3*(204+222+215+215) = 43 minutes. Six waves is 4.3
-# hours and n=18 per arm. The ledger blocks add about 40 minutes each and run on waves 2 and 4, so
-# a short night still leaves them balanced.
+# A wave is 3 reps x 4 arms, roughly 44 minutes. Eight waves is about 7.5 hours and n=24 per arm.
+# That is still short of the ~60 a proportion needs, and long enough to see a large effect on the
+# continuous measures, which is where a real difference will show first.
 #
 # Waves rather than arms-in-sequence, for the reason the last two queues established: an
 # interruption at any point leaves a balanced comparison rather than one complete arm and nothing
@@ -96,28 +109,19 @@ job sync-clone --no-gpu --timeout 300 -- "$HANDOFF/tools/sync-bench-clone" "$CLO
 
 # --- the waves -----------------------------------------------------------------------------------
 
-for wave in 1 2 3 4 5 6; do
+for wave in 1 2 3 4 5 6 7 8; do
     flag="--append"
     [[ "$wave" == 1 ]] && flag="--force"
 
     # native FIRST in every wave. It is the control for all three comparisons, so if the night is
     # cut short the arm that survives is the one every reading depends on.
-    for arm in native nativeraw nativejson nativetype; do
+    for arm in native nativeraw nativeharmony nativecot; do
         job "w$wave-$arm" --cwd "$CLONE" --est 660 --timeout 3600 -- \
             ./bench/run --plan wide --providers "$arm" --repeat 3 "$flag"
     done
 
     job "w$wave-readout" --no-gpu --cwd "$CLONE" --timeout 300 -- \
-        ./bench/compare wide native nativejson --acts-on first-attempt
-
-    # ledger, for the symbols arm. Waves 2 and 4 so a short night still leaves it balanced.
-    if [[ "$wave" == 2 || "$wave" == 4 ]]; then
-        lflag="--append"; [[ "$wave" == 2 ]] && lflag="--force"
-        for arm in native nativesym; do
-            job "l$wave-$arm" --cwd "$CLONE" --est 600 --timeout 3600 -- \
-                ./bench/run --plan ledger --providers "$arm" --repeat 3 "$lflag"
-        done
-    fi
+        ./bench/compare wide nativeraw nativeharmony --acts-on first-attempt
 done
 
 # --- the morning ---------------------------------------------------------------------------------
@@ -125,12 +129,12 @@ done
 # The one that settles an existing question rather than opening a new one.
 job final-raw --no-gpu --cwd "$CLONE" --timeout 300 -- \
     ./bench/compare wide native nativeraw --acts-on first-attempt
-job final-json --no-gpu --cwd "$CLONE" --timeout 300 -- \
-    ./bench/compare wide native nativejson --acts-on first-attempt
-job final-type --no-gpu --cwd "$CLONE" --timeout 300 -- \
-    ./bench/compare wide native nativetype --acts-on first-attempt
-job final-sym --no-gpu --cwd "$CLONE" --timeout 300 -- \
-    ./bench/compare ledger native nativesym --acts-on first-attempt
+# nativeraw is the control for the renderer, NOT native: both parse harmony locally and differ
+# only in who builds the prompt. Comparing against native would fold the parser change in with it.
+job final-harmony --no-gpu --cwd "$CLONE" --timeout 300 -- \
+    ./bench/compare wide nativeraw nativeharmony --acts-on first-attempt
+job final-cot --no-gpu --cwd "$CLONE" --timeout 300 -- \
+    ./bench/compare wide nativeharmony nativecot --acts-on first-attempt
 
 job final-summary --no-gpu --cwd "$CLONE" --timeout 300 -- ./bench/summary
 
