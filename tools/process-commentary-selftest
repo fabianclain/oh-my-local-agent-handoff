@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+#
+# process-commentary-selftest — the edit-narration gate, from both sides.
+#
+#   tools/process-commentary-selftest
+#
+# Every "must pass" case below is a real false positive this gate produced before it was
+# narrowed, not a hypothetical. That is the half worth testing hardest: the flagged form appears
+# once in a night of rounds, while the imperative comment it must not touch appears in almost
+# every file in the project.
+
+set -uo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+TOOL="$HERE/process-commentary"
+WORK="$(mktemp -d)"
+FAILED=0
+trap 'rm -rf "$WORK"' EXIT
+
+clean() {
+    local name="$1" file="$WORK/$1.php"
+    cat >"$file"
+    if ! out="$(python3 "$TOOL" "$file" 2>&1)"; then
+        echo "    FAIL: '$name' is an ordinary comment but was flagged"
+        printf '%s\n' "$out" | head -3 | sed 's/^/          /'
+        FAILED=$((FAILED + 1))
+    fi
+}
+
+flagged() {
+    local name="$1" file="$WORK/$1.php"
+    cat >"$file"
+    if python3 "$TOOL" "$file" >/dev/null 2>&1; then
+        echo "    FAIL: '$name' narrates an edit and was reported clean"
+        FAILED=$((FAILED + 1))
+    fi
+}
+
+echo "==> the instance this was written for"
+# Byte-for-byte what a local model left behind after an orchestrator-guided repair, in a round
+# that went from 5 of 16 criteria to 13.
+flagged real <<'PHP'
+<?php
+$buckets[$b]['bytes_stored'] = (int) $row->bytes_stored;
+// removed bytes_raw from bucket
+$buckets[$b]['words'] = (int) $row->words;
+PHP
+
+flagged other-verbs <<'PHP'
+<?php
+// added the guard
+// renamed to match the plan
+// reverted my earlier attempt
+$x = 1;
+PHP
+
+echo "==> imperative comments say what the code DOES and must pass"
+# All five of these are shipped files this gate fired on before it was narrowed to past tense.
+clean imperative <<'PHP'
+<?php
+// Update per-metric maxima
+// Remove null bytes and control chars (except newline, tab)
+// Update visitor info if provided
+// Update visitor last seen
+// Update duration on the previous page visit
+$x = 1;
+PHP
+
+echo "==> a comment carrying a reason is explaining, not narrating"
+clean with-rationale <<'PHP'
+<?php
+// Deliberately past 4 GB. On SQLite this cannot fail — integers are dynamically sized.
+// changed here because the read path now reports an unreadable file rather than an absent one
+$x = 1;
+PHP
+
+echo "==> docblock prose that happens to begin with a verb"
+clean docblock <<'PHP'
+<?php
+/**
+ * A body whose permissions were
+ * changed is still a stored body, and the read path now reports an unreadable file.
+ */
+$x = 1;
+PHP
+
+echo "==> the project's own source must pass"
+COUNT=0
+mapfile -t FILES < <(find /home/fabbs/dev/monolith/app /home/fabbs/dev/monolith/resources/views \
+                          /home/fabbs/dev/monolith/routes /home/fabbs/dev/monolith/tests \
+                          -type f -name '*.php' 2>/dev/null)
+COUNT=${#FILES[@]}
+if (( COUNT > 0 )) && ! out="$(python3 "$TOOL" "${FILES[@]}" 2>&1)"; then
+    echo "    FAIL: shipped source was flagged"
+    printf '%s\n' "$out" | head -6 | sed 's/^/          /'
+    FAILED=$((FAILED + 1))
+fi
+echo "    checked $COUNT shipped file(s)"
+
+echo
+if (( FAILED > 0 )); then
+    echo "$FAILED case(s) wrong."
+    exit 1
+fi
+echo "process-commentary: every case correct."

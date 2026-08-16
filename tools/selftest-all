@@ -17,6 +17,8 @@
 #                        cost a round, invisible to php -l and to the HTML tag check
 #   invisible-characters-selftest  characters that are not the character they look like. A U+2011
 #                        shipped twice, in rounds accepted 10/10 and 16/16
+#   process-commentary-selftest  comments about the edit rather than the code. Every plan forbids
+#                        them in prose; prose is not a control
 #   feedback-selftest    what a repair attempt is told
 #   patch-shape-selftest the order and hunk-count checks
 #   shim-selftest        the tool-call shim (needs no model either)
@@ -65,7 +67,7 @@ REPO="$(cd "$HERE/.." && pwd)"
 cd "$REPO"
 FAILED=()
 
-for suite in smoke-e2e harness-selftest verifier-selftest refuse-destructive-selftest sequence-selftest blade-balance-selftest invisible-characters-selftest feedback-selftest patch-shape-selftest shim-selftest native-retry-selftest native-tools-selftest turn-economy-selftest report-audit-selftest journal-selftest roundup-selftest plan-lint-selftest view-selftest site-audit-selftest overnight-selftest docblock-anchor-selftest repeat-guard-selftest repair-provenance-selftest schema-typedef-selftest harmony-render-selftest schema-grammar-selftest peg-capture-selftest usage-selftest queue-selftest answerability-selftest; do
+for suite in smoke-e2e harness-selftest verifier-selftest refuse-destructive-selftest sequence-selftest blade-balance-selftest invisible-characters-selftest process-commentary-selftest feedback-selftest patch-shape-selftest shim-selftest native-retry-selftest native-tools-selftest turn-economy-selftest report-audit-selftest journal-selftest roundup-selftest plan-lint-selftest view-selftest site-audit-selftest overnight-selftest docblock-anchor-selftest repeat-guard-selftest repair-provenance-selftest schema-typedef-selftest harmony-render-selftest schema-grammar-selftest peg-capture-selftest usage-selftest queue-selftest answerability-selftest; do
     # Suites live in tools/, except the ones that test a bench fixture and belong beside it.
     # Resolving only tools/ made a real suite report `SKIP (missing)` — which this file's own next
     # comment calls the failure it exists to avoid, one line before failing to avoid it.

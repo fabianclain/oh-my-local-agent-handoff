@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""process-commentary — comments about the edit, left in the file.
+
+    tools/process-commentary <file> [<file> ...]
+
+Exit 0 when clean, 1 when something was found, 2 when a file cannot be read.
+
+WHY THIS EXISTS
+
+Every plan this harness runs carries an "Output discipline" section, and it says, in bold:
+
+    No commentary on your own process — nothing of the form "the above is wrong",
+    "re-writing this properly", "actually, the rule is".
+
+It is prose, and prose is not a control. Measured over one nine-round session, every instruction
+that existed only as prose was ignored and every instruction in command form held — including one
+warning written in bold, in its own section, naming the two prior failures, which happened anyway.
+
+Caught live during an overnight run. An orchestrator diagnosed a rejected round precisely ("delete
+the single line `$totals['bytes_raw'] += ...`"), the local model applied the fix and took the round
+from 5 of 16 criteria to 13, and left this behind:
+
+    $buckets[$b]['bytes_stored'] = (int) $row->bytes_stored;
+    // removed bytes_raw from bucket
+    $buckets[$b]['words'] = (int) $row->words;
+
+The code is right. The comment describes what happened to the file rather than what the file does,
+so it is addressed to nobody: the next reader has no "before" to compare it against, and the line
+it refers to is gone.
+
+WHAT IS FLAGGED
+
+A single-line comment that opens with an edit verb and offers no reason. Nothing else.
+
+    // removed bytes_raw from bucket          flagged — past tense, no reason
+    // added the guard                        flagged
+
+WHAT IS NOT, AND WHY THE RULE IS THIS NARROW
+
+This codebase explains its own history deliberately and at length, and that prose is the most
+valuable thing in it. All of these must pass:
+
+    // Update per-metric maxima             IMPERATIVE — says what the code does
+    // Remove null bytes and control chars   imperative again; five shipped files, all correct
+    /**
+     * ... changed is still a stored body, and the read path now reports an unreadable file
+                                            a wrapped docblock line beginning with a verb
+    // Deliberately past 4 GB. On SQLite this cannot fail — integers are dynamically sized.
+                                            a reason, which is the whole point
+    # Add currency conversion across the orders domain
+                                            a markdown heading, not a comment at all
+
+Three narrowings, each forced by a false positive rather than anticipated:
+
+  past tense only     the imperative forms are what comments are FOR, and including them fired
+                      on five correct files immediately
+  `//` only           `#` is a comment in a shell script and a heading in the markdown beside it,
+                      which flagged four plan files on sight
+  no rationale        a comment carrying a reason is explaining the code, not narrating the edit
+
+Verified silent across 812 PHP and Blade files in the monolith and 903 files in this repository.
+The only hit is the one it was written for. This file is its own exception: it necessarily
+contains the pattern it documents.
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+
+# PAST TENSE ONLY, and this is the whole difference between a gate and a nuisance.
+#
+# `// Update per-metric maxima` and `// Remove null bytes` are imperative: they say what the code
+# below DOES, which is what a comment is for. `// removed bytes_raw from bucket` is past: it says
+# what happened to the file. Including the imperative forms fired on five shipped files here
+# immediately, all of them correct.
+VERBS = (
+    "removed", "added", "deleted", "changed", "renamed", "moved", "updated", "fixed",
+    "rewrote", "rewritten", "re-wrote", "re-written", "reverted", "restored", "replaced",
+    "commented out", "uncommented",
+)
+
+# `//` only, never `#`. In a shell script `#` is a comment; in the markdown sitting beside it,
+# `# Add currency conversion` is a heading, and this flagged four plan files on sight.
+COMMENT = re.compile(
+    r"^\s*//\s*(" + "|".join(VERBS) + r")\b(?P<rest>.*)$",
+    re.IGNORECASE,
+)
+
+# A comment that gives a reason is explaining the code, not narrating the edit. `.` ends a
+# sentence, and everything else here introduces one.
+RATIONALE = re.compile(
+    r"[.!?]|\b(because|since|so that|so the|rather than|otherwise|which|in order|to avoid|"
+    r"or the|and the|would|cannot|must|see )\b",
+    re.IGNORECASE,
+)
+
+
+def check(path: str) -> list[str]:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+    except UnicodeDecodeError:
+        return []
+    except OSError as exc:
+        return [f"{path}: cannot read: {exc}"]
+
+    problems = []
+    for number, line in enumerate(lines, start=1):
+        match = COMMENT.match(line)
+        if not match:
+            continue
+        rest = match.group("rest")
+        if RATIONALE.search(rest) or len(rest) > 70:
+            continue                     # a reason, or a paragraph: explaining, not narrating
+        problems.append(f"{path}:{number}: {line.strip()}")
+    return problems
+
+
+def main(argv: list[str]) -> int:
+    if not argv:
+        print("usage: process-commentary <file> [...]", file=sys.stderr)
+        return 64
+
+    failed = 0
+    for path in argv:
+        problems = check(path)
+        if problems:
+            failed += 1
+            for problem in problems:
+                print(problem)
+
+    if failed:
+        print()
+        print(f"{failed} file(s) carry a comment about the edit rather than about the code.")
+        print("The next reader has no 'before' to compare it against, and the line it refers to")
+        print("is gone. Delete the comment, or replace it with the reason the code is as it is.")
+        return 1
+
+    print(f"{len(argv)} file(s): no commentary on the edit.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
