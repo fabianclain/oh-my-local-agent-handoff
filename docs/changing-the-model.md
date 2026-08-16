@@ -196,18 +196,19 @@ nothing connected them and the wait loop had no deadline. It would have consumed
 report-channel queue. Two regression cases, because one is not enough: 13 proves `handoff` honours
 the flag, 14 proves `bench/run` sets it.
 
-**Open — the residency check has a false positive.** `llamacpp-serve` infers residency from host
-RSS and warned that gemma4-agentic was "at least partly in host memory". It was not: llama.cpp
-**mmaps** the GGUF, and reading from ollama's blob store puts the model file's page cache in RSS.
-Measured during sustained generation: GPU 94–96%, 70–74 W, llama-server using 14% of one core. The
-heuristic rejects a perfectly resident model, and it nearly caused a needless 10 GB download.
+**Fixed — the residency check measured the wrong number.** It read `VmRSS` and warned that
+gemma4-agentic was "at least partly in host memory". It was not: llama.cpp **mmaps** the GGUF, so
+the model file's page cache is file-backed and counts toward `VmRSS` without a byte of it being a
+spill. On a fully resident gpt-oss: `VmRSS` 1.19 GB, `RssFile` 0.81 GB, `RssAnon` **0.38 GB**, with
+nvidia-smi reporting all 12,756 MiB on the card, and sustained generation at 94–96% GPU on 14% of
+one CPU core. The check now reads `RssAnon`. It had nearly bought a needless 10 GB download of a
+smaller quant, while the throughput evidence contradicting it sat in the same terminal.
 
-**Open — `llamacpp-serve start <model>` ignores its model argument.** When a systemd unit is
-present it restarts `monolith-llama.service`, whose `ExecStart` hardcodes
-`llamacpp-serve foreground gpt-oss-20b`. Asking for any other model silently starts gpt-oss; it
-took three attempts and two wrong diagnoses to see it. `LLAMACPP_UNIT=no-such-unit.service` is the
-workaround. The unit should read the model and context from the state files `llamacpp-serve`
-already writes, or `start` should refuse rather than serve something else.
+**Fixed — `llamacpp-serve start <model>` served a different model, silently.** The unit names one
+model in its `ExecStart`, so restarting it to serve another starts the unit's model:
+`start lfm2.5-8b` brought up gpt-oss three times running, each looking like a different failure,
+and the state file then recorded gpt-oss so nothing downstream noticed either. It now reads the
+unit's `ExecStart` and, when the requested model differs, stops the unit and starts directly.
 
 **Open — the most diagnostic artifact this stack produces is being deleted.** llama-server logs
 every completion it discards under `unparsed peg-native output:`, with the full text. Those logs
@@ -217,7 +218,77 @@ three overturned a model verdict. `providers/lcpp.sh` already brackets each roun
 into that log for token accounting; the same bracket would let a round copy its own discarded
 completions into its result directory, where they would outlive rotation.
 
-**Open — the unit and the manual server disagree about context.** The unit hardcodes `-c 65536`;
-the session had been running 98304. Whichever starts last wins, silently. Tonight's queue asserts
-`HANDOFF_EXPECT_CTX=98304` at `doctor`, so it would fail loudly — but only because that assertion
-exists.
+**Fixed, and this entry had the cause wrong.** It said the unit hardcodes `-c 65536`. It does not:
+`ExecStart` is `llamacpp-serve foreground gpt-oss-20b`, and `cmd_foreground` reads the context from
+the state file. The 65536 was written by **this tool's own failed start** — `start lfm2.5-8b 65536`
+wrote the context, failed on a busy port, and the gpt-oss server that returned a moment later read
+65536 where the session had been running 98304. The previous value is now restored on every failure
+path. Diagnosing it as a hardcoded unit value was a guess that matched the symptom and not the
+mechanism.
+
+---
+
+## 5. The harmony spec, and what llama.cpp does to our tools
+
+[openai/harmony](https://github.com/openai/harmony) is the official renderer and parser for the
+format gpt-oss speaks. Reading it answered two questions this project had only guessed at, and
+raised a third that matters more than either.
+
+### Our lenient parser is spec-sanctioned, not guesswork
+
+`tools/native-agent`'s `parse_harmony` is tolerant in three documented ways, each added from an
+observed failure. Two of them turn out to be the specification, not leniency. From `docs/format.md`:
+
+> If the model decides to call a tool it will define a `recipient` in the header … **The recipient
+> might be defined in the role or channel section of the header.**
+>
+> The model **might also** specify a `<|constrain|>` token to indicate the type of input.
+
+So a recipient whose position varies, and an optional `<|constrain|>`, are both expected. Those are
+exactly the shapes llama.cpp discards — 99 of 3,131 completions in one night, 75 of them a
+"garbled" header and 18 a `final` message tagged `<|constrain|>json`.
+
+**llama.cpp is stricter than the format's own specification.** Fed the same strings, the official
+parser does not reject them. It is worth saying that it does not parse them *well* either — on the
+garbled header it returns `channel='functions.write_file'`, `recipient='<|channel|>commentary'`,
+which is not the intended reading. `parse_harmony` recovers the intent that both of the others lose.
+
+### llama.cpp flattens every nested tool argument to `any[]`
+
+The spec renders tools as TypeScript-like types in a `functions` namespace and states plainly that
+**"it is important to stick to this format closely to improve accuracy of function calling"**.
+llama.cpp does render that format, and does emit the channel rules. It does not render the types.
+
+The same `read_files` schema, through both renderers:
+
+| | |
+| --- | --- |
+| **harmony** | `files: { path?: string, // first line, 1-based`<br>`start?: number, // last line, inclusive`<br>`end?: number, }[]` |
+| **llama.cpp** | `files: any[]` |
+
+Four nested structures in the real tool set are erased this way:
+
+| tool | field | rendered as |
+| --- | --- | --- |
+| `read_files` | `files` | `any[]` — `path`, `start`, `end` invisible |
+| `submit_report` | `files_changed` | `any[]` |
+| `submit_report` | `tests_run` | `any[]` |
+| `submit_report` | `deviations` | `any[]` |
+
+The `start`/`end` window — the change that turned three dead rounds into an accepted one — **is not
+in the type the model is shown**. It survives only because it happens to be described in prose in
+the tool's description string, which is why that description reads the way it does.
+
+Worse for `submit_report`: llama.cpp builds the tool-call **grammar** from the same schema, so the
+model is *forced* into a shape it was never shown. A model fighting a grammar it cannot see is
+precisely the failure `capability-baseline`'s `response-format` probe watches for.
+
+### The fix is half-built already
+
+`providers/nativeraw.sh` generates through `/completions`, taking the prompt from `/apply-template`
+so it cannot drift from the server's idea of it. That call is the one thing to replace: render with
+harmony's own renderer instead, and the tool definitions become correct wholesale. Same loop, same
+tools, one dependency, and it is an arm — measurable against the same control as everything else.
+
+This is the first finding here that changes what the model is **told**, rather than how its answer
+is read.
