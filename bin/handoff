@@ -260,10 +260,33 @@ if [[ ( "$MODE" == "do" || "$MODE" == "resume" ) && -n "${HANDOFF_USES_LOCAL_GPU
     if [[ -x "$_queue" ]] && ! flock -n "$GPU_LOCK" true 2>/dev/null; then
         _ticket="$("$_queue" take "$SLUG" "$REPO_ROOT" --pid $$ 2>/dev/null || true)"
         echo "==> the local model is busy — waiting"
-        "$_queue" status "$_ticket" 2>/dev/null || true
+        _status="$("$_queue" status "$_ticket" 2>/dev/null || true)"
+        [[ -n "$_status" ]] && printf '%s\n' "$_status"
+        # The queue only knows about rounds that took a TICKET. bench/run takes the same lock with
+        # a bare flock and registers nothing, so the status can truthfully say "nobody" about a
+        # lock that is definitely held -- which is how a deadlocked run came to print "holder:
+        # nobody — the model is free" every two minutes while waiting on it. Say which it is.
+        if [[ "$_status" == *nobody* ]]; then
+            echo "    NOTE: the lock is held by a process that registered no ticket — almost"
+            echo "    always a benchmark. 'nobody' above means 'no queued round', not 'free'."
+        fi
         echo "    (Ctrl-C to give up; nothing has been written yet)"
         _waited=0
+        _limit="${HANDOFF_GPU_WAIT:-7200}"
         until flock -n "$GPU_LOCK" true 2>/dev/null; do
+            # Bounded. This loop had no exit but success, so a lock that was never going to be
+            # released -- one held by an ANCESTOR of this very process, which is what a bench round
+            # produced -- waited forever at 15 W with no error and no deadline. An unbounded wait
+            # for a condition that cannot change is a hang, not patience.
+            if (( _waited >= _limit )); then
+                echo "==> giving up after ${_waited}s: the GPU lock was never released." >&2
+                echo "    Nothing has been written. If a benchmark is running, wait for it;" >&2
+                echo "    if this round was started from INSIDE one, that is a bug -- bench/run" >&2
+                echo "    must export HANDOFF_GPU_LOCK_HELD=1 so nested rounds do not re-take" >&2
+                echo "    the lock their own parent holds." >&2
+                [[ -n "$_ticket" ]] && "$_queue" drop "$_ticket" 2>/dev/null || true
+                exit 75
+            fi
             # Configurable only so the selftest can exercise the wait without taking a minute.
             sleep "${HANDOFF_GPU_POLL:-15}"
             _waited=$(( _waited + ${HANDOFF_GPU_POLL:-15} ))

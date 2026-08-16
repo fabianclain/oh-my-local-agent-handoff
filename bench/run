@@ -30,6 +30,17 @@ if [[ -z "${BENCH_LOCK_HELD:-}" ]]; then
     # token-accounting comment in providers/lcpp.sh says makes both sets of numbers wrong. A commit
     # message claimed they already serialised; they did not, and the claim was caught by reading
     # the two literals side by side rather than by anything failing.
+    # Tell the rounds this process tree ALREADY holds it. Without this line every round inside the
+    # run calls bin/handoff, which takes the same lock, finds it held -- by its own parent -- and
+    # waits in a loop with no timeout. Parent waits for child, child waits for parent, and the GPU
+    # sits at 15 W while the run reports "the local model is busy" and "holder: nobody".
+    #
+    # The guard already existed in bin/handoff; it keys on HANDOFF_GPU_LOCK_HELD and bench/run set
+    # only BENCH_LOCK_HELD, so nothing connected them. Unifying the two lock files created the
+    # deadlock and the commit that did it claimed the two now serialise, "verified it blocks" --
+    # blocking is correct between INDEPENDENT processes and fatal between nested ones, and only the
+    # first case was tested.
+    export HANDOFF_GPU_LOCK_HELD=1
     BENCH_LOCK="${TMPDIR:-/tmp}/agent-handoff-gpu.lock"
     exec flock --close -w "${BENCH_LOCK_WAIT:-600}" "$BENCH_LOCK" "$0" "$@"
 fi

@@ -59,6 +59,22 @@ SERVING="$STATE_DIR/llamacpp.model"
 model_path() {
     case "$1" in
     gpt-oss-20b) echo "${GPTOSS_GGUF:-$HOME/.cache/agent-handoff/models/gpt-oss-20b-MXFP4.gguf}" ;;
+    # LFM2.5-8B-A1B, hybrid convolution + attention MoE: 8.3B total, ~1.5B active per token.
+    # Q8_0 from LiquidAI's own repo, NOT ollama's blob and NOT a low quant, for two separate
+    # reasons this project has already paid for.
+    #
+    #   the blob     ollama keeps the chat template in a layer OUTSIDE the GGUF, so pointing
+    #                llama.cpp at an ollama blob tests a template-stripped model and tells you
+    #                nothing. `ollama pull lfm2.5:8b` is fine for ollama and useless here.
+    #   the quant    the gpt-oss Coding-Distill at Q3_K_M fabricated two successes with invented
+    #                file paths and was nearly recorded as an architecture verdict. Q8_0 costs
+    #                4 GB more and removes quantisation from the list of things a bad result
+    #                could mean.
+    #
+    # `ollama show` lists capabilities completion/tools/thinking. That claim is about the template,
+    # not about what the model emits -- every Qwen tried here also declared tools and emitted them
+    # as TEXT. tools/engine-conformance is the gate, and it runs before any round.
+    lfm2.5-8b) echo "${LFM_GGUF:-$HOME/.cache/agent-handoff/models/LFM2.5-8B-A1B-Q8_0.gguf}" ;;
     # ornith 9B, `ollama pull ornith:9b`. Pointed straight at ollama's blob, which is
     # world-readable and carries the GGUF magic, so no copy is needed.
     #

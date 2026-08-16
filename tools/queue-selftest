@@ -58,7 +58,7 @@ project() {  # a throwaway repo with one plan
     echo "$root"
 }
 
-echo "==> 1/12 an estimate is not invented from too little history"
+echo "==> 1/15 an estimate is not invented from too little history"
 OUT="$("$Q" status 2>&1)"
 if grep -qE "~[0-9]" <<<"$OUT"; then
     fail "printed a number with no rounds recorded" "$OUT"
@@ -68,7 +68,7 @@ else
     pass "says how many rounds it has and how many it needs"
 fi
 
-echo "==> 2/12 position and estimate scale with the queue"
+echo "==> 2/15 position and estimate scale with the queue"
 for s in 300 300 300; do "$Q" record native "$s"; done
 T1="$("$Q" take alpha /a --pid $$)"; T2="$("$Q" take beta /b --pid $$)"
 "$Q" holding running /c --pid $$
@@ -84,7 +84,7 @@ else
     pass "#1 waits one round, #2 waits two — from recorded durations, not a guess"
 fi
 
-echo "==> 3/12 a dead waiter's ticket does not inflate the queue"
+echo "==> 3/15 a dead waiter's ticket does not inflate the queue"
 bash -c 'sleep 30' & DEAD=$!
 DEADTICKET="$("$Q" take zombie /z --pid $DEAD)"
 kill "$DEAD" 2>/dev/null; wait "$DEAD" 2>/dev/null
@@ -119,7 +119,7 @@ Anything else.
 PLAN
 ( cd "$R" && printf '.handoff/runs/\n' >> .gitignore && git add -A && git commit -qm ig ) >/dev/null
 
-echo "==> 4/12 with the GPU free, a round says nothing about queues"
+echo "==> 4/15 with the GPU free, a round says nothing about queues"
 OUT="$( cd "$R" && HANDOFF_USES_LOCAL_GPU=1 HANDOFF_PROVIDER=stub STUB_PATCH="true" \
         handoff do alpha 2>&1 )"
 if grep -qi "busy\|waiting" <<<"$OUT"; then
@@ -128,7 +128,7 @@ else
     pass "silent when there is nothing to say"
 fi
 
-echo "==> 5/12 a busy GPU makes the next round wait, and say where it is"
+echo "==> 5/15 a busy GPU makes the next round wait, and say where it is"
 flock "$GPU_LOCK" sleep 6 &
 HOLDER=$!
 sleep 1
@@ -143,7 +143,7 @@ else
     pass "waited, said so, and started once free"
 fi
 
-echo "==> 6/12 the lock is released when the round ends"
+echo "==> 6/15 the lock is released when the round ends"
 if flock -n "$GPU_LOCK" true 2>/dev/null; then
     pass "free again after the round"
 else
@@ -153,14 +153,14 @@ fi
 # ------------------------------------------------------------------------------------------------
 # The spool.
 
-echo "==> 7/12 a slug with no plan is refused when it is queued"
+echo "==> 7/15 a slug with no plan is refused when it is queued"
 if "$SPOOL" add nosuchplan "$R" >/dev/null 2>&1; then
     fail "queued a job that could never run — discovered at 2am instead of at 3pm"
 else
     pass "refused at enqueue, while you are still there to fix it"
 fi
 
-echo "==> 8/12 jobs drain oldest first, each in its own repository"
+echo "==> 8/15 jobs drain oldest first, each in its own repository"
 A="$(project alpharepo)"; B="$(project betarepo)"
 "$SPOOL" add alpha "$A" >/dev/null; "$SPOOL" add alpha "$B" >/dev/null
 cat > "$SANDBOX/fake-handoff" <<'FAKE'
@@ -179,7 +179,7 @@ else
     pass "oldest first, each with its own working directory"
 fi
 
-echo "==> 9/12 a rejected job is a result, not a wedge"
+echo "==> 9/15 a rejected job is a result, not a wedge"
 "$SPOOL" add alpha "$A" >/dev/null; "$SPOOL" add alpha "$B" >/dev/null
 printf '#!/bin/bash\nexit 1\n' > "$SANDBOX/failing"; chmod +x "$SANDBOX/failing"
 OUT="$(HANDOFF_BIN="$SANDBOX/failing" "$SPOOL" drain 2>&1)"
@@ -191,7 +191,7 @@ else
     pass "recorded and moved on"
 fi
 
-echo "==> 10/12 the callback fires with the verdict the gates reached"
+echo "==> 10/15 the callback fires with the verdict the gates reached"
 SEEN="$SANDBOX/callback.txt"
 OUT="$( cd "$R" && HANDOFF_USES_LOCAL_GPU=1 HANDOFF_PROVIDER=stub STUB_PATCH="true" \
         HANDOFF_CALLBACK="cat > $SEEN" handoff do alpha 2>&1 )"
@@ -205,7 +205,7 @@ else
     pass "ai-run-end delivered, carrying the gates' verdict"
 fi
 
-echo "==> 11/12 a second job for a repo already in flight is refused"
+echo "==> 11/15 a second job for a repo already in flight is refused"
 "$SPOOL" add alpha "$A" >/dev/null
 OUT="$("$SPOOL" add alpha "$A" 2>&1)"; RC=$?
 if [[ "$RC" -eq 0 ]]; then
@@ -219,7 +219,7 @@ else
 fi
 "$SPOOL" clear >/dev/null
 
-echo "==> 12/12 a rejection holds that project's queue, and nobody else's"
+echo "==> 12/15 a rejection holds that project's queue, and nobody else's"
 # Two jobs for A, one for B. A's first is rejected, so A's second must not run — and B's must.
 "$SPOOL" add alpha "$A" >/dev/null
 "$SPOOL" add alpha "$A" --force >/dev/null
@@ -246,5 +246,73 @@ else
 fi
 
 echo
+
+echo "==> 13/15 a round INSIDE a benchmark does not wait for its parent's lock"
+# The deadlock this case exists for, observed live. bench/run re-execs itself under
+# `flock ... agent-handoff-gpu.lock` and holds it for the whole run; each round then calls
+# bin/handoff, which took the SAME lock, found it held -- by its own parent -- and waited in a
+# loop with no timeout. The GPU sat at 15 W while the run printed "the local model is busy" and
+# "holder: nobody — the model is free" every two minutes.
+#
+# bin/handoff already had the guard, keyed on HANDOFF_GPU_LOCK_HELD; bench/run exported only
+# BENCH_LOCK_HELD, so nothing connected them. Unifying the two lock files created it, and the
+# commit that unified them claimed to have "verified it blocks" -- which is right between
+# INDEPENDENT processes and fatal between nested ones. Only the first case was tested, and this
+# is the second.
+flock "$GPU_LOCK" bash -c "
+    cd '$R' || exit 1
+    HANDOFF_GPU_LOCK_HELD=1 HANDOFF_USES_LOCAL_GPU=1 HANDOFF_PROVIDER=stub STUB_PATCH='true' \
+    HANDOFF_GPU_POLL=1 HANDOFF_GPU_WAIT=6 timeout 40 handoff do alpha 2>&1" > "$SANDBOX/nested.log" 2>&1
+NESTED_RC=$?
+if grep -qi "busy\|still waiting\|giving up" "$SANDBOX/nested.log"; then
+    fail "a nested round waited for a lock its own parent holds — this is the deadlock" \
+         "$(head -4 "$SANDBOX/nested.log")"
+elif [[ "$NESTED_RC" -ne 0 ]]; then
+    fail "the nested round did not complete (exit $NESTED_RC)" "$(tail -4 "$SANDBOX/nested.log")"
+else
+    pass "ran straight through, because the lock is already held by this process tree"
+fi
+
+echo "==> 14/15 bench/run declares that it holds the lock, before it takes it"
+# Case 13 proves bin/handoff HONOURS the flag; it sets the flag itself, so it cannot notice
+# bench/run failing to SET it -- which was the actual defect. Both halves or neither.
+#
+# Static, deliberately, and the limitation is worth stating: exercising it dynamically means
+# standing up the whole bench scaffolding, and the branch only arms when HANDOFF_USES_LOCAL_GPU is
+# set, which the stub provider does not set. That is exactly why harness-selftest ran bench/run end
+# to end for weeks and never touched this path.
+BENCH_RUN="$(cd "$HERE/.." && pwd)/bench/run"
+if [[ ! -r "$BENCH_RUN" ]]; then
+    fail "bench/run not found, so this check is looking at nothing" "$BENCH_RUN"
+else
+    # The export must appear inside the lock block and BEFORE the exec that takes the lock.
+    _blk="$(sed -n '/BENCH_LOCK_HELD:-/,/exec flock/p' "$BENCH_RUN")"
+    if ! grep -q "export HANDOFF_GPU_LOCK_HELD=1" <<<"$_blk"; then
+        fail "bench/run takes the GPU lock without telling its rounds — every round inside it will wait forever for its own parent" \
+             "$(head -3 <<<"$_blk")"
+    else
+        pass "the flag bin/handoff keys on is exported where the lock is taken"
+    fi
+fi
+
+echo "==> 15/15 an unreleasable lock gives up with a reason, rather than hanging"
+# The wait loop had no exit but success. A lock that is never released -- the nested case above,
+# before it was understood -- produced an unbounded wait with no error and no deadline. An
+# unbounded wait for a condition that cannot change is a hang, not patience.
+flock "$GPU_LOCK" sleep 12 &
+HOLDER2=$!
+sleep 1
+OUT="$( cd "$R" && HANDOFF_USES_LOCAL_GPU=1 HANDOFF_PROVIDER=stub STUB_PATCH="true" \
+        HANDOFF_GPU_POLL=1 HANDOFF_GPU_WAIT=3 timeout 40 handoff do alpha 2>&1 )"; RC=$?
+wait "$HOLDER2" 2>/dev/null
+if [[ "$RC" -eq 0 ]]; then
+    fail "it acquired a lock that was held for the whole window" "$OUT"
+elif ! grep -q "giving up" <<<"$OUT"; then
+    fail "it stopped without saying it had given up waiting" "$OUT"
+elif ! grep -q "HANDOFF_GPU_LOCK_HELD" <<<"$OUT"; then
+    fail "the message does not name the nested-round cause, which is the likely one" "$OUT"
+else
+    pass "bounded, and the error names the cause worth checking first"
+fi
 if [[ "$FAILURES" -eq 0 ]]; then echo "all checks passed"; else echo "$FAILURES check(s) failed"; fi
 exit $(( FAILURES > 0 ? 1 : 0 ))
