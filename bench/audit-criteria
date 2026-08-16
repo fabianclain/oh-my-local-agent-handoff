@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+#
+# audit-criteria — can each criterion be satisfied by an honest implementation?
+#
+#   bench/audit-criteria <worktree> <plan.md> [<plan.md> ...]
+#
+# Run against a tree holding the FINISHED, shipped work. That tree is the known-good answer by
+# construction, so a criterion that fails there cannot be satisfied by any correct
+# implementation — it is defective, and every round spent on it measures the test rather than
+# the model.
+#
+# This is the check that was missing. Of four failed rounds in a nine-round session, two failed
+# on criteria no honest implementation could satisfy: one pinned the test clock to a five-minute
+# boundary and then asserted the newest bar was partial, and one demanded a single query while
+# also demanding a value that by design lives outside the query's window. Neither was a model
+# failure and both were scored as one. The model's response to the impossible was never to fail
+# cleanly — it wrote `Carbon::setTestNow()` into production code to force the assertion true.
+#
+# Shape gates are reported apart from the rest. `patch-shape` and `docblock-anchor` compare a
+# file against a base ref, so on a clean checkout with nothing changed they are answering a
+# different question than the one they answer mid-round. A verdict from them here means nothing
+# either way, so they are listed and not judged.
+
+set -uo pipefail
+
+TREE="${1:?usage: audit-criteria <worktree> <plan.md>...}"; shift
+(( $# > 0 )) || { echo "no plans given" >&2; exit 64; }
+
+TOTAL=0; FAILED=0; SKIPPED=0
+
+for plan in "$@"; do
+    name="$(basename "$plan" .md)"
+    printf '\n\033[1m== %s\033[0m\n' "$name"
+
+    idx=0
+    while IFS= read -r command; do
+        [[ -n "${command//[[:space:]]/}" ]] || continue
+        idx=$((idx + 1))
+
+        # See the header: these need a diff to mean anything.
+        if [[ "$command" == *patch-shape* || "$command" == *docblock-anchor* ]]; then
+            SKIPPED=$((SKIPPED + 1))
+            printf '  %2d  \033[90mnot judged\033[0m  %s\n' "$idx" "${command:0:96}"
+            continue
+        fi
+
+        TOTAL=$((TOTAL + 1))
+        if out="$(cd "$TREE" && NO_COLOR=1 TERM=dumb CLICOLOR=0 \
+                  timeout 300 bash -o pipefail -c "$command" 2>&1)"; then
+            printf '  %2d  \033[32mholds\033[0m       %s\n' "$idx" "${command:0:96}"
+        else
+            FAILED=$((FAILED + 1))
+            printf '  %2d  \033[31mCANNOT PASS\033[0m %s\n' "$idx" "${command:0:96}"
+            printf '%s\n' "$out" | tail -6 | sed 's/^/          /'
+        fi
+    done < <(awk '
+        /^## Verification([[:space:]]+commands)?[[:space:]]*$/ { in_section=1; next }
+        in_section && /^```/ { if (in_block) exit; in_block=1; next }
+        in_block && NF { print }
+    ' "$plan")
+done
+
+printf '\n'
+if (( FAILED > 0 )); then
+    printf '\033[31m%d of %d judged criteria cannot be satisfied by the shipped implementation.\033[0m\n' "$FAILED" "$TOTAL"
+    printf 'Fix these before spending rounds on them — a round against a defective criterion\n'
+    printf 'measures nothing, and the model will contort the code until it passes.\n'
+    printf '(%d shape gates listed but not judged.)\n' "$SKIPPED"
+    exit 1
+fi
+printf '\033[32mall %d judged criteria hold against the shipped tree.\033[0m (%d shape gates not judged.)\n' "$TOTAL" "$SKIPPED"

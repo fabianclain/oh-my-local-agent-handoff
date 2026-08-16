@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+#
+# stage-graph-test — put the reviewer's test for one step into the tree, just before that step runs.
+#
+#   bench/stage-graph-test <slug>          # called by: handoff sequence --before-step
+#
+# ## Why staging, rather than seeding everything up front
+#
+# The guidance says to write every plan up front AND every test up front. Those two cannot both
+# hold when any plan's criteria include a broad filter, and this benchmark's do. Measured at
+# 4b-wiring's own shipped commit, with the code finished and correct:
+#
+#     tests staged one step ahead   php artisan test --filter=Crawler   346 passed
+#     all seven tests up front      php artisan test --filter=Crawler    19 FAILED
+#
+# Same code, same criterion. The nineteen are the tests for steps 5a and 5b — work nobody has
+# asked the model to do yet. Seeding them early makes an honest criterion unsatisfiable, which is
+# the single most expensive defect in this workflow: the model does not fail cleanly against an
+# impossible check, it contorts the code until the check passes.
+#
+# So: plans up front, because writing step 2's plan mid-round puts a file in the tree that the
+# scope gate charges to step 1. Tests with their step, because a test is a criterion's subject and
+# a criterion may only ever be about the step being run.
+#
+# The safe window is between the previous step's commit and this step's round — where
+# `--before-step` runs. Anything appearing DURING a round is that round's work as far as the
+# gates can tell.
+#
+# ## Where these come from
+#
+# The shipped commits of the feature this benchmark replays. Each introduced exactly one test
+# file, which is what makes the mapping below one line per step rather than a judgement.
+
+set -uo pipefail
+
+SLUG="${1:?usage: stage-graph-test <slug>}"
+
+case "$SLUG" in
+crawler-graphs-1-schema)     COMMIT=ba71eeb; FILE=tests/Feature/Crawler/CrawlMetricBucketTest.php ;;
+crawler-graphs-2-collect)    COMMIT=0a6fe08; FILE=tests/Feature/Crawler/CrawlerMetricsCollectTest.php ;;
+crawler-graphs-3-series)     COMMIT=b1a1f49; FILE=tests/Feature/Crawler/CrawlerMetricsSeriesTest.php ;;
+# 3b-shape re-runs the tests 3-series already staged; it introduced no test of its own.
+crawler-graphs-3b-shape)     COMMIT=""; FILE="" ;;
+crawler-graphs-4a-command)   COMMIT=b273f33; FILE=tests/Feature/Crawler/CrawlerCollectMetricsCommandTest.php ;;
+crawler-graphs-4b-wiring)    COMMIT=a533c27; FILE=tests/Feature/Crawler/CrawlerStatusSeriesTest.php ;;
+crawler-graphs-5a-chart)     COMMIT=5451703; FILE=tests/Feature/Crawler/CrawlerMetricChartTest.php ;;
+crawler-graphs-5b-page)      COMMIT=cf86d42; FILE=tests/Feature/Crawler/CrawlerStatusPageTest.php ;;
+*) echo "stage-graph-test: no test mapping for '$SLUG'" >&2; exit 1 ;;
+esac
+
+if [[ -z "$COMMIT" ]]; then
+    echo "   staged: nothing — $SLUG is judged by the test its predecessor staged"
+    exit 0
+fi
+
+git checkout "$COMMIT" -- "$FILE" || exit 1
+
+# Committed, not merely dropped in the tree — and this is what a reviewer actually does, not a
+# convenience.
+#
+# Found by the first real round. Left untracked, the test is still there after the step commits,
+# so `handoff sequence` sees a tree that is not clean and stops — correctly, since it cannot know
+# an untracked file is the reviewer's rather than the model's litter, and carrying it into the
+# next step would charge that step for it.
+#
+# Committing it first also puts it in the round's BASE, which is the honest place for the thing
+# that judges the round: the scope gate then knows it is not the model's work, and the read-only
+# gate has a tracked baseline to compare against rather than only "it exists now".
+git add -- "$FILE" || exit 1
+git -c user.name=reviewer -c user.email=reviewer@bench \
+    commit --quiet --no-verify -m "test: the criterion for ${SLUG#crawler-graphs-}" -- "$FILE" || exit 1
+
+echo "   staged: ${FILE#tests/Feature/Crawler/} (reviewer's test, from $COMMIT, committed)"

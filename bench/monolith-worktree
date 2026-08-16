@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+#
+# monolith-worktree — a disposable checkout of the monolith that Laravel actually boots in.
+#
+#   bench/monolith-worktree <name> <commit>     create (or reuse) and print the path
+#   bench/monolith-worktree --remove <name>
+#
+# A plain `git worktree add` is not enough here, and each of the three reasons below cost a
+# session before it was written down.
+#
+# ## vendor must be COPIED, not symlinked
+#
+# Composer resolves its base directory from the REALPATH of vendor/autoload.php. A symlink
+# therefore points the application at the repository the link came from, not the worktree — the
+# app boots against the wrong tree and every test dies with "A facade root has not been set",
+# which reads like a broken worktree rather than a broken vendor.
+#
+# `cp -al` (hardlinks) gives a real directory at the real path for 130 MB of files, costs a few
+# hundred milliseconds and almost no disk, and vendor/ is never written during a round.
+#
+# ## public/build must be copied, because git will not carry it
+#
+# The Vite manifest is gitignored, so a fresh worktree has no `public/build/manifest.json` and
+# every page render throws ViteException. That turns a view step into a step that cannot pass —
+# indistinguishable, from the evidence, from a model that wrote a broken template.
+#
+# ## storage must exist, with its framework subdirectories
+#
+# They are gitignored too, and Laravel does not create them. A missing framework/views is a
+# compile error on the first Blade render.
+
+set -uo pipefail
+
+MONOLITH="${MONOLITH_ROOT:-/home/fabbs/dev/monolith}"
+ROOT="${BENCH_WORKTREE_ROOT:-/home/fabbs/dev/bench-trees}"
+
+if [[ "${1:-}" == "--remove" ]]; then
+    name="${2:?usage: --remove <name>}"
+    git -C "$MONOLITH" worktree remove --force "$ROOT/$name" 2>/dev/null
+    rm -rf "${ROOT:?}/$name"
+    exit 0
+fi
+
+NAME="${1:?usage: monolith-worktree <name> <commit>}"
+COMMIT="${2:?commit required}"
+TREE="$ROOT/$NAME"
+
+mkdir -p "$ROOT"
+
+if [[ -d "$TREE/.git" || -f "$TREE/.git" ]]; then
+    git -C "$TREE" checkout --quiet --detach "$COMMIT" || exit 1
+    git -C "$TREE" clean -qfd -e vendor -e node_modules -e public/build -e storage -e .env
+    git -C "$TREE" reset --quiet --hard "$COMMIT"
+    printf '%s\n' "$TREE"
+    exit 0
+fi
+
+git -C "$MONOLITH" worktree add --quiet --detach "$TREE" "$COMMIT" || exit 1
+
+# See the header. Hardlinks, not a symlink, and not a full copy either.
+cp -al "$MONOLITH/vendor" "$TREE/vendor" 2>/dev/null || cp -a "$MONOLITH/vendor" "$TREE/vendor"
+cp -al "$MONOLITH/node_modules" "$TREE/node_modules" 2>/dev/null || true
+cp -a  "$MONOLITH/public/build" "$TREE/public/build" 2>/dev/null || true
+cp -a  "$MONOLITH/.env" "$TREE/.env" 2>/dev/null || true
+
+mkdir -p "$TREE/storage/framework/views" \
+         "$TREE/storage/framework/cache/data" \
+         "$TREE/storage/framework/sessions" \
+         "$TREE/storage/framework/testing" \
+         "$TREE/storage/logs" \
+         "$TREE/storage/app/public" \
+         "$TREE/bootstrap/cache"
+
+# The harness's own directories. `handoff init` would add these to .gitignore, but the worktree
+# shares the repository's .gitignore, which already has them — so this is only the directories.
+mkdir -p "$TREE/.handoff/plans" "$TREE/.handoff/runs"
+cp "$MONOLITH/.handoff/config.sh" "$TREE/.handoff/config.sh" 2>/dev/null || true
+
+printf '%s\n' "$TREE"

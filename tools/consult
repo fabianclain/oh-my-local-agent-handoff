@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+#
+# consult — ask an orchestrator what KIND of failure a rejected round was.
+#
+#   tools/consult <slug> --plan <plan.md> --runs-dir <dir> --provider <name> [--attempt N]
+#
+# Prints one line: `RETRY`, `STOP <reason>`, or `UNAVAILABLE <reason>`. On RETRY it has written
+# the narrowed instruction to <runs-dir>/<slug>/feedback.md, which is the channel `handoff do`
+# already reads for a repair.
+#
+# ## The one question worth asking
+#
+# When a round is rejected there are two failures wearing the same clothes, and they need
+# opposite responses:
+#
+#   the model got it wrong        -> a narrower instruction and one more attempt
+#   the criterion cannot pass     -> stop; the round was never about the model
+#
+# A nine-round session got this wrong twice out of four failures, and both times the cost was
+# worse than a wasted round. Told to satisfy an impossible criterion, the model did not fail
+# cleanly and did not report the problem — it contorted the code until the check passed, once by
+# writing `Carbon::setTestNow()` into production code to force a flag true. An automatic retry
+# loop makes that outcome MORE likely, which is why `handoff auto` is the wrong tool for a plan
+# whose criteria have not been re-read.
+#
+# So this asks the question rather than assuming the answer, and the default on doubt is to stop.
+#
+# ## What the orchestrator may not do
+#
+# It may not touch a criterion — not rewrite one, not drop one, not reinterpret one. The whole
+# value of the verdict is that the thing being measured did not choose the measurement. An
+# orchestrator that can weaken a test can make any round pass, and the schema gives it no field
+# in which to try: it can only narrow the INSTRUCTION, or declare a criterion unsatisfiable and
+# hand that back as a finding for a person.
+#
+# It is also a different model from the implementer, for the same reason the ladder refuses to
+# let one model plan and implement. That is enforced by the caller.
+
+set -uo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+HANDOFF_HOME="$(cd "$HERE/.." && pwd)"
+
+SLUG="${1:?usage: consult <slug> --plan <plan.md> --runs-dir <dir> --provider <name>}"; shift
+PLAN=""; RUNS_DIR=""; PROVIDER=""; ATTEMPT=1
+
+while (( $# > 0 )); do
+    case "$1" in
+    --plan)     PLAN="$2"; shift 2 ;;
+    --runs-dir) RUNS_DIR="$2"; shift 2 ;;
+    --provider) PROVIDER="$2"; shift 2 ;;
+    --attempt)  ATTEMPT="$2"; shift 2 ;;
+    *) echo "UNAVAILABLE unknown option: $1"; exit 2 ;;
+    esac
+done
+
+[[ -f "$PLAN" ]]        || { echo "UNAVAILABLE no plan at $PLAN"; exit 2; }
+[[ -d "$RUNS_DIR/$SLUG" ]] || { echo "UNAVAILABLE no run directory for $SLUG"; exit 2; }
+[[ -f "$HANDOFF_HOME/providers/${PROVIDER}.sh" ]] || { echo "UNAVAILABLE unknown provider: $PROVIDER"; exit 2; }
+
+RUN="$RUNS_DIR/$SLUG"
+EVIDENCE="$RUN/evidence/evidence.md"
+ANSWER="$RUN/consult-$ATTEMPT.json"
+LOG="$RUN/consult-$ATTEMPT.log"
+
+# What the model actually did, capped. The diff is the only artifact that shows whether the code
+# is wrong; the round's own report is deliberately not included, being the least reliable thing
+# in a run and an invitation to believe its earlier claims.
+DIFF="$(git diff HEAD 2>/dev/null | head -c 60000)"
+[[ -n "$DIFF" ]] || DIFF="(the round changed nothing that git can see)"
+
+read -r -d '' DEV <<'DEV' || true
+You are the orchestrator in a three-part loop: you specify and diagnose, a local model implements,
+and a harness decides. You are being consulted because the harness rejected a round.
+
+Answer only the schema. Do not implement anything, do not edit any file, and do not propose a
+change to any acceptance criterion — you have no field in which to express one, deliberately.
+DEV
+
+PROMPT="A round was rejected. Tell me which kind of failure it was.
+
+## The plan the local model was given
+
+$(cat "$PLAN")
+
+## What the gates found
+
+$(cat "$EVIDENCE" 2>/dev/null || echo '(no evidence bundle was written)')
+
+## What the local model actually changed
+
+\`\`\`diff
+${DIFF}
+\`\`\`
+
+## The question
+
+For every criterion that FAILED, ask: could an ideal implementation of this plan satisfy it?
+
+- If yes for all of them, the code is wrong: answer \`model-error\` and write a narrowed
+  instruction naming the exact file, method and behaviour to fix. Do not restate the plan.
+- If any failing criterion could NOT be satisfied by a correct implementation — it contradicts
+  another criterion, it asserts something the plan never asked for, it depends on state the
+  plan places outside its own scope, it pins a clock or a count that makes the assertion false
+  by construction — answer \`criterion-unsatisfiable\` and list those exact command lines.
+- If the evidence does not let you tell, answer \`unclear\`.
+
+Prefer \`unclear\` to a guess. A wrong \`model-error\` spends a round and, worse, invites the
+local model to contort working code until an impossible check passes — which is a failure this
+loop has already produced in production code. A wrong \`unclear\` costs only that this stops and
+a person looks."
+
+# The provider adapters are sourced, not executed, and set HANDOFF_ROLE so an adapter can tell a
+# planning turn from an implementing one. Run in a subshell: sourcing an adapter defines functions
+# that would otherwise shadow the caller's for the rest of the process.
+(
+    HANDOFF_ROLE=planner
+    export HANDOFF_ROLE
+    # shellcheck disable=SC1090
+    source "$HANDOFF_HOME/providers/${PROVIDER}.sh"
+    if declare -F provider_preflight >/dev/null && ! provider_preflight; then
+        exit 3
+    fi
+    provider_run "$(pwd)" "$HANDOFF_HOME/schemas/consult.schema.json" "$ANSWER" "$LOG" "$DEV" "$PROMPT"
+) >>"$LOG" 2>&1
+
+[[ -s "$ANSWER" ]] || { echo "UNAVAILABLE the orchestrator returned nothing (see ${LOG})"; exit 2; }
+
+python3 - "$ANSWER" "$RUN/feedback.md" <<'PY'
+import json, sys
+
+answer_path, feedback_path = sys.argv[1], sys.argv[2]
+try:
+    with open(answer_path) as fh:
+        answer = json.load(fh)
+except Exception as exc:
+    print(f"UNAVAILABLE the orchestrator's answer did not parse ({exc})")
+    raise SystemExit(2)
+
+# A provider may wrap the object. Unwrap one level rather than failing on a shape difference
+# between adapters, but never guess deeper than that.
+if "diagnosis" not in answer:
+    for key in ("result", "output", "final", "response"):
+        if isinstance(answer.get(key), dict) and "diagnosis" in answer[key]:
+            answer = answer[key]
+            break
+
+diagnosis = answer.get("diagnosis")
+reason = (answer.get("reason") or "").strip().replace("\n", " ")
+
+if diagnosis == "model-error":
+    instruction = (answer.get("narrowed_instruction") or "").strip()
+    if not instruction:
+        # model-error with nothing to act on is not actionable, and re-running the identical plan
+        # asks a question the harness has already answered three times internally.
+        print(f"STOP the orchestrator called it a model error but gave no narrowed instruction: {reason}")
+        raise SystemExit(0)
+    with open(feedback_path, "w") as fh:
+        fh.write("## The previous attempt was rejected\n\n")
+        fh.write("An orchestrator read the plan, the gates' evidence and your diff, and concluded\n")
+        fh.write("the implementation is wrong rather than the specification. Every acceptance\n")
+        fh.write("criterion is unchanged and still applies.\n\n")
+        fh.write(f"{reason}\n\n")
+        fh.write("## What to change\n\n")
+        fh.write(instruction + "\n")
+    print("RETRY")
+elif diagnosis == "criterion-unsatisfiable":
+    bad = answer.get("unsatisfiable_commands") or []
+    named = ("; ".join(bad))[:400] if bad else "(none named)"
+    print(f"STOP a criterion cannot be satisfied by any correct implementation: {reason} | commands: {named}")
+elif diagnosis == "unclear":
+    print(f"STOP the orchestrator could not tell: {reason}")
+else:
+    print(f"STOP unrecognised diagnosis {diagnosis!r}")
+PY

@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+#
+# graphs-pass — one unattended replay of the crawler-graphs feature, start to finish.
+#
+#   bench/graphs-pass <name> pure          no orchestrator; stops at the first rejection
+#   bench/graphs-pass <name> consult       asks Claude what kind of failure a rejection was
+#
+# Eight steps, in the order the original session ran them, from the tree as it stood before any
+# of the work existed. Plans are all present from the start; each step's reviewer test is staged
+# immediately before that step runs — see bench/stage-graph-test for why those differ.
+#
+# ## What the two modes are for
+#
+# They are the same run with one variable changed, which is the only way to find out whether the
+# orchestrator earns its place:
+#
+#   pure      the harness advances on an accepted step and stops on a rejected one. This is the
+#             completion rate with nobody in the loop at all.
+#   consult   on a rejection a DIFFERENT model reads the plan, the gates' evidence and the diff,
+#             and answers one question: could an ideal implementation satisfy every failing
+#             criterion? Model error earns one narrower retry. An unsatisfiable criterion, or any
+#             uncertainty, still stops — because the failure this protects against is a criterion
+#             the model cannot honestly pass, and against one of those a retry is worse than a
+#             stop. It has already produced `Carbon::setTestNow()` in production code.
+#
+# The comparison is the point. If consult does not move the completion rate, it is latency and
+# cost with a story attached, and that is worth knowing before it becomes the default.
+
+set -uo pipefail
+
+NAME="${1:?usage: graphs-pass <name> <pure|consult>}"
+MODE="${2:?mode required: pure or consult}"
+
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+HANDOFF_HOME="$(cd "$HERE/.." && pwd)"
+BASE="${GRAPHS_BASE:-bench-graphs-base}"
+RESULTS="${GRAPHS_RESULTS:-/home/fabbs/dev/bench-trees/results}"
+
+STEPS=(
+    crawler-graphs-1-schema
+    crawler-graphs-2-collect
+    crawler-graphs-3-series
+    crawler-graphs-3b-shape
+    crawler-graphs-4a-command
+    crawler-graphs-4b-wiring
+    crawler-graphs-5a-chart
+    crawler-graphs-5b-page
+)
+
+mkdir -p "$RESULTS"
+TREE="$("$HERE/monolith-worktree" "$NAME" "$BASE")" || { echo "could not build a worktree for $NAME" >&2; exit 1; }
+
+ARGS=(--before-step "$HERE/stage-graph-test")
+[[ "$MODE" != consult ]] || ARGS+=(--consult claude)
+
+cd "$TREE" || exit 1
+
+# The implementer is the local model in both modes. `--consult claude` names the ORCHESTRATOR,
+# which must be a different model — a model that writes the plan, judges whether its own criteria
+# were satisfiable, and then implements against them has removed every independent check at once.
+export HANDOFF_PROVIDER=native
+
+LOG="$RESULTS/$NAME.log"
+{
+    echo "== $NAME ($MODE) started $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "   tree $TREE at $(git rev-parse --short HEAD)"
+} | tee "$LOG"
+
+"$HANDOFF_HOME/bin/handoff" sequence "${ARGS[@]}" "${STEPS[@]}" 2>&1 | tee -a "$LOG"
+STATUS=${PIPESTATUS[0]}
+
+# One line per pass, appended, so a kill at 04:00 still leaves a readable record. How far it got
+# is the measurement — `handoff sequence` commits exactly the accepted steps and nothing else, so
+# counting them off the base is counting what landed unattended.
+# Not every commit on the branch is a landed step: bench/stage-graph-test commits each reviewer
+# test before the step it judges, under a distinct author so the two can be told apart. Counting
+# all of them would report a pass that landed nothing as having landed eight.
+LANDED="$(git log --format='%ae' "$BASE"..HEAD 2>/dev/null | grep -cv '^reviewer@bench$' || echo 0)"
+printf '%s\t%s\t%s\tlanded %s of %s\texit %s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$NAME" "$MODE" "$LANDED" "${#STEPS[@]}" "$STATUS" \
+    >>"$RESULTS/summary.tsv"
+
+# Keep the commits reachable after the worktree is reset for the next pass.
+git tag -f "pass/$NAME" >/dev/null 2>&1 || true
+
+echo "== $NAME landed $LANDED of ${#STEPS[@]} steps (exit $STATUS)" | tee -a "$LOG"
+exit "$STATUS"

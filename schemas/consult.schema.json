@@ -1,0 +1,30 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "consult",
+  "description": "A diagnosis of one rejected round. The orchestrator answers exactly this and nothing else.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["diagnosis", "reason"],
+  "properties": {
+    "diagnosis": {
+      "type": "string",
+      "enum": ["model-error", "criterion-unsatisfiable", "unclear"],
+      "description": "model-error: an ideal implementation COULD satisfy every failing criterion, and the code is wrong. criterion-unsatisfiable: at least one failing criterion cannot be satisfied by any correct implementation, so the round was never about the model. unclear: you cannot tell from the evidence. Choose unclear rather than guessing; it costs one round and a wrong model-error costs the tree."
+    },
+    "reason": {
+      "type": "string",
+      "maxLength": 1200,
+      "description": "Why, in a few sentences, citing the specific failing command and what its output shows. A reason that does not name a command is not a diagnosis."
+    },
+    "narrowed_instruction": {
+      "type": ["string", "null"],
+      "maxLength": 2000,
+      "description": "Only when diagnosis is model-error. A narrower instruction for the SAME plan and the SAME criteria: name the exact file, method and behaviour to fix. You may not restate, weaken, reinterpret or add a criterion. Null otherwise."
+    },
+    "unsatisfiable_commands": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Only when diagnosis is criterion-unsatisfiable. The exact command lines that cannot be satisfied, copied verbatim from the plan."
+    }
+  }
+}
