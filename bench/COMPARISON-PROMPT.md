@@ -20,10 +20,23 @@ If `IMPLEMENTER` is not exactly `local` or `claude`, stop and say so rather than
 
 Derived from it, so you do not have to decide anything:
 
-    NAME    = cmp-local      when IMPLEMENTER = local
-    NAME    = cmp-claude     when IMPLEMENTER = claude
-    FEATURE = a dead-hosts page for the crawler   (same in both runs)
-    BASE    = master                              (same in both runs)
+    FEATURE = a dead-hosts page for the crawler   (same in every run)
+    BASE    = 015d078                             (same in every run — pinned, see below)
+    NAME    = cmp-<IMPLEMENTER>-<N>
+
+`<N>` is the first integer that does not already have a worktree. Check before you start:
+
+    ls -d /home/fabbs/dev/bench-trees/cmp-<IMPLEMENTER>-* 2>/dev/null
+
+If `cmp-local-1` exists, you are `cmp-local-2`. **Never reuse an existing worktree** — earlier runs
+of this same experiment left finished trees with the feature already implemented and the plans
+already written, and starting in one would measure nothing at all. If in doubt, pick a higher
+number.
+
+`BASE` is pinned to a commit rather than `master` so every run of this experiment builds from the
+identical tree. `master` moves, and a run whose base differs from the runs it is being compared
+against is not comparable to them. Confirm it with `git log --oneline -1` after creating the
+worktree and put the SHA in your report — if it is not `015d078`, stop and say so.
 
 Say which role you are running, and the NAME you derived, in your first message — so a glance at the
 transcript shows the two instances are not both doing the same thing.
@@ -137,7 +150,31 @@ not need to pass `check-plan`. Do not artificially inflate or deflate it; write 
 write if nobody were measuring. Save it to `$TREE/.claude/plans/` anyway so both plans can be
 compared afterwards.
 
-Stop the `T_plan` clock when the plan is written (and, for run B, passing `check-plan`).
+**`IMPLEMENTER = local`: dry-run every criterion before you start the sequence.** Not some of them.
+
+    cd "$TREE"
+    /home/fabbs/dev/monolith/local-implementer/bin/handoff prepare <slug>   # for EVERY step
+
+This is the check that separates "the model got it wrong" from "this criterion could never pass",
+and those two are indistinguishable from a verdict alone. A criterion that fails here because the
+feature does not exist yet is expected and fine — that is the point of the step. What you are
+hunting is a criterion that fails for a reason the step will never change: a lint or a test run
+scoped wider than the plan's own files, so it trips on debt that predates the branch.
+
+That is not hypothetical. A previous run of this exact experiment wrote
+
+    vendor/bin/pint --test --format txt app routes resources
+
+as a criterion for a one-line route change. It fails on pre-existing violations in `app/Domains/
+Drive` and `app/Domains/Seap` — unsatisfiable over any tree, including a perfect one. It rejected a
+correct attempt, triggered a re-roll that came back **worse**, and cost about twelve minutes.
+`prepare` on that one step would have taken two. Scope every lint and test criterion to the files
+the step actually touches.
+
+Count `prepare` inside `T_plan`, not `T_impl` — it is part of getting the plan right.
+
+Stop the `T_plan` clock when the plan is written, `check-plan` passes, and `prepare` has been run
+on every step.
 
 ## 5. Implement, and time it
 
