@@ -251,8 +251,37 @@ handoff sequence <slug>-1-service <slug>-2-view <slug>-3-page
 ```
 
 **Run the sequence rather than the steps.** `handoff sequence` checks every plan first, runs them
-in order, commits each accepted step, and stops at the first rejection with the tree exactly as
-the gates left it. It never retries and never re-specifies — a rejection comes back to you.
+in order, commits each accepted step, and stops at the first rejection with the tree as the gates
+left it. It never re-specifies — deciding a criterion is wrong comes back to you.
+
+**Add `--reroll 2` unless you have a reason not to.**
+
+```bash
+handoff sequence --reroll 2 <slug>-1-service <slug>-2-view <slug>-3-page
+```
+
+A rejected step is asked again from a restored tree, with no feedback — an independent sample of
+the same plan, not a nudge toward the criterion it just missed. The case is arithmetic: the
+benchmark step measured at 6 accepted rolls out of 10 lands 60% of the time if the sequence stops
+on rejection, and lands every time if it is re-rolled, for an expected 1.67 rounds of GPU. Steps
+here are usually satisfiable and occasionally unlucky, and re-rolling is the cheap answer to
+unlucky.
+
+Two things about it are worth knowing before you rely on it:
+
+- **A re-roll is not a repair.** A repair hands the model its failing commands and the tree it
+  already wrote; against an impossible criterion that is what produced `Carbon::setTestNow()` in
+  production code. A re-roll shows it neither, so it cannot harden a bad assertion. Repairs are
+  still one-per-step and still gated behind `--consult`.
+- **Rolls are not free against an unsatisfiable criterion** — every one fails identically and the
+  step stops anyway, several rounds later. With `--consult` set, a consult answer that cannot
+  confirm the failure was the model's *cancels* the remaining rolls, which is the composition worth
+  paying for: not "retry with a hint" but "is this reachable at all, before we ask again".
+
+When a step is rejected on every roll, read that as evidence about the **plan**. An unlucky roll
+does not repeat three times, and the stop says how many times it asked. Nothing is thrown away —
+each discarded attempt is committed to `refs/handoff/discarded/<slug>/<roll>`, readable with
+`git show`.
 
 **Why the commit matters, and why a tool now does it.** The implementer leaves changes uncommitted,
 and the scope gate compares the tree against the plan's file list, so step 1's files still sitting

@@ -16,6 +16,13 @@
 #   4. a destructive plan    refused in pre-flight, before any step runs — the whole point of
 #                            checking every plan up front rather than one at a time
 #   5. no verdict            a round that never reached the gates must not be committed
+#   6. re-rolls exhausted    every roll rejected: it stops, says how many times it asked, and each
+#                            discarded attempt is recoverable from its own ref
+#   7. re-roll succeeds      a step rejected twice and accepted on the third commits, and the
+#                            history records WHICH roll landed it
+#   8. the tree is restored  the property everything else rests on — a re-roll that inherits the
+#                            previous roll's files is not an independent sample, and its scope gate
+#                            would charge them to it
 #
 # Runs against the stub provider, so nothing here touches the GPU or a real model.
 
@@ -64,13 +71,24 @@ PLAN
 # decides from the tree — which is enough, and keeps the two steps genuinely distinct files.
 PATCH_AB='if [ ! -f src/A.php ]; then printf "<?php\nconst A = 1;\n" > src/A.php; else printf "<?php\nconst B = 1;\n" > src/B.php; fi'
 
-run_sequence() {   # run_sequence <root> <slug>... ; echoes output, returns its status
+run_sequence() {   # run_sequence <root> [<flag>...] <slug>... ; echoes output, returns its status
+    # STUB_PATCH is honoured if the caller already set one, so a case can give the stub a different
+    # behaviour — notably one that changes between rolls — without a second runner.
     ( cd "$1" && shift
-      HANDOFF_PROVIDER=stub STUB_PATCH="$PATCH_AB" "$HANDOFF" sequence "$@" 2>&1 )
+      HANDOFF_PROVIDER=stub STUB_PATCH="${STUB_PATCH:-$PATCH_AB}" "$HANDOFF" sequence "$@" 2>&1 )
+}
+
+# How many attempts a step has had, kept OUTSIDE the project tree on purpose: a counter file inside
+# it would be work the scope gate attributes to the model, and restore_tree would then delete the
+# very thing recording that a roll happened.
+roll_counter() { echo "$SANDBOX/rolls-$1"; }
+
+discarded_refs() {   # discarded_refs <root> <slug>
+    ( cd "$1" && git for-each-ref --format='%(refname)' "refs/handoff/discarded/$2" )
 }
 
 # ---------------------------------------------------------------------------------------------
-echo "==> 1/5 two accepted steps commit in order and leave a clean tree"
+echo "==> 1/8 two accepted steps commit in order and leave a clean tree"
 R="$(new_project accepted)"
 write_plan "$R" s1 "add A" src/A.php 'test -f src/A.php'
 write_plan "$R" s2 "add B" src/B.php 'test -f src/B.php'
@@ -95,7 +113,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------------------------
-echo "==> 2/5 a rejected step stops the sequence and keeps its work in the tree"
+echo "==> 2/8 a rejected step stops the sequence and keeps its work in the tree"
 R="$(new_project rejected)"
 write_plan "$R" s1 "add A" src/A.php 'test -f src/A.php'
 # Satisfiable by nothing the stub writes: the file appears, the assertion about it does not hold.
@@ -115,7 +133,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------------------------
-echo "==> 3/5 a dirty tree is refused before anything runs"
+echo "==> 3/8 a dirty tree is refused before anything runs"
 R="$(new_project dirty)"
 write_plan "$R" s1 "add A" src/A.php 'test -f src/A.php'
 printf '<?php\n// someone else\n' > "$R/src/other.php"
@@ -131,7 +149,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------------------------
-echo "==> 4/5 a destructive criterion in ANY step is refused in pre-flight"
+echo "==> 4/8 a destructive criterion in ANY step is refused in pre-flight"
 R="$(new_project destructive)"
 write_plan "$R" s1 "add A" src/A.php 'test -f src/A.php'
 write_plan "$R" s2 "add B" src/B.php 'php artisan migrate:fresh'
@@ -147,7 +165,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------------------------
-echo "==> 5/5 a round that produces no verdict is not committed"
+echo "==> 5/8 a round that produces no verdict is not committed"
 R="$(new_project noverdict)"
 write_plan "$R" s1 "add A" src/A.php 'test -f src/A.php'
 # An unknown provider fails before the gates ever run, so there is no verdict to read. Committing
@@ -159,6 +177,78 @@ elif [[ -n "$( cd "$R" && git log --format=%s | grep 'add A' )" ]]; then
     fail "committed a step that produced no verdict"
 else
     pass "no verdict, no commit"
+fi
+
+# ---------------------------------------------------------------------------------------------
+echo "==> 6/8 every roll rejected: it stops, counts, and keeps each attempt"
+R="$(new_project rerollfail)"
+write_plan "$R" s1 "add B" src/B.php 'grep -q NEVER src/B.php'
+OUT="$(STUB_PATCH='printf "<?php\nconst B = 1;\n" > src/B.php' run_sequence "$R" --reroll 2 s1)"; RC=$?
+mapfile -t REFS < <(discarded_refs "$R" s1)
+if (( RC == 0 )); then
+    fail "a step rejected on every roll exited 0"
+elif (( ${#REFS[@]} != 2 )); then
+    # Three attempts, two of them discarded: the last roll's work stays in the tree, exactly as it
+    # does without --reroll, so the promise "the work is there to read" still holds.
+    fail "expected 2 discarded refs after 3 rolls, found ${#REFS[@]}: ${REFS[*]:-none}"
+elif ! grep -q 'rolled 3 times' <<<"$OUT"; then
+    fail "it did not say how many times it asked — the count is what separates unlucky from unreachable"
+    echo "$OUT" | tail -14 | sed 's/^/        /'
+elif [[ ! -f "$R/src/B.php" ]]; then
+    fail "the last attempt's work was destroyed; it is the copy a reviewer reads"
+elif ! ( cd "$R" && git show "${REFS[0]}:src/B.php" 2>/dev/null | grep -q 'const B' ); then
+    fail "a discarded attempt is not recoverable from its ref, so it WAS thrown away"
+elif [[ -n "$( cd "$R" && git log --format=%s | grep 'add B' )" ]]; then
+    fail "committed a step that no roll accepted"
+else
+    pass "3 rolls, stopped, counted, and both discarded attempts recoverable"
+fi
+
+# ---------------------------------------------------------------------------------------------
+echo "==> 7/8 a step accepted on a later roll commits, and the history says which roll"
+R="$(new_project rerollpass)"
+C="$(roll_counter pass)"
+write_plan "$R" s1 "add B" src/B.php 'grep -q RIGHT src/B.php'
+# Wrong twice, right on the third — so the accept path is reached through a re-roll rather than
+# by a first-attempt success that would prove nothing about this feature.
+LATE_PASS='n=$(( $(cat '"$C"' 2>/dev/null || echo 0) + 1 )); echo $n >'"$C"'
+if [ "$n" -ge 3 ]; then printf "<?php\nconst RIGHT = 1;\n" > src/B.php
+else printf "<?php\nconst WRONG = 1;\n" > src/B.php; fi'
+OUT="$(STUB_PATCH="$LATE_PASS" run_sequence "$R" --reroll 2 s1)"; RC=$?
+BODY="$( cd "$R" && git log --format=%b -1 )"
+if (( RC != 0 )); then
+    fail "a step that its third roll satisfied exited $RC"
+    echo "$OUT" | tail -14 | sed 's/^/        /'
+elif [[ -z "$( cd "$R" && git log --format=%s | grep 'add B' )" ]]; then
+    fail "the accepted roll was not committed"
+elif ! grep -q 'Accepted on roll 3' <<<"$BODY"; then
+    fail "the commit does not record which roll landed it; a marginal step reads as a clean one"
+    printf '%s\n' "$BODY" | sed 's/^/        /'
+elif ! ( cd "$R" && git show --format= --stat HEAD | grep -q 'src/B.php' ); then
+    fail "the commit does not contain the file the accepted roll wrote"
+elif [[ -n "$( cd "$R" && git status --porcelain -- . ':(exclude).handoff/**' )" ]]; then
+    fail "the model's work was left uncommitted after an accepted re-roll"
+else
+    pass "accepted on roll 3, committed, and the history says so"
+fi
+
+# ---------------------------------------------------------------------------------------------
+echo "==> 8/8 each roll starts from a restored tree, not the previous roll's leftovers"
+R="$(new_project rerollclean)"
+write_plan "$R" s1 "add B" src/B.php 'grep -q NEVER src/B.php'
+# APPENDS one line per roll. This is the whole test: if the tree is restored between rolls the file
+# holds exactly one line at the end, and if it is not it holds three — and a model handed a
+# half-written file is being asked a different question than the plan asks.
+OUT="$(STUB_PATCH='printf "line\n" >> src/B.php' run_sequence "$R" --reroll 2 s1)"; RC=$?
+LINES="$(wc -l < "$R/src/B.php" 2>/dev/null || echo missing)"
+if (( RC == 0 )); then
+    fail "the never-satisfiable criterion was accepted"
+elif [[ "$LINES" != 1 ]]; then
+    fail "expected 1 line after 3 restored rolls, found $LINES — the tree is NOT being restored"
+elif ! ( cd "$R" && [[ "$(git show 'refs/handoff/discarded/s1/1:src/B.php' | wc -l)" == 1 ]] ); then
+    fail "the first discarded attempt does not hold its own single line"
+else
+    pass "3 rolls, 1 line — every roll saw a clean tree"
 fi
 
 echo

@@ -6,6 +6,7 @@
 #   handoff sequence chart-1-schema chart-2-collect chart-3-series
 #   handoff sequence --dry-run <slug>...        say what it would do, run nothing
 #   handoff sequence --check <slug>...          pre-flight every plan and stop
+#   handoff sequence --reroll 2 <slug>...       ask a rejected step again, from a clean tree
 #
 # ## What this removes, and what it deliberately does not
 #
@@ -25,18 +26,50 @@
 # does not apply to it: that rule exists because the queue could not commit, not because sequences
 # are unsafe.
 #
-# ## What is NOT automated, on purpose
+# ## Retrying: which kind, and why only one of them
 #
-# Retrying. The same field report is unambiguous about why: of four failed rounds, two failed on
-# criteria that no honest implementation could satisfy — a test pinned to the wrong clock, and a
-# single-query assertion that contradicted another criterion in the same plan. The model's response
-# to an impossible criterion was never to fail cleanly. It wrote `Carbon::setTestNow()` into
-# production code to force a flag true. A retry loop cannot detect that, and a planner asked to
-# re-specify is likely to harden the bad assertion rather than doubt it.
+# This tool refused to retry at all for a reason that is still true. Of four failed rounds in the
+# field report, two failed on criteria that no honest implementation could satisfy — a test pinned
+# to the wrong clock, and a single-query assertion contradicting another criterion in the same plan.
+# The model's response to an impossible criterion was never to fail cleanly. It wrote
+# `Carbon::setTestNow()` into production code to force a flag true.
 #
-# So automating the advance helps and automating the retry hurts, and this does only the first.
-# On a rejection it stops, leaves the tree exactly as the gates found it, and hands back what to
-# read. The diagnosis is the reviewer's, which is the one part of the loop a human was ever doing.
+# But that is an argument against ONE kind of retry, and the two are not alike:
+#
+#   a REPAIR   hands the model its failing commands and the tree it already wrote, and asks it to
+#              close the gap. Against an impossible criterion this is what produces test-only APIs
+#              in production code — the model is being pushed at a target that cannot be reached,
+#              and it will reach for anything. Still gated behind `--consult`, still one attempt.
+#
+#   a RE-ROLL  discards the failed attempt, restores the tree, and asks the SAME question again
+#              with no feedback at all. It is an independent sample, not a nudge. It cannot harden
+#              a bad assertion because it never sees which assertion failed.
+#
+# The case for re-rolling is arithmetic, and it is measured rather than assumed. `2-collect` is
+# accepted on 6 of 10 independent attempts, so p=0.60 — and a step at p=0.60 that stops on rejection
+# lands 60% of the time, while the same step re-rolled until accepted lands every time for an
+# expected 1.67 rounds of GPU. bench/slot-throughput works the comparison out against best-of-2,
+# which loses on one card because it always pays for both rolls where a re-roll is paid for only
+# when the previous one actually failed.
+#
+# What re-rolling costs is GPU against an unsatisfiable criterion: every roll fails the same way and
+# the step stops anyway, several rounds later. That is why `--consult` CANCELS the remaining re-rolls
+# when it cannot confirm the failure was the model's — the one judgement worth paying for here is
+# "is this reachable at all", and re-rolling is only ever the answer to "was that roll unlucky".
+#
+# Default 0. A sequence with no `--reroll` behaves exactly as it did before this existed.
+#
+# ## What is still NOT automated
+#
+# Deciding a criterion is wrong. On a final rejection this stops, leaves the tree exactly as the
+# gates found it, and hands back what to read. The diagnosis is the reviewer's, which is the one
+# part of the loop a human was ever doing.
+#
+# Nothing is thrown away to make room for a re-roll. Each discarded attempt is committed to
+# `refs/handoff/discarded/<slug>/<roll>` before the tree is restored, because the harness records
+# `tree-after` as an UNREFERENCED git tree — durable enough to re-read the same night, and reapable
+# by the next `git gc`. The evidence bundle survives on its own: tools/journal already archives
+# every round's evidence, plan and event stream before the run directory is reused.
 
 set -uo pipefail
 
@@ -49,6 +82,7 @@ DRY_RUN=0
 CHECK_ONLY=0
 CONSULT=""
 BEFORE_STEP=""
+REROLL=0
 SLUGS=()
 
 while (( $# > 0 )); do
@@ -57,11 +91,20 @@ while (( $# > 0 )); do
     --check)   CHECK_ONLY=1; shift ;;
     --consult) CONSULT="${2:?--consult needs a provider}"; shift 2 ;;
     --before-step) BEFORE_STEP="${2:?--before-step needs a command}"; shift 2 ;;
-    -h|--help) sed -n '2,38p' "$(readlink -f "${BASH_SOURCE[0]}")" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --reroll)  REROLL="${2:?--reroll needs a count}"; shift 2 ;;
+    # Bounded by the header comment rather than a line number: the range was `2,38p` and the header
+    # has since grown, which would have silently truncated the help at the first edit past line 38.
+    -h|--help) awk 'NR>1 && /^set -uo pipefail/{exit} NR>1' "$(readlink -f "${BASH_SOURCE[0]}")" \
+                   | sed 's/^# \{0,1\}//'; exit 0 ;;
     -*)        echo "unknown option: $1" >&2; exit 64 ;;
     *)         SLUGS+=("$1"); shift ;;
     esac
 done
+
+# Rejected here rather than degraded to 0. `--reroll two` silently meaning "do not re-roll" is the
+# shape of the bug that had this project serving 32768 tokens while every document said 98304: an
+# unusable value quietly becoming a plausible one, with nothing in the output to say so.
+[[ "$REROLL" =~ ^[0-9]+$ ]] || { echo "--reroll needs a non-negative integer, got: $REROLL" >&2; exit 64; }
 
 (( ${#SLUGS[@]} > 0 )) || { echo "usage: handoff sequence <slug> [<slug>...]" >&2; exit 64; }
 
@@ -149,6 +192,65 @@ commit_subject() {
     printf '%s' "$subject"
 }
 
+# --- keeping a discarded roll, and then discarding it ------------------------------------------
+#
+# A re-roll has to start from a clean tree — the scope gate charges whatever is sitting there to the
+# running round, so the previous roll's files would fail the next one for work it did not do, and
+# the model would be handed a broken half-implementation to "finish" rather than the question the
+# plan asks.
+#
+# So the failed attempt has to go. `preserve_roll` is what makes that a move rather than a loss: it
+# turns the tree the gates judged into a real commit under refs/handoff/discarded, which is
+# invisible to `git log` and survives `git gc`. The harness's own `tree-after` is an unreferenced
+# tree object — good enough to re-read the same night, which is all bench/gate-sweep ever needed,
+# and reapable whenever gc next runs.
+preserve_roll() {
+    local slug="$1" roll="$2" passed="$3" total="$4"
+    local tree ref commit
+    tree="$(cat "$RUNS_DIR/$slug/tree-after" 2>/dev/null)"
+    [[ -n "$tree" ]] || return 1
+    ref="refs/handoff/discarded/$slug/$roll"
+    commit="$(git commit-tree "$tree" -p HEAD -m "discarded roll $roll of $slug
+
+Rejected by the gates at $passed of $total acceptance criteria, then discarded so the next
+roll could start from the clean tree its scope gate needs. Nothing was lost — this commit is
+the exact tree the gates judged.
+
+  git show $ref
+  git diff HEAD $ref
+")" || return 1
+    git update-ref "$ref" "$commit" || return 1
+    printf '%s' "$ref"
+}
+
+# Restore exactly the files the gates attributed to the round, and nothing else.
+#
+# Not `git reset --hard` and not `git clean -fd`. Both would take the harness's own bookkeeping with
+# them — the run evidence this function is reading its file list OUT of, among other things — and
+# `reset --hard` would be reaching for HEAD when the thing that needs undoing is the working tree.
+# The gates already did the work of separating the model's changes from the harness's footprint, and
+# re-deriving it here is how the two drift apart.
+restore_tree() {
+    local slug="$1"
+    local changed="$RUNS_DIR/$slug/evidence/changed-files.txt"
+    [[ -s "$changed" ]] || return 0
+    local -a files
+    mapfile -t files <"$changed"
+    local file
+    for file in "${files[@]}"; do
+        [[ -n "$file" ]] || continue
+        # Tracked covers modified AND deleted: a file the model removed is still in the index, so it
+        # takes the checkout path and comes back. Untracked means the model created it, and the only
+        # way to un-create a file is to remove it.
+        if git ls-files --error-unmatch -- "$file" >/dev/null 2>&1; then
+            git checkout HEAD -- "$file" || return 1
+        else
+            rm -f -- "$file" || return 1
+        fi
+    done
+    return 0
+}
+
 verdict_of() {
     python3 -c "
 import json,sys
@@ -169,6 +271,7 @@ for slug in "${SLUGS[@]}"; do
     if (( DRY_RUN )); then
         say "would run: handoff do $slug"
         [[ -z "$BEFORE_STEP" ]] || say "would stage first: $BEFORE_STEP $slug"
+        (( REROLL == 0 )) || say "would re-roll up to $REROLL time(s) if rejected"
         say "would commit as: $(commit_subject "$plan")"
         continue
     fi
@@ -189,50 +292,97 @@ for slug in "${SLUGS[@]}"; do
         fi
     fi
 
-    "$HANDOFF_BIN" do "$slug"
-    DO_STATUS=$?
-
     EVIDENCE="$RUNS_DIR/$slug/evidence/evidence.json"
-    read -r VERDICT PASSED TOTAL REGRESSED <<<"$(verdict_of "$EVIDENCE")"
+    DISCARDED=()
+    REROLL_CANCELLED=0
+    ROLL=0
 
-    # --- the one place a person was doing something other than pressing continue ----------------
-    #
-    # A rejection is two failures wearing the same clothes: the model got it wrong, or the
-    # criterion cannot be satisfied by anything. They need opposite responses, and telling them
-    # apart is the judgement this loop cannot make for itself. `--consult` asks an orchestrator —
-    # a DIFFERENT model from the implementer — and acts only on a confident answer.
-    #
-    # Exactly one retry. Two rounds failing the same way is evidence about the task, not about
-    # the attempt, and a second repair against an impossible criterion is how a local model ends
-    # up writing test-only APIs into production code to force an assertion true.
-    if [[ -n "$CONSULT" && "$VERDICT" != "ACCEPT" && "$VERDICT" != "NONE" ]]; then
-        say "rejected — asking $CONSULT which kind of failure this is"
-        ANSWER="$("$HERE/consult" "$slug" --plan "$plan" --runs-dir "$RUNS_DIR" --provider "$CONSULT")"
-        say "$CONSULT: ${ANSWER:0:200}"
+    while :; do
+        ROLL=$((ROLL + 1))
+        (( ROLL == 1 )) || say "re-roll $((ROLL - 1)) of $REROLL — same plan, clean tree, no feedback"
 
-        if [[ "$ANSWER" == RETRY* ]]; then
-            say "retrying $slug once with a narrower instruction"
-            HANDOFF_FEEDBACK_FILE="$RUNS_DIR/$slug/feedback.md" "$HANDOFF_BIN" do "$slug"
-            DO_STATUS=$?
-            read -r VERDICT PASSED TOTAL REGRESSED <<<"$(verdict_of "$EVIDENCE")"
-            say "after repair: $VERDICT — $PASSED of $TOTAL"
-        else
-            # STOP and UNAVAILABLE both land here. The distinction is in the message, which the
-            # rejection block below prints; neither is a reason to run the step again.
-            CONSULT_FINDING="$ANSWER"
-        fi
-    fi
+        "$HANDOFF_BIN" do "$slug"
+        DO_STATUS=$?
+        read -r VERDICT PASSED TOTAL REGRESSED <<<"$(verdict_of "$EVIDENCE")"
 
-    # A missing verdict is not a rejection — it means the round did not reach the gates at all
-    # (the provider died, the lock was held, the model produced nothing). Committing on a verdict
-    # nobody wrote would be the one unrecoverable mistake this tool could make.
-    if [[ "$VERDICT" == "NONE" ]]; then
-        die "step $STEP produced no verdict (handoff do exited $DO_STATUS).
+        # A missing verdict is not a rejection — it means the round did not reach the gates at all
+        # (the provider died, the lock was held, the model produced nothing). Committing on a verdict
+        # nobody wrote would be the one unrecoverable mistake this tool could make, and re-rolling
+        # would be answering an infrastructure failure by spending more GPU on it.
+        if [[ "$VERDICT" == "NONE" ]]; then
+            die "step $STEP produced no verdict (handoff do exited $DO_STATUS).
    Nothing was committed and the tree is untouched.
    Look at: ${RUNS_DIR#"$REPO_ROOT"/}/$slug/stdout.log"
-    fi
+        fi
 
-    say "verdict: $VERDICT — $PASSED of $TOTAL acceptance criteria"
+        say "verdict: $VERDICT — $PASSED of $TOTAL acceptance criteria"
+        [[ "$VERDICT" != "ACCEPT" ]] || break
+
+        # --- the one place a person was doing something other than pressing continue ------------
+        #
+        # A rejection is two failures wearing the same clothes: the model got it wrong, or the
+        # criterion cannot be satisfied by anything. They need opposite responses, and telling them
+        # apart is the judgement this loop cannot make for itself. `--consult` asks an orchestrator —
+        # a DIFFERENT model from the implementer — and acts only on a confident answer.
+        #
+        # First rejection only, and it decides whether re-rolling is worth anything. If the failure
+        # cannot be confirmed as the model's, every re-roll will fail the same way for the same
+        # reason and the step stops several rounds later having learned nothing — so a non-RETRY
+        # answer cancels them. This is the composition that earns consult its cost: not "retry with
+        # a hint", but "is this reachable at all, before we pay to ask again".
+        if [[ -n "$CONSULT" && $ROLL -eq 1 ]]; then
+            say "rejected — asking $CONSULT which kind of failure this is"
+            ANSWER="$("$HERE/consult" "$slug" --plan "$plan" --runs-dir "$RUNS_DIR" --provider "$CONSULT")"
+            say "$CONSULT: ${ANSWER:0:200}"
+
+            if [[ "$ANSWER" == RETRY* ]]; then
+                # A REPAIR, not a re-roll: the tree is deliberately left in place, because the model
+                # is being asked to close a named gap in work it can still see. Exactly one.
+                say "repairing $slug once with a narrower instruction"
+                HANDOFF_FEEDBACK_FILE="$RUNS_DIR/$slug/feedback.md" "$HANDOFF_BIN" do "$slug"
+                DO_STATUS=$?
+                read -r VERDICT PASSED TOTAL REGRESSED <<<"$(verdict_of "$EVIDENCE")"
+                say "after repair: $VERDICT — $PASSED of $TOTAL"
+                [[ "$VERDICT" != "ACCEPT" ]] || break
+            else
+                # STOP and UNAVAILABLE both land here. The distinction is in the message, which the
+                # rejection block below prints; neither is a reason to run the step again, and
+                # neither is a reason to re-roll it.
+                CONSULT_FINDING="$ANSWER"
+                REROLL_CANCELLED=1
+            fi
+        fi
+
+        if (( REROLL_CANCELLED )); then
+            say "not re-rolling: $CONSULT could not confirm this was the model's error"
+            break
+        fi
+        (( ROLL < 1 + REROLL )) || break
+
+        # Keep the attempt, then undo it. In that order — if preserving fails, nothing is discarded.
+        REF="$(preserve_roll "$slug" "$ROLL" "$PASSED" "$TOTAL")" || die \
+            "step $STEP was rejected and its tree could not be preserved, so it has NOT been
+   discarded and no re-roll was attempted. The work is still in the tree:
+     handoff diff $slug"
+        DISCARDED+=("$REF")
+        say "kept the rejected attempt at $REF"
+
+        if ! restore_tree "$slug"; then
+            die "step $STEP was rejected and the tree could not be restored for a re-roll.
+   The attempt is safe at $REF, but this tree is now part-way between two states.
+   Restore it by hand before continuing:  git status"
+        fi
+
+        # The re-roll's scope gate inherits whatever is left here, exactly as a next step's would.
+        # A leftover means the model wrote outside the files the gates attributed to it, which
+        # restore_tree deliberately does not touch — it undoes the round, not the tree.
+        if [[ -n "$(dirty)" ]]; then
+            echo
+            dirty | sed 's/^/   /'
+            die "step $STEP left changes outside the files the gates attributed to it, so the tree
+   is not clean enough to re-roll into. The attempt is safe at $REF."
+        fi
+    done
 
     if [[ "$VERDICT" != "ACCEPT" ]]; then
         cat <<EOF
@@ -240,7 +390,7 @@ for slug in "${SLUGS[@]}"; do
 $STEP of ${#SLUGS[@]} steps ran. Step $STEP was rejected, and the sequence stops here —
 later steps assume it landed.
 
-The tree is exactly as the gates found it. Nothing has been reverted and nothing committed,
+The tree holds the last attempt, exactly as the gates found it, and nothing was committed,
 so the work is there to read:
 
   handoff diff $slug
@@ -256,6 +406,22 @@ been answered. Two things to separate first, because they need opposite response
 Check the second one first. It is the more common of the two and the one that looks like the
 first. Read each failing command and ask whether an ideal implementation could satisfy it.
 EOF
+        # How many independent attempts this was is the single most useful line here, because it
+        # separates "unlucky" from "unreachable" without anyone having to reason about it. One
+        # rejection is a sample. Three rejections of the same plan from three clean trees is
+        # evidence about the plan, and the criteria are where to look first.
+        (( ROLL == 1 )) || {
+            echo
+            echo "This step was rolled $ROLL times, each from a clean tree with no feedback, and"
+            echo "rejected every time. That is evidence about the PLAN rather than the attempt —"
+            echo "an unlucky roll does not repeat $ROLL times. Read the criteria before the diff."
+        }
+        (( ${#DISCARDED[@]} == 0 )) || {
+            echo
+            echo "The rejected attempts were kept, not thrown away:"
+            printf '  %s\n' "${DISCARDED[@]}"
+            echo "  (git show <ref>, or git diff HEAD <ref>)"
+        }
         [[ -z "$CONSULT_FINDING" ]] || {
             echo
             echo "$CONSULT read the evidence and said:"
@@ -295,10 +461,18 @@ EOF
         die "step $STEP was accepted but its files could not be staged. Nothing committed."
     fi
 
+    # Which roll landed it belongs in the history. A step accepted on the third attempt and a step
+    # accepted on the first are the same commit and very different facts, and the second is the one
+    # that tells the next reader the plan is marginal.
+    ROLL_NOTE=""
+    (( ROLL == 1 )) || ROLL_NOTE="
+Accepted on roll $ROLL — the earlier attempts were rejected and are kept at
+${DISCARDED[*]}"
+
     SUBJECT="$(commit_subject "$plan")"
     if ! git commit --quiet -m "$SUBJECT" -m "$(cat <<EOF
 Implemented by the local model from ${plan#"$REPO_ROOT"/}.
-Acceptance: $PASSED of $TOTAL. Evidence: ${RUNS_DIR#"$REPO_ROOT"/}/$slug/evidence/evidence.md
+Acceptance: $PASSED of $TOTAL. Evidence: ${RUNS_DIR#"$REPO_ROOT"/}/$slug/evidence/evidence.md$ROLL_NOTE
 EOF
 )"; then
         die "step $STEP was accepted but the commit failed. Nothing was lost — the work is in

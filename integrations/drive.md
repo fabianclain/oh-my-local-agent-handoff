@@ -64,13 +64,19 @@ When the plans are a sequence in one repository and you expect them to stand as 
 sequence and let it do the committing:
 
 ```bash
-HANDOFF_PROVIDER=${HANDOFF_PROVIDER:-native} handoff sequence <slug> <slug> <slug>
+HANDOFF_PROVIDER=${HANDOFF_PROVIDER:-native} handoff sequence --reroll 2 <slug> <slug> <slug>
 ```
 
 It checks every plan first, runs them in order, commits each accepted step, and stops at the first
-rejection with the tree exactly as the gates left it. It never retries and never re-specifies, so
-anything it stops on is yours to diagnose from section 4 onward — which is the same work you would
-have done, minus the part where you typed `git commit` between steps.
+step it cannot land, with the tree as the gates left it. It never re-specifies, so anything it stops
+on is yours to diagnose from section 4 onward — which is the same work you would have done, minus
+the part where you typed `git commit` between steps.
+
+`--reroll 2` asks a rejected step again from a restored tree with no feedback: an independent sample,
+not a nudge. A step measured at 6 accepted rolls in 10 lands 60% of the time without it and every
+time with it, for an expected 1.67 rounds of GPU. A step rejected on *every* roll is evidence about
+the plan rather than the attempt — read the criteria first. Each discarded attempt is kept at
+`refs/handoff/discarded/<slug>/<roll>`, so nothing is lost to make room for the next one.
 
 Drop to one step at a time when you need to intervene between rounds — after a rejection, when
 narrowing a step, or when the plans span more than one repository:
