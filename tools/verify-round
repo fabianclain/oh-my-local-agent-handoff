@@ -98,6 +98,21 @@ PY
 
 cd "$WORKTREE" || { echo "worktree not found: $WORKTREE" >&2; exit 2; }
 
+# The project's own description of itself, if it has one.
+#
+# Read for ONE thing: how this project runs its test suite. The regression gate below used a fixed
+# `vendor/bin/pest --compact`, which is correct and slow — this repository's own pre-commit hook
+# runs the same suite with `--parallel --exclude-testsuite=Browser` because serial costs ~108s
+# against ~24s, and because the Browser suite needs a runtime (a detached, unsandboxed shell for
+# playwright) that a round does not have. Paying 84 extra seconds on EVERY round, including every
+# re-roll, is most of the harness overhead in a round that is otherwise ~291s of model time.
+#
+# Sourced in a subshell-free way because the file legitimately sets HANDOFF_PLANS_DIR and friends,
+# but nothing here depends on those — only the test command is read out of it, and a project that
+# does not set one keeps exactly the behaviour it had.
+# shellcheck disable=SC1091
+[[ -f .handoff/config.sh ]] && { REPO_ROOT="$WORKTREE_ABS"; source .handoff/config.sh; } >/dev/null 2>&1
+
 # --- what changed, including anything created and then removed ------------------------------
 CHANGED="$OUT_DIR/changed-files.txt"
 # Harness-owned paths only. The driver stages the plan into .handoff/plans and writes its own
@@ -465,11 +480,19 @@ else
 fi
 
 # --- the project's existing suite, to catch damage the plan never thought to check --------------
+# HANDOFF_TEST_COMMAND lets a project say how ITS suite runs; the default is what this always did.
+#
+# Not guessed. Appending `--parallel` wherever paratest happens to be installed would be a change
+# to how every project's suite executes, decided by this file on the project's behalf — and a suite
+# that is not parallel-safe fails in ways that read as the model's fault. The project already has a
+# place to describe itself (.handoff/config.sh, which also carries PROJECT_RULES), so it says this
+# too, or says nothing and keeps the slow-and-certain default.
+TEST_COMMAND="${HANDOFF_TEST_COMMAND:-vendor/bin/pest --compact}"
 if [[ -x vendor/bin/pest ]]; then
     TEST_OUT="$OUT_DIR/tests.log"
-    timeout 900 vendor/bin/pest --compact >"$TEST_OUT" 2>&1 &&
-        record "test-suite" "pass" "existing suite green" "vendor/bin/pest --compact" "$TEST_OUT" ||
-        record "test-suite" "fail" "existing suite has failures" "vendor/bin/pest --compact" "$TEST_OUT"
+    timeout 900 bash -o pipefail -c "$TEST_COMMAND" >"$TEST_OUT" 2>&1 &&
+        record "test-suite" "pass" "existing suite green" "$TEST_COMMAND" "$TEST_OUT" ||
+        record "test-suite" "fail" "existing suite has failures" "$TEST_COMMAND" "$TEST_OUT"
 else
     record "test-suite" "skipped" "no vendor/bin/pest in this tree"
 fi
