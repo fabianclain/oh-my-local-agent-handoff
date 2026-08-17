@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+#
+# gate-sweep — run the gates that did not exist yet over every round already recorded.
+#
+#   bench/gate-sweep [<worktree> ...]     default: every bench tree plus the archived session
+#
+# ## What this is for
+#
+# A new gate is worth having only if the defect it catches is actually there. The cheapest way to
+# find out is not to wait for the next round — it is to run it over every round already on disk,
+# which the harness kept precisely so that a question asked later can still be answered.
+#
+# Each round's `tree-after` is a git tree object recorded at the moment the gates judged it, so
+# this reads exactly what the model produced, not what a reviewer committed afterwards.
+#
+# ## What the first sweep found
+#
+# Twenty-three rounds — the archived nine-round session and the overnight passes:
+#
+#     invisible characters   fired in 14 (61%), and in 11 of the 16 rounds ACCEPTED (69%)
+#     Blade directive balance    1
+#     commentary on the edit     1
+#
+# The first line changed how that defect is understood. A U+2011 non-breaking hyphen had been
+# recorded as an oddity noticed twice; it is in more than two thirds of the rounds the harness
+# accepted, which makes it the model's ordinary way of writing a hyphenated phrase. Every one of
+# those rounds passed every criterion, every scope and shape gate, and a human review.
+#
+# The other two are rare because they catch a specific mistake in a specific kind of file, and few
+# rounds touch a Blade template at all. Rare is not the same as not worth having: the Blade one is
+# why a round was rejected that nothing else could explain.
+
+set -uo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+TOOLS="$HERE/../tools"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+TREES=("$@")
+if (( ${#TREES[@]} == 0 )); then
+    for candidate in /home/fabbs/dev/bench-trees/*/ /home/fabbs/dev/monolith-graphs-1; do
+        [[ -d "$candidate/.handoff/runs" ]] && TREES+=("${candidate%/}")
+    done
+fi
+
+printf '%-36s %-9s %-7s %-10s %-9s\n' round verdict blade invisible narration
+printf '%.0s-' {1..76}; echo
+
+TOTAL=0; ACCEPTED=0; INV=0; INV_ACC=0; BLADE=0; NARR=0
+
+for tree in "${TREES[@]}"; do
+    label="$(basename "$tree")"
+    for run in "$tree"/.handoff/runs/*/; do
+        [[ -d "$run" ]] || continue
+        slug="$(basename "$run")"
+        object="$(cat "$run/tree-after" 2>/dev/null)" || continue
+        [[ -n "$object" ]] || continue
+        verdict="$(python3 -c "
+import json,sys
+try: print(json.load(open('$run/evidence/evidence.json'))['verdict'])
+except Exception: print('?')" 2>/dev/null)"
+
+        rm -rf "${WORK:?}/x"; mkdir -p "$WORK/x"
+        written=0
+        while IFS= read -r file; do
+            [[ -n "$file" ]] || continue
+            mkdir -p "$WORK/x/$(dirname "$file")"
+            git -C "$tree" show "$object:$file" >"$WORK/x/$file" 2>/dev/null && written=$((written + 1))
+        done < <(git -C "$tree" ls-tree -r "$object" --name-only 2>/dev/null |
+                 grep -E '^(app|resources|routes|database)/.*\.php$')
+        (( written > 0 )) || continue
+
+        mapfile -t all < <(find "$WORK/x" -type f)
+        mapfile -t blades < <(find "$WORK/x" -name '*.blade.php')
+
+        blade='-'
+        if (( ${#blades[@]} )); then
+            python3 "$TOOLS/blade-balance" "${blades[@]}" >/dev/null 2>&1 && blade=ok || { blade=FIRED; BLADE=$((BLADE + 1)); }
+        fi
+        python3 "$TOOLS/invisible-characters" "${all[@]}" >/dev/null 2>&1 && inv=ok || {
+            inv=FIRED; INV=$((INV + 1)); [[ "$verdict" == ACCEPT ]] && INV_ACC=$((INV_ACC + 1)); }
+        python3 "$TOOLS/process-commentary" "${all[@]}" >/dev/null 2>&1 && narr=ok || { narr=FIRED; NARR=$((NARR + 1)); }
+
+        TOTAL=$((TOTAL + 1)); [[ "$verdict" == ACCEPT ]] && ACCEPTED=$((ACCEPTED + 1))
+        printf '%-36s %-9s %-7s %-10s %-9s\n' "$label/${slug#crawler-graphs-}" "$verdict" "$blade" "$inv" "$narr"
+    done
+done
+
+echo
+(( TOTAL > 0 )) || { echo "no rounds found."; exit 0; }
+printf '%d rounds, %d accepted by the gates.\n\n' "$TOTAL" "$ACCEPTED"
+printf '  invisible characters   %2d (%d%%)' "$INV" $(( 100 * INV / TOTAL ))
+(( ACCEPTED > 0 )) && printf '  — %d of the %d ACCEPTED rounds (%d%%)' "$INV_ACC" "$ACCEPTED" $(( 100 * INV_ACC / ACCEPTED ))
+echo
+printf '  Blade directives       %2d\n' "$BLADE"
+printf '  edit narration         %2d\n' "$NARR"
+echo
+echo "A defect in a round the gates ACCEPTED is the number that matters: it passed every"
+echo "criterion the plan asked for, every scope and shape gate, and a human reading the diff."
