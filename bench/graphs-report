@@ -39,7 +39,12 @@ class Pass:
 
     @property
     def landed(self) -> int:
-        return sum(1 for s in self.steps if s["final"] == "ACCEPT")
+        # COMMITTED, not merely accepted, and the difference is real. consult-3 scored 7 of 7 on a
+        # step where the adapter never attempted a write: every criterion for 3b-shape was already
+        # true from the step before it, so a do-nothing tree passed them all. `handoff sequence`
+        # refused to commit it. Counting the verdict rather than the commit would have reported
+        # that pass as landing a step nobody implemented.
+        return sum(1 for s in self.steps if s["committed"])
 
     @property
     def reached(self) -> int:
@@ -69,7 +74,7 @@ def parse(path: pathlib.Path) -> Pass:
             current = {
                 "n": int(step.group(1)), "slug": step.group(3),
                 "first": None, "final": None, "score": None,
-                "consulted": False, "answer": None, "answer_detail": "",
+                "consulted": False, "answer": None, "answer_detail": "", "committed": False,
             }
             continue
         if current is None:
@@ -99,6 +104,7 @@ def parse(path: pathlib.Path) -> Pass:
             continue
         if COMMITTED.search(line):
             current["final"] = "ACCEPT"
+            current["committed"] = True
             continue
         stopped = STOPPED.search(line)
         if stopped:
@@ -146,22 +152,24 @@ def main(argv: list[str]) -> int:
 
     print("\n## Per step, across every pass\n")
     per_step: dict[int, Counter] = defaultdict(Counter)
+    landed_per_step: dict[int, int] = defaultdict(int)
     names: dict[int, str] = {}
     for run in runs:
         for s in run.steps:
             names[s["n"]] = s["slug"].replace("crawler-graphs-", "")
             per_step[s["n"]][s["final"] or "no-verdict"] += 1
+            landed_per_step[s["n"]] += 1 if s["committed"] else 0
     # "no verdict" is its own column, never folded into rejected. A step that was still running
     # when the night ended did not fail, and reporting it as a failure would overstate exactly the
     # thing this benchmark exists to measure.
-    print(f"{'step':<16} {'accepted':>9} {'rejected':>9} {'unfinished':>11} {'attempts':>9}")
-    print("-" * 60)
+    print(f"{'step':<16} {'landed':>7} {'accepted':>9} {'rejected':>9} {'unfinished':>11} {'attempts':>9}")
+    print("-" * 68)
     for n in sorted(per_step):
         counts = per_step[n]
         attempts = sum(counts.values())
         unfinished = counts["no-verdict"]
         rejected = attempts - counts["ACCEPT"] - unfinished
-        print(f"{names[n]:<16} {counts['ACCEPT']:>9} {rejected:>9} {unfinished:>11} {attempts:>9}")
+        print(f"{names[n]:<16} {landed_per_step[n]:>7} {counts['ACCEPT']:>9} {rejected:>9} {unfinished:>11} {attempts:>9}")
 
     consulted = [s for r in runs for s in r.steps if s["consulted"]]
     print(f"\n## The orchestrator — {len(consulted)} consultation(s)\n")
