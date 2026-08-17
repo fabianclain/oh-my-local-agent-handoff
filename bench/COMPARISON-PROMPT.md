@@ -194,7 +194,24 @@ on every step.
 work: read, write, run the tests, fix what fails. Commit each step as you complete it.
 
 **Run B — IMPLEMENTER = local.** Hand it to the harness and do not write any implementation code
-yourself:
+yourself.
+
+Three rules about HOW you wait, because the last run of this experiment spent more of the expensive
+model supervising than the other arm spent doing the work:
+
+1. **Drive from a subagent, not from this session.** Spawn one, give it only the repository path and
+   the three slugs, and have it run the sequence and report the verdicts. Its context starts near
+   empty; yours is holding two skill files, 54K of crawler documentation, three plans and three test
+   files, and every turn re-sends all of it. Measured last time: 369k per turn here against 166k in
+   the arm that just wrote the code.
+2. **Produce nothing while it runs.** No polling, no shell checks, no "standing by". You will be
+   re-invoked when the subagent returns. The previous run emitted **1,218 assistant turns** against
+   98 for the other arm, and almost all of the excess was this.
+3. **Do not arm a per-step monitor.** Every verdict, score and duration is in the journal when the
+   sequence exits. Watching them live costs a wakeup per step and tells you nothing you cannot read
+   afterwards with `handoff log <slug>`.
+
+The sequence itself is unchanged:
 
     cd "$TREE"
     /home/fabbs/dev/monolith/local-implementer/bin/handoff sequence --reroll 2 \

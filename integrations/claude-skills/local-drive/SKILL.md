@@ -127,12 +127,49 @@ So the cost of watching is not attention. It is turns. Take fewer.
     when the notification arrives, read the verdict and act
     if you need a long fallback, arm ONE monitor — not a poll loop
 
+**And do not arm a per-step monitor.** Watching each step's verdict as it lands buys nothing: every
+verdict, score, attempt and duration is in the journal when the sequence exits, and `handoff log
+<slug>` reads it back. A per-step watcher costs a wakeup per step on top of whatever polling you do
+anyway, and the run that emitted 1,218 turns had both — a Monitor on step verdicts AND a shell poll
+loop beside it. One background task, one notification, one read of the journal at the end.
+
 If you catch yourself writing "I'll wait for the notification", you have just paid a full context
 pass to say so. Say nothing instead.
 
 The whole economic case for a local implementer is that its tokens are nearly free. A reviewer that
 narrates the wait spends more of the expensive model's tokens supervising than the expensive model
 would have spent doing the work — which inverts the reason the harness exists.
+
+## 3c. Drive from a small context, not the one that wrote the plans
+
+Turns cost the context they carry, so the same discipline is worth twice as much from a session that
+is not holding the planner's research.
+
+Measured across the two arms of one comparison, cache reads per turn — which is just context size:
+
+    phase           the arm that implemented directly    the arm that drove the harness
+    reading                    83k/turn                          118k/turn
+    planning                  119k/turn                          192k/turn
+    implementing              138k/turn                          289k/turn
+    verifying                 166k/turn                          369k/turn
+
+The driving session ended carrying **369k against 166k** — 2.2x — because it still held both skill
+files (65K), the project's crawler documentation (54K), three plans and three test files it had
+authored. None of that is needed once the plans exist and the sequence is running. It is dead weight
+charged to every remaining turn.
+
+So drive from a fresh, minimal context. Two ways, both fine:
+
+- **a subagent**, given only the slugs and the repository path. Its context starts near empty, and
+  the parent spends exactly one turn waiting for it;
+- **a separate session**, if a person is starting it by hand.
+
+Either way the planner's session should END at the handoff. Its job finished when the plans passed
+`check-plan` and `prepare`; everything after that is operating, and operating needs the plans, not
+the reasoning that produced them.
+
+This compounds with 3b rather than replacing it. Not polling takes 1,064 turns to 2. Driving from a
+small context makes each remaining turn ~14x cheaper.
 
 ## 4. When a round is rejected, find out which kind of failure it was
 

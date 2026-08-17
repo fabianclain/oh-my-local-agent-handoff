@@ -747,6 +747,33 @@ service-and-view step becomes a service step and a view step.
 loop does not yet. Treat it as the best available reasoning, and be ready to find it wrong — two
 other plausible improvements to the retry path already were.
 
+## Hand the plans over, then stop
+
+Writing the plans and driving them are different jobs, and doing both in one session is measurably
+expensive — not because supervising is hard, but because every turn re-sends the whole conversation,
+and yours is the one carrying the research.
+
+One comparison measured it directly. The session that wrote plans and then watched the harness run
+them ended holding **369k of context per turn** against **166k** for the session that simply built
+the feature itself. It was still carrying both skill files, 54K of project documentation, three
+plans and three test files — none of it needed once the sequence was running, all of it charged to
+every remaining turn. Combined with polling, that phase alone cost **146,571 output tokens and 307.7M
+cache reads**, which is 7.2x more of the expensive model than the other session spent writing all
+the code.
+
+So when the plans pass `check-plan` and `prepare`:
+
+    hand off the slugs and the repository path — to a subagent, or to a separate session
+    stop
+
+The driver needs the plans, not the reasoning that produced them. Give it the slugs and nothing
+else, and let your own session end. If you want the result back, one turn of waiting is enough —
+every verdict, score and attempt is in the journal when the sequence exits.
+
+This is why there are two skills rather than one. The seat that decides a rejected round is fine
+must not be the seat that wrote the criterion it failed — and keeping them in one context loses that
+separation as well as the tokens.
+
 ## Assert the thing, not a number about it
 
 Never write a criterion that counts occurrences. It has now cost two runs of the same benchmark,

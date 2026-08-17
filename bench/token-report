@@ -87,21 +87,37 @@ def read_journal(worktree: str) -> list[dict]:
     return rows
 
 
-def find_transcript(worktree: str) -> str | None:
-    """The session that drove this run, found by the worktree path it must have mentioned.
+def find_transcripts(worktree: str) -> list[tuple[int, str]]:
+    """EVERY session that worked in this tree, most-involved first.
 
-    Sessions are named by uuid, so nobody knows which one drove which run. Every session that
-    worked in a tree necessarily wrote its path many times; the one that wrote it most is the one.
+    Sessions are named by uuid, so nobody knows which one drove which run; a session that worked in
+    a tree necessarily wrote its path many times, so hit count finds them.
+
+    Plural, and that is the point. The skills now say to write the plans in one session and drive
+    them from another — a driver carrying the planner's research pays for it on every turn, measured
+    at 369k per turn against 166k. Returning only the best match would have reported the planning
+    half of such a run and silently dropped the driving half, which is the more expensive one.
+
+    The threshold is RELATIVE, not fixed. A session that merely listed the bench-trees directory
+    once mentions every run in it, and a fixed floor of five let exactly that through: the arm that
+    never touched this tree was reported as having driven it. A session genuinely operating in a
+    tree names it on nearly every command, so the real ones sit orders of magnitude above the
+    passers-by — 118 hits against 1, and 37 against 0, in the run this was found on.
+
+    Returns (hits, path) so the caller can print the evidence rather than asking to be believed.
     """
-    best, best_hits = None, 0
+    found = []
     for path in glob.glob(os.path.join(PROJECTS, "**", "*.jsonl"), recursive=True):
         try:
             hits = open(path, errors="ignore").read().count(worktree)
         except OSError:
             continue
-        if hits > best_hits:
-            best, best_hits = path, hits
-    return best if best_hits > 0 else None
+        if hits:
+            found.append((hits, path))
+    if not found:
+        return []
+    floor = max(10, int(0.15 * max(h for h, _ in found)))
+    return [(h, p) for h, p in sorted(found, reverse=True) if h >= floor]
 
 
 def transcript_usage(path: str, split_at: str | None) -> tuple[dict, dict, int, str | None, str | None]:
@@ -153,11 +169,12 @@ def main(argv: list[str]) -> int:
     worktree = args.worktree or os.path.join(BENCH_TREES, args.run)
     rounds = read_journal(worktree)
 
-    transcript = None
+    transcripts: list[str] = []
     if not args.no_transcript:
-        transcript = args.transcript or find_transcript(worktree)
+        transcripts = ([(0, args.transcript)] if args.transcript
+                       else find_transcripts(worktree))
 
-    if not rounds and not transcript:
+    if not rounds and not transcripts:
         print(f"no journal at {worktree}/.handoff/journal/runs.jsonl and no transcript found.",
               file=sys.stderr)
         return 2
@@ -212,14 +229,16 @@ def main(argv: list[str]) -> int:
             print()
 
     # --- planning, from the transcript ----------------------------------------------------------
-    if transcript:
+    for hits, transcript in transcripts:
         before, after, messages, first, last = transcript_usage(transcript, args.impl_start)
-        payload["transcript"] = {"path": transcript, "messages": messages,
+        payload.setdefault("transcripts", []).append({"path": transcript, "hits": hits,
+                                 "messages": messages,
                                  "before_split": before, "after_split": after,
-                                 "split_at": args.impl_start, "first": first, "last": last}
+                                 "split_at": args.impl_start, "first": first, "last": last})
         if not args.json:
             label = "PLANNING" if args.impl_start else "WHOLE SESSION"
-            print(f"{label} — {os.path.basename(transcript)}, {messages} assistant message(s)")
+            print(f"{label} — {os.path.basename(transcript)}, {messages} assistant message(s)"
+                  + (f", {hits} mentions of the tree" if hits else ""))
             print(f"  session ran {first}  ..  {last}")
             if args.impl_start and not (first <= args.impl_start <= last):
                 print(f"  WARNING: --impl-start {args.impl_start} is OUTSIDE that range, so every")
@@ -246,7 +265,7 @@ def main(argv: list[str]) -> int:
         return 0
 
     # The refusal, stated every time rather than left to the reader's memory.
-    if rounds and transcript:
+    if rounds and transcripts:
         print("NOT TOTALLED, on purpose")
         print("  The journal's tokens and the transcript's are different currencies — one is")
         print("  billed per token, the other is electricity against a card you already own — and")
