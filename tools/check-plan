@@ -114,6 +114,32 @@ check_one() {
         (( trivial == 0 )) || notes+=("$trivial command(s) a do-nothing tree could also pass")
         verification_commands "$plan" | grep -qE 'git (status|diff)' ||
             notes+=("nothing asserts how many files changed — scope is unenforced by the plan")
+
+        # A criterion that runs the WHOLE suite, the slow way.
+        #
+        # "Whole" means unscoped: no --filter, --parallel, --group, --testsuite, and no test path. Naming a file is as
+        # narrow as filtering by name, and flagging `vendor/bin/pest tests/Feature/XTest.php` would
+        # fire on the single most common well-written criterion in this project.
+        #
+        # Measured, not guessed: on this project `vendor/bin/pest --compact` takes 166s where
+        # `php artisan test --compact --parallel --exclude-testsuite=Browser` takes 32s over the
+        # same code. A criterion is not run once — the model runs it while working AND the gates
+        # run it to reach a verdict — so a slow one is paid for at least twice per round, and again
+        # on every re-roll.
+        #
+        # Advisory rather than a refusal: the slow form is CORRECT, and on a project with no
+        # paratest or a suite that is not parallel-safe it is the only right answer. This says the
+        # cost out loud so it is a choice rather than an accident.
+        # Counted PER COMMAND, not per plan. Asking "does this plan contain a suite runner" and then
+        # "does this plan contain a --filter anywhere" lets one narrow criterion vouch for three
+        # broad ones sitting beside it — which is the common shape, since a plan usually has one
+        # filtered check per behaviour and one full-suite regression run at the end.
+        local whole_suite
+        whole_suite="$(verification_commands "$plan" |
+            grep -E '(vendor/bin/(pest|phpunit)|artisan test)([[:space:]]|$)' |
+            grep -cvE '\-\-(filter|parallel|group|testsuite)|[[:space:]](tests?|spec)/[^[:space:]]*')"
+        [[ "$whole_suite" =~ ^[0-9]+$ ]] || whole_suite=0
+        (( whole_suite == 0 )) || notes+=("$whole_suite command(s) run the whole suite unfiltered and serially — the model runs each while working and the gates run it again to reach a verdict, so it is paid at least twice per round and again on every re-roll. Measured here: 166s against 32s for the same check with the project's own parallel form")
     fi
     grep -qE '^## Out of scope' "$plan" || notes+=("no '## Out of scope' section")
 
