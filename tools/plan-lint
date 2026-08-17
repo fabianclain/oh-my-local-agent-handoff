@@ -328,6 +328,10 @@ def check_whitespace(report: Report, commands: list[str]) -> None:
 # line-survival check in one of the repository's own plans. A linter whose first live run produced
 # a confident wrong finding teaches the reader to skim it.
 ZERO_ASSERTION = re.compile(r"-eq\s+0\b|(?<=\s)==?\s+0\b|(^|[|;&(]\s*)!\s*grep")
+
+# `-eq N` for N > 0, over a `grep -c`. The sibling of the zero-assertion, and the more expensive of
+# the two — see check_positive_counts for the two runs it cost.
+POSITIVE_COUNT = re.compile(r"-eq\s+([1-9]\d*)\b|(?<=\s)==?\s+([1-9]\d*)\b")
 # A pattern the shell builds at runtime cannot be counted here, and guessing at one is how a
 # checker starts inventing findings.
 UNEVALUABLE = re.compile(r"[$`]")
@@ -408,6 +412,64 @@ def current_matches(pattern: str, path: pathlib.Path, extended: bool) -> int | N
     if done.returncode not in (0, 1):
         return None
     return int(done.stdout.strip() or 0)
+
+
+def check_positive_counts(report: Report, commands: list[str]) -> None:
+    """`test "$(grep -c X f)" -eq 3` — a criterion asking for a specific number of matches.
+
+    This has now cost two runs of the same benchmark, and it fails in three ways at once.
+
+    **`grep -c` counts LINES, not occurrences.** A route added as one line containing `dead-hosts`
+    three times returns 1. The author who wrote `-eq 3` meant occurrences; the command cannot
+    express that, and no dry run reveals the gap — `prepare` reported "fails now, count 0", which
+    is exactly what a not-yet-implemented step should report. Only reading `grep -c` semantics
+    catches it, and the author had already read them and still got it wrong.
+
+    **A count is satisfiable by text that is not code.** Asked for three occurrences, the local
+    model eventually appended `// dead-hosts route` and `// dead-hosts comment` — filler whose only
+    purpose was to match the pattern. It was not being obtuse: a criterion is the specification,
+    it is stricter than the prose, and it will be obeyed past where the prose stops. The plan said
+    "one line, nothing else moves"; the criterion said "three of these"; the criterion won.
+
+    **A count fights a shape bound.** The same plan carried `patch-shape --max-added 2`. Reaching
+    three lines required adding three. The two criteria were mutually unsatisfiable, proven from
+    both directions in the same run: roll 1 wrote the correct single line and failed the count,
+    roll 2 split it across three lines and failed the shape. No tree could pass both.
+
+    Cost: the accepted implementation was rejected four times over 81 minutes and 6.07M tokens for
+    a one-line change. What finally worked asserts the thing itself rather than a number about it —
+
+        grep -qF "Route::livewire('crawler/dead-hosts', 'pages::crawler.dead-hosts')..."
+
+    — which cannot be forged by a comment and does not compete with the shape bound.
+    """
+    for index, command in enumerate(commands, 1):
+        match = POSITIVE_COUNT.search(command)
+        if not match:
+            continue
+        wanted = match.group(1) or match.group(2)
+        for pattern, operand, _ in grep_calls(command):
+            if not re.search(r"grep\s+(-\w*c|\S*\s+-c)", command) and "-c" not in command:
+                continue
+            # `-eq 1` is the safe end of this and gets a note, not a warning. Adding a comment
+            # carrying the pattern would BREAK it rather than satisfy it, so the gaming route is
+            # closed; it is still line-vs-occurrence confused and can still fight a shape bound,
+            # which is worth a glance and not worth a warning. Both criteria that actually cost a
+            # run asked for 3.
+            emit = report.note if wanted == "1" else report.warn
+            emit("positive-count-assertion",
+                        f"criterion {index} demands exactly {wanted} matches of `{pattern}`"
+                        + (f" in {operand}" if operand else ""),
+                        command.strip(),
+                        "`grep -c` counts LINES, not occurrences — three occurrences on one line",
+                        "return 1 — and a count is satisfiable by anything carrying the pattern,",
+                        "including a comment written to satisfy it. Both happened in one run: a",
+                        "correct one-line route scored 1 and was rejected, and a later attempt",
+                        "appended `// dead-hosts route` purely to reach the number.",
+                        "If the step also has a patch-shape bound, check they can both hold: a",
+                        "count of 3 and --max-added 2 are mutually unsatisfiable.",
+                        "Assert the thing, not a number about it: grep -qF '<the exact line>'.")
+            break
 
 
 def check_zero_assertions(report: Report, commands: list[str], repo: pathlib.Path) -> None:
@@ -537,6 +599,7 @@ def lint(path: pathlib.Path, repo: pathlib.Path) -> Report:
     check_states(report, text)
     check_colour(report, commands)
     check_whitespace(report, commands)
+    check_positive_counts(report, commands)
     check_zero_assertions(report, commands, repo)
     check_worked_example(report, text)
     check_shape(report, text, commands, paths)

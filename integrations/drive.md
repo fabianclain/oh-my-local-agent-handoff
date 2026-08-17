@@ -93,6 +93,39 @@ fails even when the model exits cleanly. Do not pipe it to `tail` and read `$?` 
 no report at all, and reports have claimed success over trees that were never touched. The evidence
 bundle is at `.handoff/runs/<slug>/evidence/evidence.md`.
 
+## 3b. While a round runs, produce NOTHING
+
+Fire the sequence, then stop. No polling, no status turns, no "standing by". The harness re-invokes
+you when the background task finishes; that is what it is for.
+
+This is the single most expensive mistake measured in this workflow, and it is not close.
+
+A reviewer that drove three steps through the harness emitted **1,218 assistant turns**, against 98
+for a session that implemented the same feature itself. Almost all of the excess was one phase: the
+one where the local model was working and the reviewer had nothing to do. That phase alone cost
+**146,571 output tokens and 307.7M cache reads** — 7.2x more Claude output than the other session
+spent actually writing the code, and 50x the cache traffic.
+
+The mechanism is worth understanding, because it is not obvious and it makes idling look free when
+it is not. A conversation is stateless: every turn re-sends the whole history. Caching makes the
+re-read cheap PER TOKEN — that session's `input_tokens` was 2,436 against 334M of `cache_read` —
+but it is still paid once per turn, whole, regardless of how little the turn does. At ~290k of
+accumulated context, a turn that says "Waiting." costs 290k. Eighty of them cost 23M to say nothing.
+And it compounds: context grows, so late idle turns cost more than early ones.
+
+So the cost of watching is not attention. It is turns. Take fewer.
+
+    fire the sequence in the background, and return
+    when the notification arrives, read the verdict and act
+    if you need a long fallback, arm ONE monitor — not a poll loop
+
+If you catch yourself writing "I'll wait for the notification", you have just paid a full context
+pass to say so. Say nothing instead.
+
+The whole economic case for a local implementer is that its tokens are nearly free. A reviewer that
+narrates the wait spends more of the expensive model's tokens supervising than the expensive model
+would have spent doing the work — which inverts the reason the harness exists.
+
 ## 4. When a round is rejected, find out which kind of failure it was
 
 ```bash

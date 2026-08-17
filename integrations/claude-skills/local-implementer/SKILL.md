@@ -761,6 +761,40 @@ service-and-view step becomes a service step and a view step.
 loop does not yet. Treat it as the best available reasoning, and be ready to find it wrong — two
 other plausible improvements to the retry path already were.
 
+## Assert the thing, not a number about it
+
+Never write a criterion that counts occurrences. It has now cost two runs of the same benchmark,
+and it fails three ways at once:
+
+```bash
+test "$(grep -c 'dead-hosts' routes/crawler.php)" -eq 3     # cost 81 minutes and 6.07M tokens
+grep -qF "Route::livewire('crawler/dead-hosts', 'pages::crawler.dead-hosts')"   # what worked
+```
+
+**`grep -c` counts LINES, not occurrences.** A correct one-line route containing the pattern three
+times returns 1. No dry run reveals this — `prepare` reports "fails now, count 0", exactly what a
+not-yet-built step should report. Only reading `grep -c`'s semantics catches it, and the author who
+wrote it had read them.
+
+**A count is satisfiable by text that is not code.** Asked for three occurrences, the local model
+appended `// dead-hosts route` and `// dead-hosts comment` — filler whose only purpose was to reach
+the number. That is not obtuseness. A criterion IS the specification, it is stricter than your
+prose, and it will be obeyed past the point where the prose stops. The plan said "one line, nothing
+else moves"; the criterion said "three of these"; the criterion won.
+
+**A count fights a shape bound.** The same step carried `patch-shape --max-added 2`. Reaching three
+occurrences on three lines needed three added lines. The two were mutually unsatisfiable, and the
+run proved it from both directions: roll 1 wrote the correct single line and failed the count, roll
+2 split it across three lines and failed the shape. No tree could pass both, including a perfect one.
+
+`plan-lint` now warns on any `grep -c ... -eq N` for N of 2 or more. `-eq 1` gets a note instead:
+filler would BREAK it rather than satisfy it, so the gaming route is closed, though it is still
+line-vs-occurrence confused.
+
+The general rule, which covers more than grep: **a criterion should assert the thing you want, not
+a measurement of it.** An exact-string check cannot be forged by a comment, does not compete with a
+shape bound, and says in the plan exactly what the implementer is being asked for.
+
 ## Criteria are executed, twice, and nothing asks you first
 
 An acceptance criterion is not a description of a check. It is a command, and two different parts
