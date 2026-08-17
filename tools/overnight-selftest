@@ -91,7 +91,13 @@ else
 fi
 
 echo "==> 4/7 the summary shows one row per job, not one per attempt"
-ROWS="$(grep -c '^| bravo |' "$(run_dir basic)/summary.md" 2>/dev/null || echo 0)"
+# Not `|| echo 0`: `grep -c` prints its count and THEN exits 1 when that count is zero, so the
+# fallback would append a second `0` to the one already printed and this failure would read
+# "bravo appears in 0\n0 summary rows". The guard covers the case the fallback was actually for —
+# a summary.md that does not exist, where grep prints nothing and exits 2. Same remedy as
+# tools/verify-round.
+ROWS="$(grep -c '^| bravo |' "$(run_dir basic)/summary.md" 2>/dev/null)"
+[[ "$ROWS" =~ ^[0-9]+$ ]] || ROWS=0
 if [[ "$ROWS" != 1 ]]; then
     fail "bravo appears in $ROWS summary rows after a resume, expected 1"
     grep '^|' "$(run_dir basic)/summary.md" | sed 's/^/        /'

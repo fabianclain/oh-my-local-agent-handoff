@@ -87,7 +87,17 @@ STATUS=${PIPESTATUS[0]}
 # Not every commit on the branch is a landed step: bench/stage-graph-test commits each reviewer
 # test before the step it judges, under a distinct author so the two can be told apart. Counting
 # all of them would report a pass that landed nothing as having landed eight.
-LANDED="$(git log --format='%ae' "$BASE"..HEAD 2>/dev/null | grep -cv '^reviewer@bench$' || echo 0)"
+#
+# No `|| echo 0` here, however defensive it looks. `grep -c` prints its count and THEN exits 1
+# when that count is zero, so the fallback fired at exactly the moment grep had already printed a
+# `0`, and the substitution captured both of them. A pass that landed nothing wrote `landed 0`,
+# a newline, and `0 of 8` — splitting its own row in two, in the one file whose whole job is to
+# stay readable after a kill at 04:00. It corrupted the two rows it was there to protect and
+# could never have helped any other.
+LANDED="$(git log --format='%ae' "$BASE"..HEAD 2>/dev/null | grep -cv '^reviewer@bench$')"
+# grep -c always prints exactly one number, empty input included, so this cannot fire today. It
+# is here so that the row stays one row regardless of what the pipeline above ever becomes.
+[[ "$LANDED" =~ ^[0-9]+$ ]] || LANDED=0
 printf '%s\t%s\t%s\tlanded %s of %s\texit %s\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$NAME" "$MODE" "$LANDED" "${#STEPS[@]}" "$STATUS" \
     >>"$RESULTS/summary.tsv"
