@@ -80,13 +80,17 @@ ARGS=(--before-step "$HERE/stage-graph-test")
 # self-describing label. "landed 3 of 8" means nothing without knowing how many rolls bought it.
 MODE_LABEL="$MODE"
 [[ "${GRAPHS_REROLL:-0}" == 0 ]] || MODE_LABEL="$MODE+reroll$GRAPHS_REROLL"
+# And the implementer, when it is not the local model. Two passes that differ only in who wrote the
+# code are the whole point of GRAPHS_PROVIDER, and a summary that does not say which is which
+# records two numbers for one label.
+[[ "${GRAPHS_PROVIDER:-native}" == native ]] || MODE_LABEL="$MODE_LABEL/${GRAPHS_PROVIDER}"
 
 cd "$TREE" || exit 1
 
 # The implementer is the local model in both modes. `--consult claude` names the ORCHESTRATOR,
 # which must be a different model — a model that writes the plan, judges whether its own criteria
 # were satisfiable, and then implements against them has removed every independent check at once.
-export HANDOFF_PROVIDER=native
+export HANDOFF_PROVIDER="${GRAPHS_PROVIDER:-native}"
 
 LOG="$RESULTS/$NAME.log"
 {
