@@ -84,16 +84,28 @@ not been set"; `public/build` is gitignored so every page render throws ViteExce
 needs its framework subdirectories).
 
     cd /home/fabbs/dev/monolith/local-implementer
-    TREE="$(bench/monolith-worktree <NAME> master)"
+    TREE="$(bench/monolith-worktree <NAME> 015d078)"
     cd "$TREE"
-    git log --oneline -1        # record this SHA in your report; both runs must show the same one
+    git log --oneline -1        # MUST print 015d078; if it does not, stop and say so
 
 Do all work in `$TREE`. Do not commit to master. Do not touch the other run's worktree.
 
 ## 2. Start the clock, and keep four numbers apart
 
-Record wall-clock timestamps with `date +%s` at each boundary. Report these four separately —
-lumping them together is what makes this kind of comparison useless:
+Record each boundary **twice**: as an epoch for arithmetic and as an ISO-8601 UTC stamp for the
+token report.
+
+    date +%s                      # for the durations below
+    date -u +%Y-%m-%dT%H:%M:%SZ   # for bench/token-report --impl-start
+
+Put the ISO stamps in your report. They are not decoration: `bench/token-report` splits your own
+session transcript into planning and implementing at that instant, and it is the only boundary that
+exists — a session is named by uuid and carries no clock, so a guessed split silently drops every
+token on one side and reads exactly like a real answer. Without your stamp nobody can ever recover
+what the planning half cost.
+
+Report these four durations separately — lumping them together is what makes this kind of
+comparison useless:
 
 | number | what it is | why it must be separate |
 | --- | --- | --- |
@@ -222,6 +234,7 @@ Print exactly this table, then the notes below it.
     T_impl           <mm:ss>
     T_verify         <mm:ss>
     T_wait           <mm:ss>   (local only; 00:00 for claude)
+    impl started at  <ISO-8601 UTC>   (the T_plan -> T_impl boundary)
     ------------------------------------
     TOTAL (excl wait) <mm:ss>
 
@@ -234,6 +247,16 @@ Print exactly this table, then the notes below it.
     edit narration   <clean | n files>
     blade balance    <clean | n>
     diff             <n files, +n/-n lines>
+
+Then run the token report and paste its output verbatim:
+
+    /home/fabbs/dev/monolith/local-implementer/bench/token-report <NAME> --impl-start <your ISO stamp>
+
+It reads the harness journal for what the implementer spent per round, and your own session
+transcript for what planning cost. It deliberately refuses to add the two together when the arms
+differ: Claude tokens are billed and gpt-oss tokens are electricity, and a combined total erases
+the only economic difference between the arms. Compare **output tokens**, which are work actually
+done and counted the same way on both sides.
 
 Then, in prose:
 

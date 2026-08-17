@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""token-report — what a run spent, split between planning and implementing.
+
+    bench/token-report cmp-local
+    bench/token-report cmp-local --transcript ~/.claude/projects/.../<session>.jsonl
+    bench/token-report cmp-claude --impl-start 2026-08-17T18:31:00Z
+    bench/token-report --json cmp-local
+
+Exit 0 with a report, 2 when no source could be read.
+
+## Nothing new is instrumented
+
+Both halves were already on disk; this joins them.
+
+    implementing   <worktree>/.handoff/journal/runs.jsonl — one line per attempt, carrying
+                   activity.tokens {input, output}, activity.iterations, the provider, the model
+                   and the verdict. Written by tools/journal after every round.
+
+    planning       the reviewer's own Claude Code session transcript, which records `usage` on
+                   every assistant message: input_tokens, output_tokens, cache_creation_input_tokens
+                   and cache_read_input_tokens, each with an ISO timestamp.
+
+A counter would have been easier and worse. These are per-round and per-message records, so a
+question asked later — which step was expensive, was it thinking or re-reading, did the expensive
+round even succeed — can still be answered. This project has needed all three.
+
+## Two totals this refuses to print
+
+**Claude tokens and gpt-oss tokens are different currencies.** One is billed per token, the other
+is electricity against a card you already own. Adding them produces a number whose only use is to
+mislead, so the arms are reported side by side and never summed. The whole economic case for a
+local implementer is that its tokens are nearly free, and a combined total erases exactly that.
+
+**"Input" does not mean the same thing in the two sources.** The journal's input is what the API
+was PRESENTED — the whole conversation, re-counted every turn. llama.cpp's own figure is what it
+EVALUATED, which skips any prefix already in the KV cache and is therefore far smaller for the same
+work. tools/usage documents this at length because the tool that ignored it once reported 62.1M
+input tokens referring to nothing. Output tokens are the honest cross-source comparison: they are
+work actually done, counted the same way everywhere.
+
+## What it showed the first time it was run
+
+The dead-hosts comparison, local arm. Three steps, six rounds:
+
+    deadhosts-1-service   accepted          43,017 in      1,664 out     8 iterations
+    deadhosts-2-page      accepted          75,733 in      3,245 out     8 iterations
+    deadhosts-3-route     x4             1,625,065 in     26,396 out    34/38/76/88
+
+Step 3 is ONE LINE in a route file. It took 93% of the run's tokens, and the round that finally
+succeeded still needed 88 iterations against step 1's 8. Wall-clock said step 3 was 4 rounds of 6;
+tokens say it was the entire run. The two steps that worked are a rounding error.
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import sys
+
+BENCH_TREES = "/home/fabbs/dev/bench-trees"
+PROJECTS = os.path.expanduser("~/.claude/projects")
+
+
+def read_journal(worktree: str) -> list[dict]:
+    """Every attempt recorded for this run, in order, de-duplicated.
+
+    De-duplication is not paranoia: the first pass at this summed a glob that matched runs.jsonl
+    twice and reported 3.77h of model time for a 1.88h run. A record is identified by the round it
+    describes, not by the line it arrived on.
+    """
+    path = os.path.join(worktree, ".handoff", "journal", "runs.jsonl")
+    if not os.path.exists(path):
+        return []
+    seen, rows = set(), []
+    for line in open(path, errors="ignore"):
+        try:
+            record = json.loads(line)
+        except Exception:
+            continue
+        key = (record.get("slug"), record.get("started_at"), record.get("recorded_at"))
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(record)
+    return rows
+
+
+def find_transcript(worktree: str) -> str | None:
+    """The session that drove this run, found by the worktree path it must have mentioned.
+
+    Sessions are named by uuid, so nobody knows which one drove which run. Every session that
+    worked in a tree necessarily wrote its path many times; the one that wrote it most is the one.
+    """
+    best, best_hits = None, 0
+    for path in glob.glob(os.path.join(PROJECTS, "**", "*.jsonl"), recursive=True):
+        try:
+            hits = open(path, errors="ignore").read().count(worktree)
+        except OSError:
+            continue
+        if hits > best_hits:
+            best, best_hits = path, hits
+    return best if best_hits > 0 else None
+
+
+def transcript_usage(path: str, split_at: str | None) -> tuple[dict, dict, int, str | None, str | None]:
+    """Usage summed before and after `split_at`, plus the session's own time range.
+
+    The range is returned because without it nobody can choose a split: sessions are named by
+    uuid and carry no clock in the filename. A `--impl-start` outside the range is not an error —
+    it silently puts every token in one bucket, which reads exactly like a real answer.
+
+    ISO-8601 with a trailing Z sorts correctly as a string, so no date parsing is needed — and no
+    date parsing means no timezone bug in a tool whose whole output is a comparison.
+    """
+    before = {k: 0 for k in ("input_tokens", "output_tokens",
+                             "cache_creation_input_tokens", "cache_read_input_tokens")}
+    after = dict(before)
+    messages = 0
+    first = last = None
+    for line in open(path, errors="ignore"):
+        try:
+            record = json.loads(line)
+        except Exception:
+            continue
+        usage = (record.get("message") or {}).get("usage")
+        if not usage:
+            continue
+        messages += 1
+        stamp = record.get("timestamp") or ""
+        if stamp:
+            first = stamp if first is None else min(first, stamp)
+            last = stamp if last is None else max(last, stamp)
+        bucket = after if (split_at and stamp >= split_at) else before
+        for key in bucket:
+            value = usage.get(key)
+            if isinstance(value, int):
+                bucket[key] += value
+    return before, after, messages, first, last
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("run", help="run name under bench-trees, e.g. cmp-local")
+    parser.add_argument("--worktree", help="override the worktree path")
+    parser.add_argument("--transcript", help="session transcript; auto-discovered when omitted")
+    parser.add_argument("--no-transcript", action="store_true", help="journal only")
+    parser.add_argument("--impl-start", help="ISO timestamp splitting planning from implementing")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+
+    worktree = args.worktree or os.path.join(BENCH_TREES, args.run)
+    rounds = read_journal(worktree)
+
+    transcript = None
+    if not args.no_transcript:
+        transcript = args.transcript or find_transcript(worktree)
+
+    if not rounds and not transcript:
+        print(f"no journal at {worktree}/.handoff/journal/runs.jsonl and no transcript found.",
+              file=sys.stderr)
+        return 2
+
+    payload: dict = {"run": args.run, "worktree": worktree, "rounds": [], "transcript": None}
+
+    if not args.json:
+        print(f"== {args.run}   {worktree}")
+        print()
+
+    # --- implementing, from the journal ---------------------------------------------------------
+    if rounds:
+        provider = (rounds[0].get("provider") or {})
+        name = provider.get("name") if isinstance(provider, dict) else provider
+        model = provider.get("model") if isinstance(provider, dict) else None
+        total_in = total_out = total_iters = 0
+        if not args.json:
+            print(f"IMPLEMENTING — journal, {len(rounds)} round(s), provider={name} model={model}")
+            print(f"  {'step':26} {'verdict':15} {'input':>10} {'output':>9} {'iters':>6}")
+            print("  " + "-" * 70)
+        for record in rounds:
+            activity = record.get("activity") or {}
+            tokens = activity.get("tokens") or {}
+            got_in = tokens.get("input", 0) or 0
+            got_out = tokens.get("output", 0) or 0
+            iters = activity.get("iterations", 0) or 0
+            total_in += got_in
+            total_out += got_out
+            total_iters += iters
+            payload["rounds"].append({
+                "slug": record.get("slug"), "outcome": record.get("outcome"),
+                "input": got_in, "output": got_out, "iterations": iters,
+                "seconds": record.get("seconds"),
+            })
+            if not args.json:
+                print(f"  {str(record.get('slug'))[:26]:26} {str(record.get('outcome'))[:15]:15} "
+                      f"{got_in:>10,} {got_out:>9,} {iters:>6}")
+        payload["implementing_total"] = {"input": total_in, "output": total_out,
+                                         "iterations": total_iters, "rounds": len(rounds)}
+        if not args.json:
+            print("  " + "-" * 70)
+            print(f"  {'TOTAL':26} {'':15} {total_in:>10,} {total_out:>9,} {total_iters:>6}")
+            # Which step ate the run. Wall-clock hides this: a step that is 4 rounds of 6 looks
+            # like two thirds, and can be 93% of the tokens.
+            by_step: dict[str, int] = {}
+            for row in payload["rounds"]:
+                by_step[row["slug"]] = by_step.get(row["slug"], 0) + row["input"]
+            if total_in and len(by_step) > 1:
+                worst = max(by_step.items(), key=lambda kv: kv[1])
+                print()
+                print(f"  {worst[0]} is {100 * worst[1] // total_in}% of the input tokens.")
+            print()
+
+    # --- planning, from the transcript ----------------------------------------------------------
+    if transcript:
+        before, after, messages, first, last = transcript_usage(transcript, args.impl_start)
+        payload["transcript"] = {"path": transcript, "messages": messages,
+                                 "before_split": before, "after_split": after,
+                                 "split_at": args.impl_start, "first": first, "last": last}
+        if not args.json:
+            label = "PLANNING" if args.impl_start else "WHOLE SESSION"
+            print(f"{label} — {os.path.basename(transcript)}, {messages} assistant message(s)")
+            print(f"  session ran {first}  ..  {last}")
+            if args.impl_start and not (first <= args.impl_start <= last):
+                print(f"  WARNING: --impl-start {args.impl_start} is OUTSIDE that range, so every")
+                print(f"  token fell on one side of it. The split below is not a split.")
+            for key, value in before.items():
+                print(f"  {key:32} {value:>15,}")
+            if args.impl_start:
+                print()
+                print(f"IMPLEMENTING — same transcript, at or after {args.impl_start}")
+                for key, value in after.items():
+                    print(f"  {key:32} {value:>15,}")
+            else:
+                print()
+                print("  Not split: pass --impl-start <ISO8601> to separate planning from")
+                print("  implementing. Without it this is the whole session, and for an arm where")
+                print("  Claude also implemented, the two are mixed in one stream.")
+            print()
+            print("  cache_read_input_tokens is usually the bulk and is the cheapest of the four;")
+            print("  do not read it as effort. output_tokens is the one that tracks work done.")
+            print()
+
+    if args.json:
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    # The refusal, stated every time rather than left to the reader's memory.
+    if rounds and transcript:
+        print("NOT TOTALLED, on purpose")
+        print("  The journal's tokens and the transcript's are different currencies — one is")
+        print("  billed per token, the other is electricity against a card you already own — and")
+        print("  the whole economic case for a local implementer is that difference. Adding them")
+        print("  erases it.")
+        print("  Nor are the two 'input' figures the same measurement: the journal counts what was")
+        print("  PRESENTED (the conversation, re-counted every turn), llama.cpp counts what it")
+        print("  EVALUATED (skipping any cached prefix). Compare output tokens across arms; they")
+        print("  are work actually done, counted the same way in both.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
