@@ -36,16 +36,28 @@ HANDOFF_HOME="$(cd "$HERE/.." && pwd)"
 BASE="${GRAPHS_BASE:-bench-graphs-base}"
 RESULTS="${GRAPHS_RESULTS:-/home/fabbs/dev/bench-trees/results}"
 
-STEPS=(
-    crawler-graphs-1-schema
-    crawler-graphs-2-collect
-    crawler-graphs-3-series
-    crawler-graphs-3b-shape
-    crawler-graphs-4a-command
-    crawler-graphs-4b-wiring
-    crawler-graphs-5a-chart
-    crawler-graphs-5b-page
-)
+# The sequence, overridable so a step can be dropped without editing this file.
+#
+# `crawler-graphs-3b-shape` is in the default list because the original session ran it, and it is
+# the first thing anyone should drop: it is a REPAIR plan, written because 3-series came back
+# damaged that night. When 3-series succeeds it has no work to do, and across three replays it
+# produced one no-op round, one that broke the previous step's tests, and one that rewrote a
+# correct file 83 insertions deep and scored 2 of 7. A step with nothing to do does not come back
+# empty — the model finds something to change, and the only thing available is working code.
+if [[ -n "${GRAPHS_STEPS:-}" ]]; then
+    read -r -a STEPS <<<"$GRAPHS_STEPS"
+else
+    STEPS=(
+        crawler-graphs-1-schema
+        crawler-graphs-2-collect
+        crawler-graphs-3-series
+        crawler-graphs-3b-shape
+        crawler-graphs-4a-command
+        crawler-graphs-4b-wiring
+        crawler-graphs-5a-chart
+        crawler-graphs-5b-page
+    )
+fi
 
 mkdir -p "$RESULTS"
 TREE="$("$HERE/monolith-worktree" "$NAME" "$BASE")" || { echo "could not build a worktree for $NAME" >&2; exit 1; }

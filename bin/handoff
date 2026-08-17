@@ -674,12 +674,32 @@ check | prepare)
             # `DRY_OUT="$(...)"` whose command fails aborts the whole script — which is every
             # criterion here, since the work has not been done yet. The first version of this
             # printed the heading and then silently exited before a single line.
-            if DRY_OUT="$(cd "$REPO_ROOT" && NO_COLOR=1 TERM=dumb CLICOLOR=0 \
-                timeout 120 bash -o pipefail -c "$dry_command" 2>&1)"; then
+            # Redirected to a file, NOT captured with $( ).
+            #
+            # `timeout` signals the process it started; a command substitution waits for the PIPE
+            # to close, and any process still holding the write end keeps it open — including one
+            # the timeout never signalled. Reproduced:
+            #
+            #   "$(timeout 3 bash -c 'sleep 30 & echo x; wait')"           3s, rc 124
+            #   "$(timeout 3 bash -c 'setsid sleep 25 & echo x; sleep 100')"  25s, rc 124
+            #
+            # Both timed out; only the detached one blocked, for as long as the grandchild lived.
+            # pest-plugin-browser leaves a `playwright run-server` child that inherits stdout and
+            # outlives the run, so a criterion running the Browser suite hung `prepare` for ~20
+            # minutes with no indication which command was responsible. The timeout has been here
+            # since 2026-08-12 and could never have helped.
+            #
+            # tools/verify-round already writes acceptance output to a file for the same reason,
+            # which is why rounds never hung and only `prepare` did.
+            DRY_LOG="$(mktemp)"
+            if (cd "$REPO_ROOT" && NO_COLOR=1 TERM=dumb CLICOLOR=0 \
+                timeout 120 bash -o pipefail -c "$dry_command" >"$DRY_LOG" 2>&1); then
+                DRY_OUT="$(cat "$DRY_LOG")"; rm -f "$DRY_LOG"
                 DRY_PASS=$(( DRY_PASS + 1 ))
                 printf '  %2d  ALREADY PASSES  %s\n' "$DRY_IDX" "${dry_command:0:88}"
                 echo "      ^ this criterion does not test the change — it was true before it"
             else
+                DRY_OUT="$(cat "$DRY_LOG")"; rm -f "$DRY_LOG"
                 printf '  %2d  fails now       %s\n' "$DRY_IDX" "${dry_command:0:88}"
             fi
             # Show the output with control characters VISIBLE. The whole point of this mode is
