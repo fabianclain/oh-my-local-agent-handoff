@@ -78,6 +78,76 @@ DEFAULT_ROOTS = [pathlib.Path.home() / "dev"]
 DEFAULT_BENCH = pathlib.Path.home() / "dev" / "agent-handoff-bench" / "bench"
 
 
+def as_int(value):
+    """A metrics field that is absent, empty or `null` is unknown, and unknown is not zero."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def journal_detail(entry: dict) -> dict:
+    """What the journal records about a round beyond its tokens.
+
+    Every field here is already written per round; none of it is newly instrumented. It is carried
+    through because a token count says what a round SPENT and nothing about what it produced --
+    the tree it left, the criteria it met, and the errors it hit on the way.
+    """
+    gates = entry.get("gates") or {}
+    tree = entry.get("tree") or {}
+    activity = entry.get("activity") or {}
+    harness = entry.get("harness") or {}
+    return {
+        "attempt": entry.get("attempt"),
+        "files_changed": tree.get("files_changed"),
+        "insertions": tree.get("insertions"),
+        "deletions": tree.get("deletions"),
+        "verdict": gates.get("verdict"),
+        # Scored over the gates named `acceptance-*`. NOT the same measure as the bench's
+        # criteria_met, which counts verification commands and is forced to 0 on an empty diff --
+        # a criterion that already passes over an untouched tree counts here and not there.
+        "criteria_passed": gates.get("acceptance_passed"),
+        "criteria_total": gates.get("acceptance_total"),
+        "criteria_basis": "gates",
+        "gates_failed": gates.get("failed"),
+        "gates_advisory": gates.get("advisory_failed"),
+        "iterations": activity.get("iterations"),
+        "tool_calls": activity.get("tool_calls"),
+        "tool_calls_total": activity.get("total_tool_calls"),
+        "write_calls": activity.get("write_calls"),
+        "shell_calls": activity.get("shell_calls"),
+        "errors": activity.get("errors"),
+        "harness_commit": harness.get("commit"),
+        "harness_dirty": harness.get("dirty"),
+        "provider_exit": entry.get("provider_exit"),
+    }
+
+
+def bench_detail(fields: dict) -> dict:
+    """The same questions, answered in the bench's own vocabulary.
+
+    The names differ from the journal's because the measurements differ; see criteria_basis.
+    """
+    return {
+        "attempt": as_int(fields.get("attempts")),
+        "verdict": fields.get("status"),
+        "criteria_passed": as_int(fields.get("criteria_met")),
+        "criteria_total": as_int(fields.get("criteria_total")),
+        "criteria_basis": "commands",
+        "model_requests": as_int(fields.get("model_requests")),
+        "truncated_requests": as_int(fields.get("truncated_requests")),
+        "context_overflows": as_int(fields.get("context_overflows")),
+        "scope_violations": as_int(fields.get("scope_violations")),
+        "empty_diff": as_int(fields.get("empty_diff")),
+        "deviations": as_int(fields.get("deviations")),
+        "blockers": as_int(fields.get("blockers")),
+        "rounds_to_green": as_int(fields.get("rounds_to_green")),
+        "harness_commit": fields.get("harness_commit"),
+        "harness_dirty": fields.get("harness_dirty") == "1",
+        "provider_exit": as_int(fields.get("exit_code")),
+    }
+
+
 def read_journals(roots: list[pathlib.Path]) -> tuple[list[dict], list[str]]:
     """Interactive rounds, one record per attempt."""
     rows, problems = [], []
@@ -102,7 +172,8 @@ def read_journals(roots: list[pathlib.Path]) -> tuple[list[dict], list[str]]:
                                  "provider": (entry.get("provider") or {}).get("name"),
                                  "slug": entry.get("slug"), "seconds": entry.get("seconds") or 0,
                                  "input": None, "output": None,
-                                 "outcome": entry.get("outcome")})
+                                 "outcome": entry.get("outcome"),
+                                 "detail": journal_detail(entry)})
                     continue
                 rows.append({"source": "journal", "project": project,
                              "when": entry.get("started_at") or entry.get("recorded_at"),
@@ -111,7 +182,8 @@ def read_journals(roots: list[pathlib.Path]) -> tuple[list[dict], list[str]]:
                              "slug": entry.get("slug"), "seconds": entry.get("seconds") or 0,
                              "input": tokens.get("input") or 0,
                              "output": tokens.get("output") or 0,
-                             "outcome": entry.get("outcome")})
+                             "outcome": entry.get("outcome"),
+                             "detail": journal_detail(entry)})
     return rows, problems
 
 
@@ -135,7 +207,10 @@ def read_ledger(path: pathlib.Path) -> tuple[list[dict], list[str]]:
                      "provider": entry.get("provider"), "slug": entry.get("slug"),
                      "seconds": entry.get("seconds") or 0,
                      "input": entry.get("input_presented"), "output": entry.get("output"),
-                     "outcome": None, "run_id": entry.get("run_id")})
+                     "outcome": None, "run_id": entry.get("run_id"),
+                     # The ledger is the copy that outlives a deleted repository, and it carries
+                     # usage alone: the tree, the gates and the activity went with the artifacts.
+                     "detail": {}})
     return rows, problems
 
 
@@ -168,7 +243,8 @@ def read_bench(bench: pathlib.Path) -> tuple[list[dict], list[str]]:
                      "seconds": int(fields.get("seconds") or 0),
                      "input": None if unattributable else int(fields.get("prompt_tokens") or 0),
                      "output": None if unattributable else int(fields.get("generated_tokens") or 0),
-                     "outcome": fields.get("outcome")})
+                     "outcome": fields.get("outcome"),
+                     "detail": bench_detail(fields)})
     return rows, problems
 
 
