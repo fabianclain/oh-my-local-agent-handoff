@@ -4,6 +4,7 @@
 #
 #   bench/graphs-pass <name> pure          no orchestrator; stops at the first rejection
 #   bench/graphs-pass <name> consult       asks Claude what kind of failure a rejection was
+#   GRAPHS_REROLL=2 bench/graphs-pass <name> pure    re-roll a rejected step twice
 #
 # Eight steps, in the order the original session ran them, from the tree as it stood before any
 # of the work existed. Plans are all present from the start; each step's reviewer test is staged
@@ -65,6 +66,21 @@ TREE="$("$HERE/monolith-worktree" "$NAME" "$BASE")" || { echo "could not build a
 ARGS=(--before-step "$HERE/stage-graph-test")
 [[ "$MODE" != consult ]] || ARGS+=(--consult claude)
 
+# How many extra independent rolls a rejected step gets. Off by default so every pass recorded
+# before this existed remains comparable with one recorded after it — a pass that silently started
+# re-rolling would make "landed N of 8" mean two different things in the same summary.tsv.
+#
+# Deliberately usable with MODE=pure. Re-roll and consult are separate variables and the point of
+# the bench is to move one at a time: consult CANCELS remaining rolls when it cannot confirm the
+# failure was the model's, so a consult pass measures the pair rather than the re-roll.
+[[ "${GRAPHS_REROLL:-0}" == 0 ]] || ARGS+=(--reroll "$GRAPHS_REROLL")
+
+# The recorded mode carries the re-roll count, in the existing field rather than a new one: the
+# summary is read by eye and a file with some 5-field rows and some 6-field rows is worse than a
+# self-describing label. "landed 3 of 8" means nothing without knowing how many rolls bought it.
+MODE_LABEL="$MODE"
+[[ "${GRAPHS_REROLL:-0}" == 0 ]] || MODE_LABEL="$MODE+reroll$GRAPHS_REROLL"
+
 cd "$TREE" || exit 1
 
 # The implementer is the local model in both modes. `--consult claude` names the ORCHESTRATOR,
@@ -74,7 +90,7 @@ export HANDOFF_PROVIDER=native
 
 LOG="$RESULTS/$NAME.log"
 {
-    echo "== $NAME ($MODE) started $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "== $NAME ($MODE_LABEL) started $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "   tree $TREE at $(git rev-parse --short HEAD)"
 } | tee "$LOG"
 
@@ -99,7 +115,7 @@ LANDED="$(git log --format='%ae' "$BASE"..HEAD 2>/dev/null | grep -cv '^reviewer
 # is here so that the row stays one row regardless of what the pipeline above ever becomes.
 [[ "$LANDED" =~ ^[0-9]+$ ]] || LANDED=0
 printf '%s\t%s\t%s\tlanded %s of %s\texit %s\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$NAME" "$MODE" "$LANDED" "${#STEPS[@]}" "$STATUS" \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$NAME" "$MODE_LABEL" "$LANDED" "${#STEPS[@]}" "$STATUS" \
     >>"$RESULTS/summary.tsv"
 
 # Keep the commits reachable after the worktree is reset for the next pass.
