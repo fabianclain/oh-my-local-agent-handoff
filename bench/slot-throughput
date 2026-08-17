@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""slot-throughput — what concurrency actually buys on one card, measured.
+
+    bench/slot-throughput [--concurrency 1,2,4] [--prompt-tokens 22000] [--predict 300]
+
+## Why this exists
+
+The server has always run with four slots and has never used more than one. Across 2,579 requests
+in one night of rounds, the maximum number of slots busy at the same moment was 1 — the harness
+issues one request per round and waits for it, so three quarters of the server sat idle.
+
+Whether that idle capacity is worth anything rests on one measured fact: **decode is 83.5% of GPU
+time** (17,332 s against 3,437 s of prefill), and decode on an MoE is memory-bandwidth bound. Two
+sequences decoding together read the active expert weights once and use them twice, so in theory
+the second stream is nearly free. Prefill is compute-bound and does not share that way.
+
+"In theory" is the reason for this file. The estimate from that split was ~1.7x for two concurrent
+rounds, and an estimate is not a measurement.
+
+## What it measured, and why the estimate was wrong
+
+    decode-dominant (1k prompt, 800 predict)     1 -> 66.5 tok/s
+                                                 2 -> 81.2  (1.22x)
+                                                 4 -> 85.3  (1.28x, saturated)
+
+    realistic shape (22k prompt, 300 predict)    1 -> 11.3 tok/s
+                                                 2 -> 12.0  (1.07x)
+
+The estimate applied DENSE-model batching logic to a mixture of experts, and that is exactly
+backwards. Batching a dense model amortises the weight read: the same matrices serve every sequence
+in the batch. In an MoE each token is routed to its own top-k experts, so a second sequence usually
+activates DIFFERENT experts and the weight read GROWS rather than being shared. A 3.6B-active MoE is
+the worst case for batched decode, not the best. Concurrency saturates at 1.28x by four streams.
+
+Weighting the decode-dominant figure by the real 83.5/16.5 split — prefill is compute-bound and
+purely additive, so it contributes no gain — gives about **1.18x for two concurrent real rounds**,
+so a concurrent pair costs ~1.70x the wall-clock of one round rather than the ~1.17x estimated.
+
+That number is what settles best-of-N on one card. At p=0.60 per roll (the measured rate for
+`crawler-graphs-2-collect`, 6 ACCEPT of 10), a 418 s median round and ~45 s to run the criteria:
+
+    sequential re-roll until accepted   1/0.60 x (T + V)         =  772 s   1.67 rounds of GPU
+    best-of-2 concurrent, one card      1/0.84 x (1.70T + V)     =  900 s   2.38 rounds of GPU
+    best-of-2 concurrent, two cards     1/0.84 x (1.00T + V)     =  551 s   2.38 rounds of GPU
+
+Re-rolling one at a time beats best-of-2 on a single card on both wall-clock and total GPU work,
+because a re-roll is only paid for when the previous roll actually failed while best-of-2 always
+pays for both. Best-of-2 becomes the better design only when the second stream is genuinely free —
+which needs a second card that can hold the whole model, not another slot on this one.
+
+## What is controlled, and why each control is here
+
+`ignore_eos` with a fixed `n_predict` makes every request perform EXACTLY the same amount of decode
+work. Without it a request that happens to stop early looks like a speedup.
+
+Prompt size is held constant across every concurrency level, so the only variable is how many
+requests are in flight. It is sized from real rounds — the median round presented 32,711 tokens —
+but capped so that the largest concurrency level under test still fits the shared KV budget.
+
+That budget is the trap. The server runs `kv_unified = true`, which means `-c` is the total across
+all concurrent requests rather than a per-slot allowance. At `-c 98304`, four requests of 30k
+tokens do not fit, and llama.cpp's default response to not fitting is to SHIFT the context —
+silently drop the oldest tokens and carry on. Every request's `truncated` flag is therefore checked
+and a truncated run is reported as void rather than as a result, because a fast number produced by
+quietly answering a shorter question is the one failure mode that would look like success.
+
+Distinct filler per request defeats prefix caching between slots. Sharing a prefix would make
+prefill nearly free for every request after the first, which is a real effect in production (~95%
+of context is served from cache) but would flatter a concurrency measurement.
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import json
+import sys
+import time
+import urllib.error
+import urllib.request
+
+ENDPOINT = "http://127.0.0.1:8071/completion"
+
+
+def build_prompt(approx_tokens: int, seed: int) -> str:
+    """A prompt of roughly `approx_tokens`, unique to `seed`.
+
+    Prose rather than repeated filler: llama.cpp's slot selection compares by longest common
+    prefix, so a shared opening would let one slot reuse another's cached prefill and the
+    measurement would be of caching rather than of concurrency.
+    """
+    head = f"Request {seed}. The following is a transcript numbered {seed * 7919}.\n"
+    body = []
+    n = 0
+    i = 0
+    # ~4 characters per token is close enough; the exact figure is read back from the server.
+    while n < approx_tokens * 4:
+        i += 1
+        line = f"[{seed}:{i}] entry {i * seed % 104729} recorded value {i * 31 + seed} and moved on.\n"
+        body.append(line)
+        n += len(line)
+    return head + "".join(body) + "\nSummarise the transcript above in detail.\n"
+
+
+def one_request(prompt: str, predict: int, seed: int) -> dict:
+    payload = json.dumps({
+        "prompt": prompt,
+        "n_predict": predict,
+        "ignore_eos": True,     # exactly `predict` tokens, so decode work is identical everywhere
+        "cache_prompt": False,  # no cross-request prefill reuse
+        "temperature": 0.8,
+        "seed": seed,
+    }).encode()
+    request = urllib.request.Request(
+        ENDPOINT, data=payload, headers={"Content-Type": "application/json"})
+    started = time.monotonic()
+    with urllib.request.urlopen(request, timeout=900) as response:
+        body = json.load(response)
+    elapsed = time.monotonic() - started
+    timings = body.get("timings", {})
+    return {
+        "wall": elapsed,
+        "predicted": timings.get("predicted_n"),
+        "prompt_n": timings.get("prompt_n"),
+        "prompt_ms": timings.get("prompt_ms", 0.0),
+        "predicted_ms": timings.get("predicted_ms", 0.0),
+        "truncated": bool(body.get("truncated")),
+    }
+
+
+def run_level(n: int, prompt_tokens: int, predict: int) -> dict:
+    prompts = [build_prompt(prompt_tokens, seed=100 + n * 10 + i) for i in range(n)]
+    started = time.monotonic()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n) as pool:
+        futures = [pool.submit(one_request, prompts[i], predict, 1000 + i) for i in range(n)]
+        results = [f.result() for f in futures]
+    wall = time.monotonic() - started
+    return {
+        "n": n,
+        "wall": wall,
+        "results": results,
+        "truncated": any(r["truncated"] for r in results),
+        "decode_tokens": sum(r["predicted"] or 0 for r in results),
+        "prompt_tokens": sum(r["prompt_n"] or 0 for r in results),
+    }
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--concurrency", default="1,2,4")
+    parser.add_argument("--prompt-tokens", type=int, default=22000)
+    parser.add_argument("--predict", type=int, default=300)
+    args = parser.parse_args(argv)
+
+    levels = [int(x) for x in args.concurrency.split(",") if x.strip()]
+
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:8071/health", timeout=10) as health:
+            json.load(health)
+    except (urllib.error.URLError, OSError) as exc:
+        print(f"server not reachable at {ENDPOINT}: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"prompt ~{args.prompt_tokens:,} tokens each, {args.predict} decode tokens each, "
+          f"ignore_eos, no prompt cache")
+    print()
+    print(f"{'conc':>5}  {'wall s':>8}  {'decode tok/s':>13}  {'per-stream':>11}  "
+          f"{'speedup':>8}  {'KV tok':>8}  trunc")
+    print("-" * 74)
+
+    baseline = None
+    rows = []
+    for n in levels:
+        row = run_level(n, args.prompt_tokens, args.predict)
+        aggregate = row["decode_tokens"] / row["wall"]
+        per_stream = aggregate / n
+        if n == 1:
+            baseline = row["wall"]
+        speedup = (baseline * n / row["wall"]) if baseline else float("nan")
+        rows.append((row, aggregate, speedup))
+        print(f"{n:>5}  {row['wall']:>8.1f}  {aggregate:>13.1f}  {per_stream:>11.1f}  "
+              f"{speedup:>7.2f}x  {row['prompt_tokens']:>8,}  "
+              f"{'VOID' if row['truncated'] else 'no'}")
+
+    print()
+    if any(r[0]["truncated"] for r in rows):
+        print("A request was TRUNCATED. Its numbers are void: the shared KV budget was exceeded and")
+        print("llama.cpp shifted the context, so that request answered a shorter question than it")
+        print("was given. Raise -c, or lower --concurrency / --prompt-tokens, and re-run.")
+        return 1
+
+    if baseline and len(rows) > 1:
+        best = max(rows[1:], key=lambda r: r[1])
+        print(f"Best aggregate decode was {best[1]:.0f} tok/s at concurrency {best[0]['n']} "
+              f"({best[2]:.2f}x one stream).")
+        print()
+        print("Read this against the split it was written to test: decode is 83.5% of real GPU time")
+        print("and prefill 16.5%, so a speedup here applies to most of a round but not all of it.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
