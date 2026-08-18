@@ -80,6 +80,26 @@ cannot be checked.
 - Anything where a plausible wrong answer is indistinguishable from a right one: dates, aggregate
   SQL, permissions, concurrency. Money is measurable and mostly fine — see below — but only with
   criteria that discriminate.
+- **Anything you could just do in five minutes, and quite a lot more than that.** This is now
+  measured rather than asserted. One three-file feature was built four times, twice by each route:
+
+      claude writes it directly    4:20 wall     59,418 Claude output tokens
+      harness, best of three runs 18:34 wall    118,555 Claude output tokens
+
+  **4.3x the wall clock and 2.0x the tokens**, and removing the time constraint does not help,
+  because the extra cost is tokens rather than minutes. Planning is 84% of it, and roughly 89% of
+  planning is DECIDING rather than writing — so a shorter plan saves almost nothing, and delegating
+  the decisions is the 0-accepted-in-7-rounds case below.
+
+  The ratio that decides it is specification against implementation: 712 lines authored (439 of
+  plan, 273 of judging tests) to ship 87. Specification cost is set by the SHAPE of the work,
+  implementation cost by its SIZE — so the route loses on small features and wins where one spec
+  drives a lot of code, or drives several features of the same shape.
+
+  It also buys something per-feature accounting cannot see: a sequence costs about two turns, so
+  the GPU is a second worker running while you do something else. Full numbers, phase by phase, in
+  `docs/economics.md`.
+
 - **Anything you could just do in five minutes.** Specification takes longer than a small change,
   and on a single small step it will lose on wall clock every time. Reported from real use: two
   steps that would each have taken about five minutes by hand cost considerably more to specify.
