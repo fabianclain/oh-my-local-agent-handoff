@@ -127,10 +127,87 @@ Sampling is at temperature 0.8, so **variance is a result, not noise**: if recal
 between samples of one task, the dossier is not a dependable input even when its average looks
 acceptable, because the planner cannot tell which sample it got.
 
-## Status
+## Result: gpt-oss-20b cannot survey, and the reason is not effort
 
-The instrument is built and controlled in both directions — a perfect dossier scores 1.00/1.00, a
-fabricated quote is caught at fidelity 0.00, and a 2-of-9 dossier passes the gate at recall 0.22.
-`tools/dossier-verify-selftest` mutation-tests all thirteen fabrication shapes.
+Six samples, two unrelated features, 56 minutes of GPU.
 
-Results against gpt-oss-20b are recorded below once the probe has run.
+| task | sample | verdict | fidelity | change surface | recall | code recall | unknowns |
+|---|---|---|---|---|---|---|---|
+| dead-hosts | 1 | fabricated | 0.50 | 4 files | 0.11 | 0.12 | 0 |
+| dead-hosts | 2 | trustworthy | 1.00 | **0 files** | 0.00 | 0.00 | 0 |
+| dead-hosts | 3 | fabricated | 1.00 | 5 files | 0.11 | 0.12 | 0 |
+| visual-track | 1 | fabricated | 0.86 | 3 files | 0.09 | 0.11 | 0 |
+| visual-track | 2 | fabricated | 1.00 | 4 files | 0.27 | 0.33 | 0 |
+| visual-track | 3 | fabricated | 0.71 | 4 files | 0.27 | 0.33 | 0 |
+
+**Recall 0.00–0.27, mean 0.14.** Not one sample found even a third of the files its feature
+touched. Five of six were caught fabricating. The single `trustworthy` verdict is the worst
+sample in the set: 751 seconds to produce a dossier claiming *nothing*, which passes a gate that
+can only check claims that exist.
+
+### It surveys lexically, not structurally
+
+This is the mechanism, and it is the same in both domains:
+
+    across all six surveys:  20 files proposed, 1 of them new
+    across both real changes: 20 files touched, 7 of them new
+
+The model looks for **files whose text contains the words in the task**. New files contain none of
+those words — they do not exist yet — so it proposes almost none. For `visual-track` it planned to
+display visual information the schema has nowhere to store, never once proposing a migration.
+
+That is not a diligence problem and no prompt fixes it. Roughly 35% of each real change was
+structure that had to be *invented*, and the search-shaped survey is blind to all of it by
+construction.
+
+### It never declares uncertainty
+
+`unknowns: 0` in all six, while covering a seventh of the change. The schema devotes a field to
+this, describes it as an answer rather than a failure, and states the model is not scored on
+confidence. It declined every time. A dossier cannot be safely consumed if the party writing it
+will not mark its own edges.
+
+### The gate works, and needs all three checks
+
+Sample 3 quoted **flawlessly — fidelity 1.00** — and was still fabricating: it ran
+`grep -R "DeadHost" -n tests/Feature`, which correctly returned nothing, then reported
+
+    tests/Feature/Crawler/DeadHostReportTest.php
+    tests/Feature/Crawler/DeadHostsPageTest.php
+
+as the result. It invented plausible filenames for the feature it was asked to survey, which would
+have told a planner that partial support already existed. **A quote-only gate would have passed
+this dossier.** The search replay is what caught it, and that is the argument for three independent
+claim shapes rather than one good one.
+
+### Variance is high relative to the mean
+
+`visual-track` drew 0.09, 0.27, 0.27; `dead-hosts` drew 0.11, 0.00, 0.11. A planner has no way to
+know which draw it received, so even the mean overstates what one dossier is worth.
+
+## What this settles
+
+**The orchestrator cannot stop reading.** Reading is where the 84% lives, and this was the one
+cheap way to move it. It does not move. The negative result stands and the route is closed at
+20B — not because implementation is weak, but because *deciding what must change* is, which is the
+same seam the implementation numbers already showed: plan 6a (design a partial) lost three rolls
+and 2,450 seconds, while plan 6b (register a section, with 5b already there to copy) landed 14/14
+first roll.
+
+**The boundary that predicts success is whether a sibling exists to copy** — not frontend versus
+backend, and not planning versus implementing. The local model is strong at producing another one
+of something and weak at establishing what is true. Every result in this project fits that line.
+
+**One confound was found and corrected.** The first run's export stripped `.git` to close a leak,
+so `git grep` answered "fatal: not a git repository" — and the model reported two files as its
+result anyway. The snapshot now runs `git init` with a single commit: the tool works, the future is
+still unreachable. A re-run of `dead-hosts` under the corrected instrument is recorded below.
+
+## What is NOT settled
+
+Whether a larger local model surveys. Nothing here separates "20B cannot do this" from "this is
+hard"; the failure shape — lexical search, no invented structure, no declared uncertainty — is
+characteristic of small models, but that is a hypothesis this probe cannot test.
+
+The instrument is reusable and the ground truth is free: point `bench/survey-probe` at another
+model and it answers in an hour.

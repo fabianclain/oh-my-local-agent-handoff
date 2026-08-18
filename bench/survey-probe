@@ -93,6 +93,19 @@ snapshot() {
     local dest="$WORK/$name"
     rm -rf "$dest"; mkdir -p "$dest"
     git -C "$MONOLITH" archive "$commit" | tar -x -C "$dest" || return 1
+    # A repository with exactly one commit and no future. The first run of this probe stripped
+    # git entirely, and the model paid for it: `git grep` answered "fatal: not a git repository",
+    # and rather than reporting the failure it reported two files as the result. A survey without
+    # a working `git grep` is being handicapped in a way the real workflow never would be, and
+    # `git init` gives the tool back without giving the answer back — one commit, so `git log`
+    # reaches nothing and there is no child commit to diff against.
+    #
+    # Committed BEFORE vendor is copied, deliberately: vendor stays untracked, so `git grep`
+    # searches the application only. The first run showed the model losing turns to vendor noise.
+    git -C "$dest" init -q 2>/dev/null || return 1
+    git -C "$dest" add -A 2>/dev/null
+    git -C "$dest" -c user.email=probe@bench -c user.name=probe \
+        commit -qm "snapshot" 2>/dev/null
     cp -al "$MONOLITH/vendor" "$dest/vendor" 2>/dev/null || true
     cp -a  "$MONOLITH/.env" "$dest/.env" 2>/dev/null || true
     mkdir -p "$dest/storage/framework/views" "$dest/storage/framework/cache/data" \
