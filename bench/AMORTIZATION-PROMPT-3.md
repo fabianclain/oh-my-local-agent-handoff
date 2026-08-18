@@ -39,6 +39,19 @@ that is what "amortize" means here. Do not create a new one and do not reset it.
 `/home/fabbs/dev/bench-trees/machine-panels` already exists, you are not feature 1 — check
 `git log --oneline` to see which panels have landed and confirm you are the next one.
 
+**Start each feature in a FRESH session, and inherit through the files rather than the
+conversation.** Reuse that only works because one session still remembers is not amortization — it
+is one long session, and it does not survive someone else building feature 3 next week. So the
+first thing feature 2, 3 and 4 do is read what the previous feature left on disk:
+
+    ls .claude/plans/machine-panels-*.md          # the plans, including the re-specified ones
+    ls tests/Feature/Machine/                     # the judging tests
+    git log --oneline                             # what landed, and in what order
+
+Those are the artifacts under test. Say in your report which of them you opened, which you copied
+from, and which turned out to be useless — that is the finding, and it is more informative than
+`T_plan` alone.
+
 ## Four clocks, and the ISO stamps that make the token split possible
 
     date +%s                      # durations
