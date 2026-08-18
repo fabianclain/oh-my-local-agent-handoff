@@ -201,7 +201,21 @@ of something and weak at establishing what is true. Every result in this project
 **One confound was found and corrected.** The first run's export stripped `.git` to close a leak,
 so `git grep` answered "fatal: not a git repository" — and the model reported two files as its
 result anyway. The snapshot now runs `git init` with a single commit: the tool works, the future is
-still unreachable. A re-run of `dead-hosts` under the corrected instrument is recorded below.
+still unreachable. A re-run of `dead-hosts` under the corrected instrument moved nothing:
+
+| run | sample 1 | sample 2 | sample 3 | new files proposed |
+|---|---|---|---|---|
+| original (no `.git`) | 0.11 | 0.00 | 0.11 | 1 of 9 |
+| corrected (`git grep` works) | 0.11 | 0.11 | 0.11 | **0 of 14** |
+
+The model reached for `git` **zero times out of three searches** in the first corrected sample,
+which is why the confound was smaller than it looked: it does not use the tool whose absence was
+handicapping it. Recall is flat at 0.11 across six samples of this task.
+
+The corrected run also produced the worst single dossier of the whole probe — sample 3 at
+**fidelity 0.111, eight of nine quotes absent** — while reading exactly as confident as the others.
+Nothing in its prose distinguishes it from sample 1 at 0.909. That is the case the gate exists for,
+and the only reason it is visible.
 
 ## What is NOT settled
 
