@@ -108,6 +108,31 @@ entry beside the page.
   return shape changes** — payloads are cached on the newest stored minute, which does not move
   when code adds a field.
 
+## Before you spend a round: prove the criteria can pass
+
+`handoff prepare` is a negative control — it shows every criterion failing now, which is what a
+not-yet-built step should do. It cannot distinguish "fails because the work is not done" from
+"fails because no tree could pass". That second case took **8 of feature 1's 9 rejected rounds**.
+
+So for every step, also run the positive control:
+
+    bench/audit-criteria <a tree holding the finished work> .claude/plans/<slug>.md
+
+Every criterion MUST pass there. Make that tree by applying your own dictated recipe by hand, then
+reverting — two minutes. The run that did this landed 3 of 3 steps first-roll; feature 1, which did
+not, lost 9 of 13 rounds and 8 were criteria written wrong.
+
+Three specific traps feature 1 paid for, all now checkable:
+
+- **No shell variables in a `## Steps` recipe.** A criterion is run by the harness as an argv list
+  where `$VAR` is safe; a recipe is run by the MODEL, which wraps it in `bash -lc "…"` and the
+  variable expands to nothing first. Cost: 3 rolls, 1.9M tokens. `plan-lint` now warns.
+- **Splice at a line number; never "insert before X".** Splicing landed first-roll in 84-128s;
+  "insert ~90 lines before the `energy()` docblock" took 3 rolls, 2,580s and 3.49M tokens — 42% of
+  the run — and never landed.
+- **`patch-shape` forbids removing an original line.** A step that must move lines cannot also
+  carry a no-deletion bound. Two rolls scored 16 of 17 against a criterion no tree could satisfy.
+
 ## The feature — read the FEATURE number on line 1
 
 **FEATURE = 1 — Pressure.** Introduce the section registry into `/machine`, and ship the first panel
