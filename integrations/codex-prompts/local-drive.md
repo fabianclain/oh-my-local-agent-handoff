@@ -231,6 +231,35 @@ the reasoning that produced them.
 This compounds with 3b rather than replacing it. Not polling takes 1,064 turns to 2. Driving from a
 small context makes each remaining turn ~14x cheaper.
 
+## 3d. What goes wrong while you are being quiet
+
+Silence is the rule for a HEALTHY run. Three failure modes break it legitimately, and all three have
+now happened.
+
+**A long sequence cannot run in the foreground.** The Bash tool enforces a hard ten-minute cap that
+the timeout parameter does not lift; a job past that returns exit 143 with no explanation. Background
+it, or `setsid` it. A sequence of three steps routinely runs 25 minutes and one has run over two
+hours.
+
+**A killed round leaves the tree dirty, and then nothing starts.** The kill lands mid-round, the
+model's partial work stays in the working tree, and every relaunch aborts in about a second on "the
+working tree is not clean" — which reads as the harness being broken rather than as residue from the
+thing you just killed. `git stash` it and relaunch. One run lost about three hours here.
+
+**Break silence for a specific suspicion, never for reassurance.** The best-behaved run so far broke
+it twice, both times prompted, and was RIGHT both times — the sequence really was dead. An
+instruction that holds while things are healthy and breaks when they are not is the behaviour you
+want. What it must not become is a status turn: "still running" costs a full context pass and tells
+you what the absence of a notification already told you.
+
+When you do check, check the machine and not the agent: `nvidia-smi`, `pgrep -af "handoff do"`, the
+run's `stdout.log`. Asking the driver how it is going costs a turn in both sessions and can be
+answered by a driver that is itself stuck.
+
+**And never relay a measurement taken against a broken tree.** One run reported 76 pre-existing suite
+failures that were an artefact of the model having wiped a file to zero bytes moments earlier; the
+finished tree was green. If the tree is mid-incident, say so instead of quoting a number from it.
+
 ## 4. When a round is rejected, find out which kind of failure it was
 
 ```bash

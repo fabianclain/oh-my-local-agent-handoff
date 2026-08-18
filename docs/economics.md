@@ -217,6 +217,21 @@ expensive run is that the reviewer was carrying the feature's design, plans and 
 re-read ~321k; in the re-run it was handed a one-page brief and two slugs and never loaded the
 feature at all.
 
+Every driving measurement taken, so the two factors can be read apart:
+
+| run | turns | cache_read | per turn | what the waiting session carried |
+| --- | --- | --- | --- | --- |
+| cmp-local-1 | 1,228 | 337.8M | 275k | the design, and it polled |
+| cmp-local-2 | 109 | — | — | the design, disciplined |
+| cmp-local-3 | 148 | 23.2M | 157k | the design, disciplined |
+| machine feature 1 | 257 *(+3 drivers)* | 66.1M | 237k | the design; waiting in subagents |
+| machine feature 2 | 1,877 | 603.6M | 322k | the design, and it polled |
+| re-run, driven from a subagent | 38 *(+63 driver)* | 5.1M | **57k / 46k** | a one-page brief and two slugs |
+
+The last row is the one that corrects the story. Its reviewer and its driver cost the same per turn —
+57k against 46k — so the subagent is not a cheaper place to wait. It is a place that never loaded
+the feature.
+
 **Cost is `turns x context size`, and the two move independently.** The subagent helps the second
 term by keeping the design out of the session that waits — which is real, and is why it stays — but
 "contain the polling" was the wrong description of why.
@@ -225,6 +240,22 @@ That re-run cannot settle the question either way: the plans were handed over kn
 was no re-specification to pay for, and both explanations predict a cheap run. What it does rule out
 is the reverse — driving from a subagent is not itself expensive. 101 turns and 5.1M cache reads
 against targets of ~250 and 80M.
+
+## The same plan is not the same round
+
+A plan that landed 14 of 14 on its first roll was re-run, unchanged, against the same base commit.
+It failed on the first attempt — the model wiped the target file to zero bytes, 0 insertions and 651
+deletions, and the gates caught it as `patch-damaged` at 2 of 14. It landed on the second.
+
+Nothing about the plan, the tree, the model or the harness differed. This is the variance the whole
+`--reroll` mechanism exists for, and it is worth stating plainly next to every other number here:
+a step's score is a sample, not a property. `crawler-graphs-2-collect` was accepted on 6 of 10
+independent attempts of an identical plan. Quoting "it landed 14/14 first roll" as though it were
+repeatable is the same mistake as quoting a single benchmark run.
+
+It is also the clearest evidence that the gates earn their place. A file reduced to zero bytes
+passes `php -l` — there is nothing left to be invalid — and would have been committed by anything
+reading the model's report rather than the tree.
 
 ## What is still unmeasured
 
