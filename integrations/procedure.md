@@ -72,13 +72,12 @@ cannot be checked.
   the GPU is a second worker running while you do something else. Full numbers, phase by phase, in
   `docs/economics.md`.
 
-- **Anything you could just do in five minutes.** Specification takes longer than a small change,
-  and on a single small step it will lose on wall clock every time. Reported from real use: two
-  steps that would each have taken about five minutes by hand cost considerably more to specify.
-  The value there was not speed — it was being forced to say exactly what "removed" means, which
-  caught a commented-out import that bold prose in the same plan had failed to prevent. Spend the
-  specification when the change is repetitive, spans many files, or is one you would have to
-  explain carefully anyway; skip it when you would type it faster than you can describe it.
+  What the specification buys, when it buys anything, is not speed. Reported from real use: two
+  steps that would each have taken five minutes by hand cost considerably more to specify, and the
+  value was being forced to say exactly what "removed" means — which caught a commented-out import
+  that bold prose in the same plan had failed to prevent. Spend it when the change is repetitive,
+  spans many files, or is one you would have to explain carefully anyway; skip it when you would
+  type it faster than you can describe it.
 
 ## What to expect
 
