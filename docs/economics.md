@@ -141,9 +141,43 @@ anything you would finish by hand in under an hour. The skill said this from int
 it was measured. It is now measured: **4.3x the wall clock and 2.0x the tokens for a three-file
 feature.**
 
+## Amortisation: tested, and it did not appear
+
+Two `/machine` panels built in sequence in one worktree, the second inheriting the first's registry,
+plans, tests and four hard-won facts. Normalised by what each actually shipped:
+
+| | feature 1 (pressure) | feature 2 (thermals) |
+| --- | --- | --- |
+| wall | 2:42:50 | 2:01:11 |
+| lines shipped | 618 | 153 |
+| rounds | 13 (9 rejected) | 9 (7 rejected) |
+| **seconds per shipped line** | **15.8** | **47.5** |
+| **Claude output per line** | **610** | **2,578** |
+| **GPU input per line** | **29,062** | **99,890** |
+
+The raw totals fell and the unit costs tripled. Feature 2 had the hard part built for it and was
+still **3.0x the wall clock, 4.2x the Claude tokens and 3.4x the GPU tokens per line**.
+
+**What did amortise** — and this part is real: the plan skeleton, the inlined-context tables, the
+"Output discipline" section, the splice primitive, the shell-quoting rule, and the whole architecture
+of the service test (a helper defaulting every measured column to NULL, a fixture with out-of-window
+and other-host rows, a worked example whose two wrong answers straddle the right one). Reading the
+previous feature's artifacts collapsed to about a minute, and reading them caught two defects
+feature 1 had shipped before any GPU time was spent.
+
+**What did not** is the thing that costs: writing a plan whose RECIPE survives execution. Both
+features lost their rounds the same way — plan, three rejected rolls, re-specify as `b`, land it —
+and in feature 2 both re-specifications were recipe mechanics again, not design.
+
+The decisive observation is feature 2's, and it is sharper than anything the tooling had:
+`bench/audit-criteria` passed 27 of 27 on a hand-built tree before the first round, **and the first
+round still failed.** A criterion audit proves the destination is reachable. Nothing proved the
+route was.
+
 ## What is still unmeasured
 
-Whether planning amortises. Every run above measured a single one-off feature, which is the worst
+Whether planning amortises across MORE than two features, or under a recipe discipline that did not
+exist while these two ran. Every run above measured a single one-off feature, which is the worst
 case the route has. Four `/machine` panels are being built in sequence to answer it; the number to
 watch is `T_plan` across features 2, 3 and 4, and the qualitative half is which artifacts a later
 feature actually reuses.

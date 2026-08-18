@@ -586,6 +586,88 @@ def check_recipe_shell(report: Report, text: str) -> None:
                 "Write every path out in full. It costs a longer line and survives any nesting.")
 
 
+# --- the recipe's mechanics: order dependence and idempotence ---------------------------------
+
+# A MUTATING sed carrying a numeric address: `sed -i '427r /tmp/b'`, `sed -i '313G'`, `sed -i '9d'`.
+# A read like `sed -n '298,372p'` is not one — it shifts nothing and repeats harmlessly.
+# Quoted OR bare. Real recipes write `sed -i 427rpath/to/block` with no quotes at all, and the
+# first version of this required them — so it missed the plan that lost three rolls to exactly
+# this and caught only the one that lost two.
+MUTATING_ADDR = re.compile(r"sed\b[^|;&]*?-i\s+'?\s*(\d+)\s*(?:,\s*\d+\s*)?([rRiaGdc])")
+# Operations that change the file every time they run. Re-running one after a partial round — which
+# the harness does, handing the model its failing commands — silently doubles the edit.
+NON_IDEMPOTENT = re.compile(r"'\s*\d+\s*(?:,\s*\d+\s*)?([GiaRr])\b|\bsed\b[^|;&]*\b(G|a\\\\|i\\\\)\b")
+
+
+def check_recipe_mechanics(report: Report, text: str) -> None:
+    """Line-numbered edits that fight each other, and edits that cannot be run twice.
+
+    Two failures from one feature, both in the recipe rather than the criteria, and both invisible
+    to every control that existed:
+
+    **More than one absolute line number.** A plan asked for a method at line 427 and a one-line log
+    entry at line 49. The model wrote the one-liner as three lines, everything below 49 moved, and
+    the 427 block landed inside another method's return array — `ParseError: unexpected token
+    "public"`. Three rolls, 2,450s, scores 1/12, 3/12, then 0/12 after it reduced a 651-line file to
+    two lines. The re-specification carried exactly ONE line number and landed 14/14 on the first
+    roll in 286s.
+
+    Telling it to "work bottom-up" does not help: prose is not a mechanism. That plan's two edits
+    WERE written in descending order — 427 before 49 — and it still failed, because the model does
+    not have to run them in the order they appear and nothing checks that it did. One line number
+    cannot be invalidated by another edit, so order stops mattering by construction.
+
+    Across the four plans of one feature this separates cleanly on outcome:
+
+        two line numbers   3 rolls lost, 2,450s          flagged
+        two line numbers   3 rolls lost                  flagged
+        two line numbers   rejected once, landed roll 2  flagged
+        ONE line number    14/14 on the first roll       clean
+
+    The third is the honest case for the rule: it worked, eventually, having spent a round. Getting
+    away with it is not the same as it being safe.
+
+    **An edit that is not idempotent.** `sed '313G'` appends a blank line. Told to run it, the model
+    ran it twice and produced two, failing `pint` at 16 of 17. The fix was to stop specifying the
+    repair at all and let `vendor/bin/pint <files>` make it — the project's own mandated step, which
+    is idempotent and produced exactly the intended change. That landed 17/17.
+
+    Why nothing else catches this: `bench/audit-criteria` passed 27 of 27 on a hand-built tree
+    before the first round, and the first round still failed. **A criterion audit proves the
+    destination is reachable; nothing proves the route is.** The gap is the `## Steps` block, and
+    this is the only check that reads it for mechanics rather than for shell quoting.
+    """
+    recipe = "\n".join(fenced_blocks(text, "steps"))
+    if not recipe:
+        return
+
+    addressed = [line.strip() for line in recipe.splitlines() if MUTATING_ADDR.search(line)]
+    if len(addressed) > 1:
+        report.warn("ordered-line-numbers",
+                    f"{len(addressed)} line-numbered edits in one recipe — each invalidates the "
+                    f"others' addresses",
+                    *addressed[:4],
+                    "The first edit moves every line below it, so the second lands somewhere else.",
+                    "A plan with two of these lost three rolls and 2,450s; its re-specification",
+                    "carried one and landed 14/14 on the first roll. 'Work bottom-up' in prose is",
+                    "not a mechanism — the model does not have to obey an ordering it cannot check.",
+                    "Carry at most ONE absolute line number and make every other edit",
+                    "order-independent: a unique-string substitution, or a formatter that owns the",
+                    "whitespace.")
+
+    unsafe = [line.strip() for line in recipe.splitlines()
+              if NON_IDEMPOTENT.search(line) and "-n" not in line]
+    if unsafe:
+        report.warn("non-idempotent-edit",
+                    f"{len(unsafe)} edit(s) change the file every time they run",
+                    *unsafe[:3],
+                    "The harness re-runs a round handing the model its failing commands, so an edit",
+                    "that is not idempotent gets applied twice. `sed '313G'` ran twice and produced",
+                    "two blank lines, failing the round at 16 of 17.",
+                    "Prefer an edit that is the same after one run or ten: a substitution against a",
+                    "unique string, or letting the project's formatter make the change.")
+
+
 def check_zero_assertions(report: Report, commands: list[str], repo: pathlib.Path) -> None:
     for index, command in enumerate(commands, 1):
         if not ZERO_ASSERTION.search(command):
@@ -715,6 +797,7 @@ def lint(path: pathlib.Path, repo: pathlib.Path) -> Report:
     check_whitespace(report, commands)
     check_reading_cost(report, text)
     check_recipe_shell(report, text)
+    check_recipe_mechanics(report, text)
     check_positive_counts(report, commands)
     check_zero_assertions(report, commands, repo)
     check_worked_example(report, text)
