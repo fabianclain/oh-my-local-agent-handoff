@@ -220,9 +220,12 @@ Then, in prose:
 
 - Do not write implementation code. The model does that or it does not get done.
 - Do not commit to `master`, do not push.
-- **Run the sequence with `run_in_background`, not a subagent.** You will be re-invoked when the
-  process exits. Subagents were tried and lost: four of them, three ran their command correctly and
-  then went idle without reporting, costing about twelve minutes with the sequence already finished.
-  An agent's "done" is a judgement; a process exit is a fact. Produce nothing while it runs, and do
-  not arm a per-step monitor — the journal has every verdict afterwards.
+- **Drive from a subagent, and tell it explicitly not to return until the sequence has exited.**
+  Both halves matter. The subagent is CONTAINMENT: you will probably poll despite being told not
+  to, and inside a subagent that costs ~36k a turn instead of ~321k. Measured across two features
+  of one series — with subagents, 257 parent turns and 66.1M cache reads; without, 1,877 turns and
+  603.6M, nine times the cost. The no-early-return half is separate: a driver that returns as soon
+  as it has backgrounded the sequence reports "finished" while step 1 is still running. Produce
+  nothing yourself while it runs, and do not arm a per-step monitor — the journal has every verdict
+  afterwards.
 - Report the unflattering numbers. A feature that does not land is the most useful result here.

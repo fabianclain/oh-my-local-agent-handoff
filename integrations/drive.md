@@ -150,19 +150,27 @@ files (65K), the project's crawler documentation (54K), three plans and three te
 authored. None of that is needed once the plans exist and the sequence is running. It is dead weight
 charged to every remaining turn.
 
-So drive from a fresh, minimal context. **Prefer a backgrounded command over a subagent.**
+So drive from a fresh, minimal context, and use **both** of these — they solve different problems
+and one run has now proved you need each:
 
-    run the sequence with run_in_background, and return
-    the harness re-invokes you when the process exits
+    a SUBAGENT, given only the slugs and the repository path
+    told explicitly not to return until the sequence has exited
 
-That is two turns, no polling, and the completion signal comes from the process exiting rather than
-from an agent deciding it is finished. A subagent was tried and lost: four of them, three ran their
-command correctly and then went idle without ever reporting, and about twelve minutes passed with
-the sequence finished and nobody told. An agent's "done" is a judgement; a process exit is a fact.
+**The subagent is containment, not notification.** That distinction was got wrong once, at cost.
+After a run whose three drivers went idle without reporting, the advice was changed to "use
+run_in_background instead" — reasoning that a process exit is a fact where an agent's "done" is a
+judgement. True, and beside the point. The next feature, driven without a subagent, went:
 
-Use a subagent only when the driving genuinely needs judgement DURING the run — narrowing a
-criterion between steps, deciding whether to re-roll. For "start it and tell me when it stops", a
-backgrounded command is strictly better and cannot go quiet.
+    with subagents      257 parent turns    66.1M cache_read   (incl. the drivers' own 5.3M)
+    without             1,877 turns        603.6M cache_read
+
+**Nine times the cost.** The subagents were never preventing the polling — they were holding it
+somewhere it was cheap, at ~36k per turn instead of ~321k. The reviewer polls either way; "produce
+nothing while a round runs" has been given three times and held twice.
+
+Which is the general rule worth taking from it: **when an instruction reliably fails to stick,
+contain the failure instead of repeating the instruction.** Containment held every time it was in
+place. So keep the subagent, and fix the reporting bug rather than removing the container.
 
 **The driver must not return until the sequence has actually finished.** This is the half that was
 missed the first time it was tried: the subagent backgrounded the sequence, returned in 55 seconds,

@@ -199,13 +199,14 @@ yourself.
 Three rules about HOW you wait, because the last run of this experiment spent more of the expensive
 model supervising than the other arm spent doing the work:
 
-1. **Run the sequence with `run_in_background`.** Not a subagent — four were tried across one
-   feature and three went idle after running their command correctly, costing ~12 minutes with the
-   sequence already finished. A backgrounded process re-invokes you on exit, which is a fact rather
-   than an agent's judgement, and costs the same two turns. Its context starts near
-   empty; yours is holding two skill files, 54K of crawler documentation, three plans and three test
-   files, and every turn re-sends all of it. Measured last time: 369k per turn here against 166k in
-   the arm that just wrote the code.
+1. **Drive from a subagent, and tell it explicitly not to return until the sequence has exited.**
+  Both halves matter. The subagent is CONTAINMENT: you will probably poll despite being told not
+  to, and inside a subagent that costs ~36k a turn instead of ~321k. Measured across two features
+  of one series — with subagents, 257 parent turns and 66.1M cache reads; without, 1,877 turns and
+  603.6M, nine times the cost. The no-early-return half is separate: a driver that returns as soon
+  as it has backgrounded the sequence reports "finished" while step 1 is still running. Produce
+  nothing yourself while it runs, and do not arm a per-step monitor — the journal has every verdict
+  afterwards.
 2. **Produce nothing while it runs.** No polling, no shell checks, no "standing by". You will be
    re-invoked when the subagent returns. The previous run emitted **1,218 assistant turns** against
    98 for the other arm, and almost all of the excess was this.
