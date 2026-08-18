@@ -174,6 +174,35 @@ The decisive observation is feature 2's, and it is sharper than anything the too
 round still failed.** A criterion audit proves the destination is reachable. Nothing proved the
 route was.
 
+## Executing the recipe does not catch recipe defects — tried, twice
+
+Every re-specification across two features was a `## Steps` recipe defect, so the obvious fix is a
+tool that runs the recipe in a scratch tree before spending a round. It was built and it does not
+work. Recorded here because it will be proposed again.
+
+**As an idempotence test** it flagged all four plans of one feature — including the one that landed
+14/14 on the first roll. `sed -i <N>r<file>` is deliberately not idempotent and it is the primitive
+this project recommends, so the check fires on the correct case. (It is also unnecessary: `--reroll`
+restores the tree, so a recipe always runs once on a clean one.)
+
+**As an execution test** — do all commands exit 0, do the touched files still parse — it missed both
+plans that actually failed and fired on one that landed:
+
+    plan     outcome                    executes cleanly?
+    6        3 rolls lost, 2,450s       yes
+    6b       14/14 first roll           yes
+    7        3 rolls lost               yes
+    7b       rejected once, then 17/17  no
+
+The reason is the same in both cases: these recipes execute perfectly. Plan 6's damage happened
+because the MODEL wrote the temp block twice, so three lines went in where the plan assumed one and
+every line below moved. Plan 7's happened because the model ran a `sed` twice. Neither is a property
+of the recipe you can observe by running it — both are properties of how a model reads it.
+
+So the best available check is structural, not empirical: `plan-lint` warns on more than one absolute
+line number and on non-splice non-idempotent edits, and that caught 3 of these 4. The fourth is
+model behaviour and no static check reaches it.
+
 ## What is still unmeasured
 
 Whether planning amortises across MORE than two features, or under a recipe discipline that did not
