@@ -164,6 +164,22 @@ So drive from a fresh, minimal context. Two ways, both fine:
   the parent spends exactly one turn waiting for it;
 - **a separate session**, if a person is starting it by hand.
 
+**The driver must not return until the sequence has actually finished.** This is the half that was
+missed the first time it was tried: the subagent backgrounded the sequence, returned in 55 seconds,
+and its "finished" signal fired while step 1 was still with the model. The parent then went silent
+waiting for a completion it had already been sent, and a person had to ask whether anything was
+running. A driver that returns early is worse than one that never existed — it converts "wait for
+the notification" into "wait forever".
+
+So the driver blocks. If it must poll to do that, it may: polling cost is the context it carries,
+and the driver's is small by construction. Measured on the same run —
+
+    driver subagent    14 messages,   512,947 cache_read   ~36k per turn
+    parent session   1,064 messages,     307.7M cache_read   ~290k per turn
+
+— which is the whole point of moving the waiting somewhere cheap. Eight times the polling in the
+driver still costs a fraction of one turn in the parent. What must not happen is the parent doing it.
+
 Either way the planner's session should END at the handoff. Its job finished when the plans passed
 `check-plan` and `prepare`; everything after that is operating, and operating needs the plans, not
 the reasoning that produced them.

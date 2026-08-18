@@ -200,7 +200,12 @@ Three rules about HOW you wait, because the last run of this experiment spent mo
 model supervising than the other arm spent doing the work:
 
 1. **Drive from a subagent, not from this session.** Spawn one, give it only the repository path and
-   the three slugs, and have it run the sequence and report the verdicts. Its context starts near
+   the three slugs, and have it run the sequence and report the verdicts. **Tell it not to return
+   until the sequence has exited.** A previous run's driver backgrounded the sequence and returned
+   in 55 seconds, so its "finished" signal arrived while step 1 was still running and the parent
+   waited silently for a completion it had already been sent. The driver may poll to stay alive —
+   its context is ~36k per turn against the parent's ~290k, which is why the waiting was moved
+   there. Its context starts near
    empty; yours is holding two skill files, 54K of crawler documentation, three plans and three test
    files, and every turn re-sends all of it. Measured last time: 369k per turn here against 166k in
    the arm that just wrote the code.
