@@ -182,8 +182,9 @@ Then, in prose:
 
 - Do not write implementation code. The model does that or it does not get done.
 - Do not commit to `master`, do not push.
-- **Drive the sequence from a subagent, and tell it not to return until the sequence has exited.**
-  A previous run's driver backgrounded the sequence and returned in 55 seconds, so its "finished"
-  signal arrived while step 1 was still running. Produce nothing yourself while it runs; you will be
-  re-invoked. Do not arm a per-step monitor — the journal has every verdict afterwards.
+- **Run the sequence with `run_in_background`, not a subagent.** You will be re-invoked when the
+  process exits. Subagents were tried and lost: four of them, three ran their command correctly and
+  then went idle without reporting, costing about twelve minutes with the sequence already finished.
+  An agent's "done" is a judgement; a process exit is a fact. Produce nothing while it runs, and do
+  not arm a per-step monitor — the journal has every verdict afterwards.
 - Report the unflattering numbers. A feature that does not land is the most useful result here.

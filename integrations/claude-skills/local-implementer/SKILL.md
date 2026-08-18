@@ -836,6 +836,59 @@ This is why there are two skills rather than one. The seat that decides a reject
 must not be the seat that wrote the criterion it failed — and keeping them in one context loses that
 separation as well as the tokens.
 
+## Prove the criteria can pass before you spend a round on them
+
+`handoff prepare` is a NEGATIVE control: it runs every criterion and shows you they fail now, which
+is what a not-yet-implemented step should do. It cannot tell "fails because the work is not done"
+from "fails because no tree could ever pass" — and that second case has now cost three separate
+runs. A `grep -c … -eq 3` no line could satisfy. A `pint --test app routes resources` tripping on
+debt that predates the branch. A `patch-shape` bound forbidding a deletion the step required, where
+two rolls scored 16 of 17 and the missing criterion was unreachable.
+
+The positive control is `bench/audit-criteria`, and it already exists:
+
+```bash
+bench/audit-criteria <worktree-holding-the-finished-work> .claude/plans/<slug>.md
+```
+
+Run against a tree that holds the answer, every criterion MUST pass. One that does not is defective,
+and every round spent on it measures your test rather than the model.
+
+You usually have such a tree, or can make one in two minutes: apply your own dictated recipe by
+hand, run the criteria, revert. The run that did this — spiking the query shape before specifying
+it — landed **3 of 3 steps on the first roll**. The run that skipped it lost **9 of 13 rounds, 8 of
+them to criteria the reviewer had written wrong**.
+
+It is the highest-value habit in this document and it needs no tooling you do not have.
+
+## Two primitives for editing a file that already exists
+
+**Splice from a file. Do not say "insert before X".**
+
+```bash
+# write the block to a temp file, then place it by line number, bottom-up so no anchor moves
+sed -i '297r /tmp/block.txt' resources/views/pages/machine/⚡monitor.blade.php
+```
+
+Measured on one feature, same model, same afternoon:
+
+| what the step was told | rounds | seconds | input tokens |
+| --- | --- | --- | --- |
+| splice a block at a line number | 1 | 84-128 | 108k-235k |
+| "insert ~90 lines before the `energy()` docblock" | **3, all rejected at 1/11** | 2,580 | **3.49M** |
+
+That second step was 42% of the run's input tokens and never landed. A mid-class surgical insertion
+makes the model read its way to the anchor — `read_files` returns about 20k at a time — so it holds
+a long conversation before writing a character, and it duplicated methods, dropped a terminator and
+added the same import twice. Both steps that used a line-numbered splice landed first-roll at full
+score.
+
+**Never drop a formatter criterion because it currently passes.** `vendor/bin/pint --dirty --test`
+reporting "passes" on an untouched tree is not evidence it cannot fail — it is the definition of a
+guard. A reviewer removed it from three plans for exactly that reason and the feature shipped with a
+dirty file that `invisible-characters`, `process-commentary` and `blade-balance` all waved through.
+Pint does lint the PHP block inside a `.blade.php`.
+
 ## Assert the thing, not a number about it
 
 Never write a criterion that counts occurrences. It has now cost two runs of the same benchmark,

@@ -170,11 +170,19 @@ files (65K), the project's crawler documentation (54K), three plans and three te
 authored. None of that is needed once the plans exist and the sequence is running. It is dead weight
 charged to every remaining turn.
 
-So drive from a fresh, minimal context. Two ways, both fine:
+So drive from a fresh, minimal context. **Prefer a backgrounded command over a subagent.**
 
-- **a subagent**, given only the slugs and the repository path. Its context starts near empty, and
-  the parent spends exactly one turn waiting for it;
-- **a separate session**, if a person is starting it by hand.
+    run the sequence with run_in_background, and return
+    the harness re-invokes you when the process exits
+
+That is two turns, no polling, and the completion signal comes from the process exiting rather than
+from an agent deciding it is finished. A subagent was tried and lost: four of them, three ran their
+command correctly and then went idle without ever reporting, and about twelve minutes passed with
+the sequence finished and nobody told. An agent's "done" is a judgement; a process exit is a fact.
+
+Use a subagent only when the driving genuinely needs judgement DURING the run — narrowing a
+criterion between steps, deciding whether to re-roll. For "start it and tell me when it stops", a
+backgrounded command is strictly better and cannot go quiet.
 
 **The driver must not return until the sequence has actually finished.** This is the half that was
 missed the first time it was tried: the subagent backgrounded the sequence, returned in 55 seconds,

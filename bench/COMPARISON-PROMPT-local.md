@@ -199,13 +199,10 @@ yourself.
 Three rules about HOW you wait, because the last run of this experiment spent more of the expensive
 model supervising than the other arm spent doing the work:
 
-1. **Drive from a subagent, not from this session.** Spawn one, give it only the repository path and
-   the three slugs, and have it run the sequence and report the verdicts. **Tell it not to return
-   until the sequence has exited.** A previous run's driver backgrounded the sequence and returned
-   in 55 seconds, so its "finished" signal arrived while step 1 was still running and the parent
-   waited silently for a completion it had already been sent. The driver may poll to stay alive —
-   its context is ~36k per turn against the parent's ~290k, which is why the waiting was moved
-   there. Its context starts near
+1. **Run the sequence with `run_in_background`.** Not a subagent — four were tried across one
+   feature and three went idle after running their command correctly, costing ~12 minutes with the
+   sequence already finished. A backgrounded process re-invokes you on exit, which is a fact rather
+   than an agent's judgement, and costs the same two turns. Its context starts near
    empty; yours is holding two skill files, 54K of crawler documentation, three plans and three test
    files, and every turn re-sends all of it. Measured last time: 369k per turn here against 166k in
    the arm that just wrote the code.

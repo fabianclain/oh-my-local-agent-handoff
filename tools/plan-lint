@@ -529,6 +529,63 @@ def check_reading_cost(report: Report, text: str) -> None:
                 "still see it; inlining the facts is what removes the round trip.")
 
 
+# --- the recipe the model runs, as opposed to the criteria the harness runs -------------------
+
+# `$VAR`, `${VAR}`, `$(cmd)` and backticks, in a fenced block under "## Steps".
+FRAGILE_SHELL = re.compile(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|\$\(|`")
+
+
+def fenced_blocks(text: str, heading: str) -> list[str]:
+    """Every line inside fenced blocks under one heading. Unlike verification_commands, which stops
+    at the first block, a Steps section legitimately has several."""
+    out, in_section, in_block = [], False, False
+    for line in text.splitlines():
+        match = HEADING.match(line)
+        if match:
+            in_section = match.group(1).lower().startswith(heading)
+            in_block = False
+            continue
+        if in_section and line.startswith("```"):
+            in_block = not in_block
+            continue
+        if in_section and in_block and line.strip():
+            out.append(line)
+    return out
+
+
+def check_recipe_shell(report: Report, text: str) -> None:
+    """A recipe under "## Steps" that only survives being run exactly once.
+
+    The criteria under "## Verification" are executed by the harness as an argv list — `bash -o
+    pipefail -c <command>` — so a `$VAR` in one is fine. A recipe under "## Steps" is different:
+    it is prose addressed to the MODEL, and the model decides how to run it. Observed doing so by
+    wrapping it in `bash -lc "…"`, which adds a shell layer that expands the variable before the
+    inner shell ever sees it:
+
+        bash -o pipefail -c 'P=/tmp/x; echo "[$P]"'                 ->  [/tmp/x]
+        bash -o pipefail -c 'bash -lc "P=/tmp/x; echo [$P]"'        ->  []
+        bash -o pipefail -c 'bash -lc "echo [/tmp/x]"'              ->  [/tmp/x]
+
+    Cost: three rolls of one step, ~1830s and 1.9M tokens. The model diagnosed it correctly on its
+    own — it ran `bash -lc "P='test'; echo $P"`, got nothing back, then burned the round on nested
+    escaping before restoring the file from git.
+
+    Nothing checked this because nothing reads "## Steps" at all; check-plan and the rest only ever
+    looked at the criteria. A recipe with every path written out in full survives any number of
+    shell layers, which is the whole fix.
+    """
+    hits = [line.strip() for line in fenced_blocks(text, "steps") if FRAGILE_SHELL.search(line)]
+    if not hits:
+        return
+    report.warn("fragile-recipe",
+                f"{len(hits)} line(s) under '## Steps' use a shell variable or substitution",
+                *hits[:4],
+                "A criterion is run by the harness as an argv list, so `$VAR` there is safe. A",
+                "RECIPE is run by the model, which has been observed wrapping it in bash -lc \"…\" —",
+                "and that extra layer expands the variable to nothing before the inner shell sees it.",
+                "Write every path out in full. It costs a longer line and survives any nesting.")
+
+
 def check_zero_assertions(report: Report, commands: list[str], repo: pathlib.Path) -> None:
     for index, command in enumerate(commands, 1):
         if not ZERO_ASSERTION.search(command):
@@ -657,6 +714,7 @@ def lint(path: pathlib.Path, repo: pathlib.Path) -> Report:
     check_colour(report, commands)
     check_whitespace(report, commands)
     check_reading_cost(report, text)
+    check_recipe_shell(report, text)
     check_positive_counts(report, commands)
     check_zero_assertions(report, commands, repo)
     check_worked_example(report, text)
