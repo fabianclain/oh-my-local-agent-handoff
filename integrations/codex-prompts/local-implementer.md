@@ -775,6 +775,54 @@ service-and-view step becomes a service step and a view step.
 loop does not yet. Treat it as the best available reasoning, and be ready to find it wrong — two
 other plausible improvements to the retry path already were.
 
+## Quote what the step needs; do not point at where it lives
+
+A plan that says "read `CrawlHost.php` for the columns" has bought the model a round trip. A plan
+that writes the four column names down has not. This is the cheapest change measured here and it is
+invisible until you look at the per-step numbers.
+
+One run, three steps, one feature, same model and same afternoon:
+
+| step | what the plan gave it | wall | iterations | input tokens |
+| --- | --- | --- | --- | --- |
+| 1 — the service | 3 files to go and learn from | **467s** | **81** | **1,937,495** |
+| 2 — the page | 1 pattern to copy, rest inlined | 150s | 14 | 152,278 |
+| 3 — the route | the exact line, quoted | **70s** | **18** | **103,729** |
+
+Step 1 was **88% of the run's GPU tokens** and it wrote forty lines. The difference was not
+difficulty. Its plan pointed at `CrawlHost`, `CrawlUrl` and `HostHealthService` so the model could
+find out what the columns and the frontier states were called; steps 2 and 3 were told, and step 3 —
+which was handed its one line verbatim — finished in seventy seconds.
+
+Every fact the model must fetch is a read, a round trip, and the entire context re-sent. You already
+know the four column names. Writing them costs you a line and saves it a file.
+
+```markdown
+## Files to read, not modify
+
+| Path | Why |
+| --- | --- |
+| `tests/…/DeadHostReportTest.php` | written by the reviewer; it judges this change |
+| `app/…/Models/CrawlHost.php`     | the table this reads          ← a round trip
+```
+
+```markdown
+`crawl_hosts` carries `host`, `status` (`ok` / `unreachable`), `consecutive_failures`,
+`last_reason`, `last_probed_at`. `CrawlUrl::STATE_PENDING` and `STATE_LEASED` are the two
+frontier states that count as waiting.                                ← no round trip
+```
+
+Keep the file listed if the model should still see it. Listing it is not the cost; needing it is.
+
+**The judge test is the exception and must never be inlined.** It is named so the model does not
+edit it, and quoting the assertions into the plan would hand it the answers.
+
+`plan-lint` notes this: a "Files to read, not modify" entry whose stated reason is a schema, a set of
+states, a pattern or a signature gets flagged, while one that hands over a finished artifact
+("step 1's output") does not. It is a note rather than a warning because it rests on a single run —
+and it is keyed on the REASON rather than the file count, because counting rows fired on all three
+steps above and told you nothing.
+
 ## Hand the plans over, then stop
 
 Writing the plans and driving them are different jobs, and doing both in one session is measurably

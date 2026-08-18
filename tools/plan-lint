@@ -472,6 +472,63 @@ def check_positive_counts(report: Report, commands: list[str]) -> None:
             break
 
 
+# --- reading the model has to do before it can start ------------------------------------------
+
+# A "Files to read, not modify" entry whose stated reason is that the model must LEARN something
+# from it — a schema, a set of states, a pattern to copy. Distinguished from an entry that hands it
+# a finished artifact ("step 1's output"), which costs a cheap read of something small and known.
+LEARNING_REASON = re.compile(
+    r"\b(table|tables|column|columns|schema|state|states|shape|pattern|convention|conventions|"
+    r"signature|signatures|enum|constants|fields?)\b", re.IGNORECASE)
+FINISHED_REASON = re.compile(r"\b(step \d|output|finished|judges? this|written by the reviewer)\b",
+                             re.IGNORECASE)
+
+
+def check_reading_cost(report: Report, text: str) -> None:
+    """How much the step must go and find out before it can write anything.
+
+    Measured on one run, three steps of one feature, same model and same day:
+
+        3 files to learn from    467s   81 iterations   1,937,495 input tokens
+        1 file  to learn from    150s   14 iterations     152,278
+        0 files to learn from     70s   18 iterations     103,729
+
+    Step 1 was 88% of that run's GPU tokens, and the difference was not difficulty — it wrote 40
+    lines — but that the plan POINTED at CrawlHost, CrawlUrl and HostHealthService instead of
+    quoting the four column names it needed. Every fact fetched is a read, a round trip and a
+    re-sent context.
+
+    The same plan quoted the route line it wanted verbatim, and that step took 70 seconds.
+
+    A note rather than a warning, and deliberately so: this is one run. The trigger reads the
+    REASON column rather than counting rows, because a plan naming three files it produced itself
+    is cheap and a plan naming one unfamiliar schema is not — counting rows cannot tell those apart
+    and fired on all three steps here.
+    """
+    rows = []
+    for line in sections(text).get("files to read, not modify", []):
+        if not line.startswith("|"):
+            continue
+        cells = [c.strip().strip("`") for c in line.split("|")[1:-1]]
+        if len(cells) < 2 or cells[0] in ("Path", "") or set(cells[0]) <= set("- "):
+            continue
+        why = cells[1]
+        if LEARNING_REASON.search(why) and not FINISHED_REASON.search(why):
+            rows.append((cells[0], why))
+    if not rows:
+        return
+    report.note("reading-before-writing",
+                f"{len(rows)} file(s) are named for the implementer to learn from, not to consume",
+                *[f"{path} — {why}" for path, why in rows],
+                "Each is a fact the model must go and fetch before it can write: a read, a round",
+                "trip, and the whole context re-sent. Measured across three steps of one feature,",
+                "3 such files cost 467s and 81 iterations against 70s and 18 for a step with none —",
+                "88% of that run's GPU tokens, for a step that wrote 40 lines.",
+                "Quote what the step needs — the four column names, the enum values, the signature —",
+                "the way you would quote a line of code. Keep the file listed if the model should",
+                "still see it; inlining the facts is what removes the round trip.")
+
+
 def check_zero_assertions(report: Report, commands: list[str], repo: pathlib.Path) -> None:
     for index, command in enumerate(commands, 1):
         if not ZERO_ASSERTION.search(command):
@@ -599,6 +656,7 @@ def lint(path: pathlib.Path, repo: pathlib.Path) -> Report:
     check_states(report, text)
     check_colour(report, commands)
     check_whitespace(report, commands)
+    check_reading_cost(report, text)
     check_positive_counts(report, commands)
     check_zero_assertions(report, commands, repo)
     check_worked_example(report, text)
