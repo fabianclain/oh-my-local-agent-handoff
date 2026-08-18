@@ -188,9 +188,25 @@ judgement. True, and beside the point. The next feature, driven without a subage
 somewhere it was cheap, at ~36k per turn instead of ~321k. The reviewer polls either way; "produce
 nothing while a round runs" has been given three times and held twice.
 
-Which is the general rule worth taking from it: **when an instruction reliably fails to stick,
-contain the failure instead of repeating the instruction.** Containment held every time it was in
-place. So keep the subagent, and fix the reporting bug rather than removing the container.
+**But the container is not where the saving comes from, and a controlled re-run said so.** Driving
+the same two plans from a subagent, with the reviewer handed only a one-page brief and two slugs:
+
+    reviewer session    38 turns   ~57k cache_read per turn
+    driver subagent     63 turns   ~46k per turn
+
+The same order of magnitude. The 9x is not "subagent turns are cheap" — it is that a session which
+never loaded the feature has a light context whatever it does. In the expensive run the reviewer was
+carrying the design, the plans and the diff, so every turn re-read all of it at ~321k.
+
+So the real rule is about **context weight, not containment**: the session that does the waiting must
+not be the session that holds the design. A subagent is one way to get that, and handing the plans to
+a fresh session is another. What the subagent adds on top is that its turns cannot leak back into the
+planner's context at all.
+
+Two things follow. Total cost is `turns x context size`, and both move independently — so measure
+both, because a run can look cheap for having few turns and still carry a ruinous per-turn cost.
+And when an instruction reliably fails to stick, containing the failure beats repeating the
+instruction: "produce nothing while a round runs" has now been given four times and held three.
 
 **The driver must not return until the sequence has actually finished.** This is the half that was
 missed the first time it was tried: the subagent backgrounded the sequence, returned in 55 seconds,

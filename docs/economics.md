@@ -203,6 +203,29 @@ So the best available check is structural, not empirical: `plan-lint` warns on m
 line number and on non-splice non-idempotent edits, and that caught 3 of these 4. The fourth is
 model behaviour and no static check reaches it.
 
+## Turns x context, not containment — a correction
+
+The 9x gap between two features driven differently (257 turns / 66.1M with subagents against 1,877 /
+603.6M without) was read as the subagent containing the polling somewhere cheap. A controlled re-run
+of the same two plans says that is the wrong mechanism:
+
+    reviewer session    38 turns    ~57k cache_read per turn
+    driver subagent     63 turns    ~46k per turn
+
+The same order of magnitude. Subagent turns are not intrinsically cheap. What differed in the
+expensive run is that the reviewer was carrying the feature's design, plans and diff, so every turn
+re-read ~321k; in the re-run it was handed a one-page brief and two slugs and never loaded the
+feature at all.
+
+**Cost is `turns x context size`, and the two move independently.** The subagent helps the second
+term by keeping the design out of the session that waits — which is real, and is why it stays — but
+"contain the polling" was the wrong description of why.
+
+That re-run cannot settle the question either way: the plans were handed over known-good, so there
+was no re-specification to pay for, and both explanations predict a cheap run. What it does rule out
+is the reverse — driving from a subagent is not itself expensive. 101 turns and 5.1M cache reads
+against targets of ~250 and 80M.
+
 ## What is still unmeasured
 
 Whether planning amortises across MORE than two features, or under a recipe discipline that did not
