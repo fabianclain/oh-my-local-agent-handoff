@@ -142,6 +142,34 @@ unbalanced wrong-closer "does not close" <<'BLADE'
 @endforeach
 BLADE
 
+# The PHP header is stripped before directives are counted, because every Livewire page here opens
+# with one and a `@if` inside it is prose or a string. Both halves of that need a case: the strip
+# must not swallow a real fault in the template that follows it, and the header must not invent one.
+unbalanced fault-after-php-header "never closed" <<'BLADE'
+<?php
+/**
+ * A docblock that says @endif and @if, which are words here, not directives.
+ */
+new class extends Component {
+    public string $q = '@if';
+}; ?>
+<div>
+@if ($a)
+    <p>a</p>
+</div>
+BLADE
+
+balanced php-header-mentioning-directives <<'BLADE'
+<?php
+/**
+ * Inline `@if`s would have to close mid-word, so this page assembles the sentence in PHP.
+ */
+new class extends Component {
+    public string $marker = '@foreach';
+}; ?>
+<div><p>done</p></div>
+BLADE
+
 unbalanced orphan-else "belongs to" <<'BLADE'
 <p>hello</p>
 @else

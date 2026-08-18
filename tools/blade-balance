@@ -91,6 +91,11 @@ DIRECTIVE = re.compile(r"@(\w+)")
 COMMENT = re.compile(r"\{\{--.*?--\}\}", re.DOTALL)
 # `@@if` is an escaped literal, not a directive.
 ESCAPED = re.compile(r"@@\w+")
+# A `<?php ... ?>` block is PHP, not template. Every Livewire page in this project opens with one
+# — the inline class syntax — and a `@if` inside it is a docblock word or a string, never a
+# directive. This was found by the selftest going red on a shipped view whose docblock explains
+# why the author avoided inline `@if`s: the sentence describing them was counted as one.
+PHP_BLOCK = re.compile(r"<\?php.*?\?>", re.DOTALL)
 
 
 def has_parens(source: str, end: int) -> bool:
@@ -112,7 +117,9 @@ def check(path: str) -> list[str]:
     except OSError as exc:
         return [f"cannot read: {exc}"]
 
+    # Newlines are preserved in place of every stripped span so reported line numbers stay true.
     source = COMMENT.sub(lambda m: "\n" * m.group(0).count("\n"), source)
+    source = PHP_BLOCK.sub(lambda m: "\n" * m.group(0).count("\n"), source)
     source = ESCAPED.sub("", source)
 
     problems: list[str] = []
