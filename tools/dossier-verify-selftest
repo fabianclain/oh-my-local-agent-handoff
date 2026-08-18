@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+#
+# dossier-verify-selftest — prove the gate fails, not just that it passes.
+#
+#   tools/dossier-verify-selftest
+#
+# A gate that has only ever been shown an honest input is not known to be a gate. This project has
+# already thrown away a tool for exactly that reason — tools/recipe-check passed its happy path,
+# and when it was finally pointed at the four real plans it flagged all four including the one
+# that landed 14/14, and missed both that actually failed. So every fabrication shape this file
+# claims to catch gets its own case here, built by mutating an honest dossier one field at a time.
+#
+# The fixture is a throwaway git repo in a temp directory. It is deliberately tiny: the thing under
+# test is the checking, not the reading.
+
+set -uo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+VERIFY="$HERE/dossier-verify"
+PASS=0; FAIL=0
+
+FIX="$(mktemp -d)"
+trap 'rm -rf "$FIX"' EXIT
+
+mkdir -p "$FIX/app" "$FIX/tests"
+cat > "$FIX/app/Widget.php" <<'PHP'
+<?php
+
+class Widget
+{
+    public function spin(int $times): int
+    {
+        return $times * 2;
+    }
+}
+PHP
+cat > "$FIX/tests/WidgetTest.php" <<'PHP'
+<?php
+
+it('spins twice', function () {
+    expect((new Widget)->spin(2))->toBe(4);
+});
+PHP
+
+honest() {
+cat <<'JSON'
+{
+  "understanding": "Widgets spin.",
+  "searches": [
+    {"command": "grep -rn 'function spin' app", "why": "find the method",
+     "result_paths": ["app/Widget.php"], "truncated": false}
+  ],
+  "evidence": [
+    {"path": "app/Widget.php", "quote": "        return $times * 2;", "what_it_shows": "the multiplier"}
+  ],
+  "change_surface": [
+    {"path": "app/Widget.php", "exists": true, "change": "add a divisor", "why": "it holds spin"},
+    {"path": "app/Gadget.php", "exists": false, "change": "new class", "why": "nothing holds this"}
+  ],
+  "conventions": [
+    {"claim": "classes are plain PHP", "example_path": "app/Widget.php",
+     "example_quote": "class Widget"}
+  ],
+  "existing_tests": [
+    {"path": "tests/WidgetTest.php", "quote": "it('spins twice', function () {",
+     "covers": "spin"}
+  ],
+  "verification_commands": [],
+  "unknowns": []
+}
+JSON
+}
+
+# case <name> <expected-exit> <jq-style python mutation, or ''>
+case_is() {
+    local name="$1" want="$2" mutate="${3:-}"
+    local file="$FIX/dossier.json"
+    if [[ -n "$mutate" ]]; then
+        honest | python3 -c "
+import json,sys
+d = json.load(sys.stdin)
+$mutate
+json.dump(d, sys.stdout)
+" > "$file"
+    else
+        honest > "$file"
+    fi
+    local out; out="$("$VERIFY" "$file" --repo "$FIX" 2>&1)"; local got=$?
+    if [[ "$got" == "$want" ]]; then
+        PASS=$((PASS+1)); printf '  ok    %s\n' "$name"
+    else
+        FAIL=$((FAIL+1)); printf '  FAIL  %s (wanted exit %s, got %s)\n%s\n' "$name" "$want" "$got" "$out"
+    fi
+}
+
+echo "dossier-verify selftest"
+
+case_is "an honest dossier passes" 0 ""
+
+case_is "an invented quote is caught" 1 \
+    "d['evidence'][0]['quote'] = '        return \$times * 3;'"
+
+case_is "a real quote attributed to the wrong file is caught" 1 \
+    "d['evidence'][0]['path'] = 'tests/WidgetTest.php'"
+
+case_is "a quote from a file that does not exist is caught" 1 \
+    "d['evidence'][0]['path'] = 'app/Nowhere.php'"
+
+case_is "an existing file called new is caught" 1 \
+    "d['change_surface'][1]['path'] = 'app/Widget.php'"
+
+case_is "a new file that is not new is caught" 1 \
+    "d['change_surface'][0]['exists'] = False"
+
+case_is "a search claiming a file it does not return is caught" 1 \
+    "d['searches'][0]['result_paths'].append('app/Ghost.php')"
+
+case_is "an invented convention example is caught" 1 \
+    "d['conventions'][0]['example_quote'] = 'final class Widget implements Spinner'"
+
+case_is "an invented test declaration is caught" 1 \
+    "d['existing_tests'][0]['quote'] = \"it('spins thrice', function () {\""
+
+# Dropping the leading indent is still an EXACT match, because the check is containment and the
+# stripped text is a substring of the line. Worth a case anyway: it is the commonest honest shape,
+# and it must never be scored as fabrication.
+case_is "a quote stripped of its leading indent still matches" 0 \
+    "d['evidence'][0]['quote'] = d['evidence'][0]['quote'].strip()"
+
+# The normalised path proper: internal whitespace that does not survive being copied through a
+# model. Not fatal — this is a copying failure, not an invention, and conflating the two would
+# fail honest dossiers over a re-wrapped line.
+case_is "a quote whose inner whitespace differs is normalised, not fatal" 0 \
+    "d['evidence'][0]['quote'] = 'public function spin(int \$times): int\\n{\\nreturn \$times * 2;'"
+
+# A search that returns MORE than claimed is under-reporting, not lying. It is reported and not
+# fatal, because the alternative is demanding the model enumerate every hit of a broad grep.
+case_is "a search that under-reports its hits is not fatal" 0 \
+    "d['searches'][0]['result_paths'] = []"
+
+case_is "a destructive search is refused rather than run" 2 \
+    "d['searches'][0]['command'] = 'git checkout -- .'"
+
+echo
+echo "$PASS passed, $FAIL failed"
+(( FAIL == 0 ))

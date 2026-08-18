@@ -1,0 +1,6 @@
+# task	parent commit surveyed	feature commit (the answer)
+# Read by bench/survey-probe. Deliberately NOT in the task briefs: tools/survey cats those
+# straight into the prompt, and a commit SHA in a comment is a commit SHA the model can `git
+# show`. The probe checkout carries no history for the same reason -- see bench/survey-probe.
+dead-hosts	7071556^	7071556
+visual-track	7fbe3a3^	7fbe3a3

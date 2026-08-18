@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+#
+# survey — send the local model to read the repository, and bring back something checkable.
+#
+#   tools/survey --task <task.md> --repo <dir> --out <dossier.json> [--provider native]
+#
+# ## Why this exists
+#
+# Measurement put 84% of the orchestrator's cost in planning, and about 89% of THAT in deciding
+# rather than writing. The route this project built moved implementation to the local model —
+# the remaining 16% — and then added a review phase on top, which is how it arrived at 2.0x the
+# tokens and 4.3x the wall clock of simply doing the work. We automated the typing. Typing was
+# never the cost.
+#
+# The cost is reading. Deciding what to change requires holding the repository in context, and a
+# stateless conversation re-sends every file it has read on every subsequent turn, so planning
+# cost is context accumulation rather than thought. Reading is exactly what is free on a machine
+# you already own.
+#
+# ## Why it is not simply "let the local model plan"
+#
+# Implementation was safe to delegate because it had a gate: acceptance criteria run mechanically,
+# so a bad round is a DETECTED bad round and a re-roll costs GPU time instead of correctness.
+# Reading has no such gate, and a dossier that is confidently wrong is worse than no dossier —
+# the orchestrator decides on false premises with no signal that anything is off. Eight of nine
+# rejections on the first feature were defects in the specification, written by the party that had
+# actually read the files. Handing reading to a 20B model without a gate makes that surface worse.
+#
+# What makes it tractable is that a dossier, unlike a decision, is machine-checkable. Every claim
+# it may contain is one of three shapes — a verbatim quote, a replayable search, or a path — and
+# all three are checkable without judgement. tools/dossier-verify is that gate, and it is the
+# whole reason this is a schema and not a free-text brief.
+#
+# ## What this is NOT allowed to do
+#
+# It does not design, and it does not write code. The schema gives it no field for either, in the
+# same way and for the same reason consult.schema.json gives the orchestrator no field in which to
+# weaken a criterion: the party being checked does not get to choose the measurement.
+#
+# The write tools are left registered rather than disabled. Disabling them means editing
+# native-agent, which changes harness_tree and stops every future implementation run from pooling
+# with the corpus already collected — a real cost for no gain here, because the dossier is scored
+# against a pristine checkout regardless of what the model does to its own worktree.
+
+set -uo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+HANDOFF_HOME="$(cd "$HERE/.." && pwd)"
+
+TASK=""; REPO=""; OUT=""; PROVIDER="native"; LOG=""
+
+while (( $# > 0 )); do
+    case "$1" in
+    --task)     TASK="$2"; shift 2 ;;
+    --repo)     REPO="$2"; shift 2 ;;
+    --out)      OUT="$2"; shift 2 ;;
+    --provider) PROVIDER="$2"; shift 2 ;;
+    --log)      LOG="$2"; shift 2 ;;
+    -h|--help)  sed -n '2,40p' "$0"; exit 0 ;;
+    *) echo "survey: unknown option: $1" >&2; exit 64 ;;
+    esac
+done
+
+[[ -f "$TASK" ]] || { echo "survey: no task file at ${TASK:-<unset>}" >&2; exit 66; }
+[[ -d "$REPO" ]] || { echo "survey: no repo at ${REPO:-<unset>}" >&2; exit 66; }
+[[ -n "$OUT"  ]] || { echo "survey: --out is required" >&2; exit 64; }
+[[ -f "$HANDOFF_HOME/providers/${PROVIDER}.sh" ]] || { echo "survey: unknown provider: $PROVIDER" >&2; exit 64; }
+
+mkdir -p "$(dirname "$OUT")"
+[[ -n "$LOG" ]] || LOG="${OUT%.json}.log"
+mkdir -p "$(dirname "$LOG")"
+
+read -r -d '' DEV <<'DEV' || true
+You are surveying a code repository. You are not implementing anything and you are not designing
+anything: someone else will decide what to build, and they will decide it using only what you
+bring back. They cannot see this repository. You are their eyes.
+
+Answer only the schema.
+
+Three rules, because your answer is checked by machine before anyone reads it:
+
+1. QUOTE, NEVER RECALL. Every quote you give is compared byte-for-byte against the file you name.
+   Read the file, copy the text out of what you read, and paste it. A quote that is close but not
+   exact is treated as a fabrication, and one fabrication voids the whole dossier.
+
+2. RECORD THE COMMANDS YOU RAN. Your searches are re-run against a clean checkout and the files
+   they return are compared with the files you say they returned. Write the command exactly as
+   you ran it.
+
+3. AN UNKNOWN IS AN ANSWER. If you cannot determine something, put it in `unknowns` and move on.
+   You are not scored on confidence. A guess that reads like a finding is the single most
+   expensive thing you can hand back, because the planner has no way to tell it apart from a
+   fact you verified.
+
+Be exhaustive about `change_surface` in particular. The plan written from this dossier will be
+permitted to touch only the files you name, so a file you fail to find is a file the
+implementation cannot use — it will not be discovered later, it will simply be missing.
+DEV
+
+PROMPT="Survey this repository for the task below. Do not implement it.
+
+## The task
+
+$(cat "$TASK")
+
+## How to go about it
+
+Start by finding where this area of the codebase lives — search for the domain words in the task,
+then read what the searches turn up. Follow the code outward: when a file you read calls something
+you do not recognise, find it. Look for how the codebase already solves problems of this shape,
+because the plan should match the neighbours rather than invent a style.
+
+Then find the tests that already cover this area, and work out what commands would prove the task
+was finished. A proving command must FAIL today — if it passes on the tree as it stands, it is not
+measuring the change.
+
+Stop when reading more stops changing your answer, and submit the dossier. Do not stop earlier
+because you have enough for a plausible summary: the person reading this cannot open a single one
+of these files, and everything you leave out is simply lost."
+
+(
+    HANDOFF_ROLE=surveyor
+    export HANDOFF_ROLE
+    # shellcheck disable=SC1090
+    source "$HANDOFF_HOME/providers/${PROVIDER}.sh"
+    if declare -F provider_preflight >/dev/null && ! provider_preflight; then
+        exit 3
+    fi
+    provider_run "$REPO" "$HANDOFF_HOME/schemas/survey.schema.json" "$OUT" "$LOG" "$DEV" "$PROMPT"
+) >>"$LOG" 2>&1
+
+[[ -s "$OUT" ]] || { echo "survey: the model returned nothing (see $LOG)" >&2; exit 2; }
+python3 -c "import json,sys;json.load(open(sys.argv[1]))" "$OUT" 2>/dev/null \
+    || { echo "survey: the dossier at $OUT is not JSON (see $LOG)" >&2; exit 2; }
+echo "$OUT"

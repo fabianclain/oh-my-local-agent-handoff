@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+#
+# survey-probe — can the local model READ a repository well enough to be planned from?
+#
+#   bench/survey-probe [--samples N] [--task NAME] [--provider native]
+#
+# ## The question, and why it is the only one worth asking first
+#
+# Every measurement this project has taken handed the model a CLOSED task: here is the plan,
+# execute it. It went 15/15 and 14/14 first-roll on well-specified plans, so implementation is
+# not in doubt. But the cost was never in implementation — 84% of the orchestrator's spend is
+# planning, and roughly 89% of that is deciding rather than writing. Moving reading to the local
+# model is the only change that can move that number, and reading is an OPEN task: nobody tells
+# the model when it has looked at enough. Stopping early and looping are the characteristic
+# failures of a 20B model, and we have never once asked it to do this.
+#
+# So: before building a pipeline on top of the assumption, measure the assumption.
+#
+# ## How it is scored
+#
+# Two numbers, and they fail in different directions.
+#
+#   FIDELITY  what fraction of the dossier's claims survive tools/dossier-verify. This is the
+#             half that has a gate: a fabricated quote is caught, and the answer is a re-roll.
+#
+#   RECALL    what fraction of the files the real change actually touched appear in the dossier's
+#             change_surface. This is the half with NO gate, and it is the number that decides
+#             whether the route is viable. A dossier that verifies perfectly and misses a file
+#             produces a plan that is silently incomplete — criteria included, because the
+#             criteria come from the same incomplete reading. Nothing downstream disagrees with
+#             it. If recall is poor, the idea does not work, and no amount of gating fixes it.
+#
+# Ground truth is the real feature commit: git already knows which files the change touched, so
+# the probe costs GPU time and nothing else.
+#
+# ## Why the checkout has no history
+#
+# A git worktree shares the object database with the repository it came from, so `git log --all`
+# in a checkout of the PARENT commit still reaches the child — the model could simply read the
+# diff it is being scored against. The snapshot is therefore an export with no .git at all. That
+# is also the more faithful setup: for a task that has not been done yet, there is no future
+# commit to find, and a probe that leaves one lying around is measuring the wrong thing.
+#
+# The task briefs are written in user terms and name no file, for the same reason. A brief that
+# says "add a HostHealthService" scores 100% recall and means nothing.
+#
+# ## Variance is a result, not noise
+#
+# Sampling is at temperature 0.8, so repeated surveys of one task differ. Run several. If recall
+# swings widely between samples of the same task, the dossier is not a dependable input even when
+# its average looks acceptable — a planner cannot tell which sample it got.
+
+set -uo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+HOME_DIR="$(cd "$HERE/.." && pwd)"
+MONOLITH="${MONOLITH_ROOT:-/home/fabbs/dev/monolith}"
+WORK="${SURVEY_PROBE_ROOT:-/home/fabbs/dev/bench-trees/survey}"
+OUT="$HOME_DIR/bench/results/survey"
+
+SAMPLES=3; ONLY=""; PROVIDER="native"
+
+while (( $# > 0 )); do
+    case "$1" in
+    --samples)  SAMPLES="$2"; shift 2 ;;
+    --task)     ONLY="$2"; shift 2 ;;
+    --provider) PROVIDER="$2"; shift 2 ;;
+    -h|--help)  sed -n '2,50p' "$0"; exit 0 ;;
+    *) echo "survey-probe: unknown option: $1" >&2; exit 64 ;;
+    esac
+done
+
+# The same lock bench/run and bin/handoff re-exec under. A survey holds the local model for as
+# long as a round does, and two of them sharing one GPU is how the OOM that cost an evening
+# happened.
+if [[ -z "${HANDOFF_GPU_LOCK_HELD:-}" ]]; then
+    export HANDOFF_GPU_LOCK_HELD=1
+    exec flock --close -w "${BENCH_LOCK_WAIT:-1800}" \
+        "${TMPDIR:-/tmp}/agent-handoff-gpu.lock" "$0" \
+        --samples "$SAMPLES" --provider "$PROVIDER" ${ONLY:+--task "$ONLY"}
+fi
+
+mkdir -p "$OUT" "$WORK"
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+SUMMARY="$OUT/summary-$STAMP.tsv"
+printf 'task\tsample\tverdict\tfidelity\tquotes\tabsent\tsurface\trecall\tprecision\tcode_recall\tunknowns\tseconds\n' > "$SUMMARY"
+
+# An export, not a worktree. See the header.
+snapshot() {
+    # Separate statements: `local a="$1" b="$WORK/$a"` expands every argument BEFORE assigning
+    # any of them, so $a is still unset and `set -u` kills the run inside the function.
+    local name="$1" commit="$2"
+    local dest="$WORK/$name"
+    rm -rf "$dest"; mkdir -p "$dest"
+    git -C "$MONOLITH" archive "$commit" | tar -x -C "$dest" || return 1
+    cp -al "$MONOLITH/vendor" "$dest/vendor" 2>/dev/null || true
+    cp -a  "$MONOLITH/.env" "$dest/.env" 2>/dev/null || true
+    mkdir -p "$dest/storage/framework/views" "$dest/storage/framework/cache/data" \
+             "$dest/storage/logs" "$dest/bootstrap/cache"
+    printf '%s\n' "$dest"
+}
+
+while IFS=$'\t' read -r TASK PARENT ANSWER; do
+    [[ "$TASK" =~ ^#|^$ ]] && continue
+    [[ -n "$ONLY" && "$TASK" != "$ONLY" ]] && continue
+    BRIEF="$HOME_DIR/bench/survey-tasks/$TASK.md"
+    [[ -f "$BRIEF" ]] || { echo "survey-probe: no brief for $TASK" >&2; continue; }
+
+    echo "=== $TASK  (surveying $PARENT, scored against $ANSWER)"
+    REF="$(snapshot "$TASK-reference" "$PARENT")" || { echo "  snapshot failed" >&2; continue; }
+
+    for (( n = 1; n <= SAMPLES; n++ )); do
+        REPO="$(snapshot "$TASK-$n" "$PARENT")" || continue
+        DOSSIER="$OUT/$TASK-$n-$STAMP.json"
+        START=$(date +%s)
+        if ! "$HOME_DIR/tools/survey" --task "$BRIEF" --repo "$REPO" --out "$DOSSIER" \
+                --provider "$PROVIDER" >/dev/null; then
+            printf '%s\t%s\tno-dossier\t\t\t\t\t\t\t\t%s\n' "$TASK" "$n" "$(( $(date +%s) - START ))" >> "$SUMMARY"
+            echo "  sample $n: the model returned no dossier"
+            continue
+        fi
+        ELAPSED=$(( $(date +%s) - START ))
+
+        # Verified against the REFERENCE export, never the one the model had: a survey that wrote
+        # to its own tree would otherwise be checking its quotes against its own edits.
+        VJSON="${DOSSIER%.json}-verify.json"
+        "$HOME_DIR/tools/dossier-verify" "$DOSSIER" --repo "$REF" --json "$VJSON" \
+            --skip-commands >/dev/null 2>&1
+        VERDICT=$?
+
+        git -C "$MONOLITH" diff-tree --no-commit-id --name-only -r "$ANSWER" > "$WORK/truth.txt"
+
+        python3 - "$DOSSIER" "$VJSON" "$WORK/truth.txt" "$TASK" "$n" "$VERDICT" "$ELAPSED" \
+            >> "$SUMMARY" <<'PY'
+import json, sys, pathlib
+
+dossier, vjson, truth, task, sample, verdict, elapsed = sys.argv[1:8]
+d = json.loads(pathlib.Path(dossier).read_text())
+if isinstance(d, dict) and len(d) == 1:
+    only = next(iter(d.values()))
+    if isinstance(only, dict) and "change_surface" in only:
+        d = only
+v = json.loads(pathlib.Path(vjson).read_text()) if pathlib.Path(vjson).is_file() else {}
+s = v.get("summary", {})
+
+real = {l.strip() for l in pathlib.Path(truth).read_text().splitlines() if l.strip()}
+claimed = {(i.get("path") or "").strip().lstrip("./") for i in d.get("change_surface") or []}
+claimed.discard("")
+hit = claimed & real
+
+def frac(a, b):
+    return f"{len(a) / len(b):.2f}" if b else ""
+
+# Scored separately because they are different failures. Missing the code is missing the feature;
+# missing the test file only means the plan would not have extended the suite.
+is_code = lambda p: not p.startswith("tests/") and not p.endswith(".md")
+code_real = {p for p in real if is_code(p)}
+
+print("\t".join([
+    task, sample,
+    "trustworthy" if verdict == "0" else ("fabricated" if verdict == "1" else "uncheckable"),
+    str(s.get("fidelity", "")), str(s.get("quotes", "")), str(s.get("absent", "")),
+    str(len(claimed)), frac(hit, real), frac(hit, claimed),
+    frac(claimed & code_real, code_real),
+    str(len(d.get("unknowns") or [])), elapsed,
+]))
+PY
+        tail -1 "$SUMMARY" | awk -F'\t' '{printf "  sample %s: %s, fidelity %s, recall %s of the real files, %ss\n", $2, $3, $4, $8, $12}'
+    done
+done < "$HOME_DIR/bench/survey-tasks/GROUND-TRUTH.tsv"
+
+echo
+echo "wrote $SUMMARY"
+column -t -s$'\t' "$SUMMARY"

@@ -1,0 +1,101 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "survey",
+  "description": "A dossier: what is already true in this repository, for a task that has not been planned yet. Every claim here is mechanically re-checkable against the tree, which is the only reason it is safe to let a local model produce it.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["understanding", "searches", "evidence", "change_surface", "conventions", "existing_tests", "verification_commands", "unknowns"],
+  "properties": {
+    "understanding": {
+      "type": "string",
+      "maxLength": 1500,
+      "description": "What the task is asking for, in your own words, in terms of the behaviour a user would notice. Do not propose a design here."
+    },
+    "searches": {
+      "type": "array",
+      "description": "Every search you ran that informed this dossier. These are REPLAYED against a clean checkout and the file list compared against what you claim, so record the command exactly as you ran it.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["command", "why", "result_paths", "truncated"],
+        "properties": {
+          "command": {"type": "string", "description": "The literal shell command, runnable from the repository root."},
+          "why": {"type": "string", "maxLength": 300, "description": "What you were trying to find out."},
+          "result_paths": {
+            "type": "array",
+            "description": "The distinct file paths the command returned. If there were more than 20, list the first 20 and set truncated true.",
+            "items": {"type": "string"}
+          },
+          "truncated": {"type": "boolean"}
+        }
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "description": "The specific code that matters, quoted. Each quote is checked byte-for-byte against the file you name: a quote that is not there is a fabrication and voids the dossier. Copy, never retype.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "quote", "what_it_shows"],
+        "properties": {
+          "path": {"type": "string"},
+          "quote": {"type": "string", "minLength": 12, "maxLength": 800, "description": "Copied verbatim from the file, including its indentation."},
+          "what_it_shows": {"type": "string", "maxLength": 400, "description": "Why a planner needs to know this. Not a restatement of the quote."}
+        }
+      }
+    },
+    "change_surface": {
+      "type": "array",
+      "description": "Every file that would have to be created or modified. This is the most important list in the dossier: the plan that follows may only touch files named here, so a file you miss is a file the implementation cannot use.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "exists", "change", "why"],
+        "properties": {
+          "path": {"type": "string"},
+          "exists": {"type": "boolean", "description": "true if the file is already in the tree, false if it would be created."},
+          "change": {"type": "string", "maxLength": 500, "description": "What would change in it, in one or two sentences."},
+          "why": {"type": "string", "maxLength": 300, "description": "What makes this file necessary rather than incidental."}
+        }
+      }
+    },
+    "conventions": {
+      "type": "array",
+      "description": "How this codebase does things of the kind the task needs. Every convention must carry an example quoted from a real file, for the same reason evidence must: an unevidenced convention is a guess wearing authority.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["claim", "example_path", "example_quote"],
+        "properties": {
+          "claim": {"type": "string", "maxLength": 400},
+          "example_path": {"type": "string"},
+          "example_quote": {"type": "string", "minLength": 12, "maxLength": 600, "description": "Copied verbatim, and checked."}
+        }
+      }
+    },
+    "existing_tests": {
+      "type": "array",
+      "description": "Tests that already cover the area, and would therefore either have to keep passing or be extended.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "quote", "covers"],
+        "properties": {
+          "path": {"type": "string"},
+          "quote": {"type": "string", "minLength": 12, "maxLength": 400, "description": "The test's declaration line, verbatim."},
+          "covers": {"type": "string", "maxLength": 300}
+        }
+      }
+    },
+    "verification_commands": {
+      "type": "array",
+      "description": "Commands that would prove the task is done. Each must FAIL on the tree as it stands today — a command that already passes proves nothing — and each must be a real command, not a description of one.",
+      "items": {"type": "string"}
+    },
+    "unknowns": {
+      "type": "array",
+      "description": "What you could not determine, stated plainly. This field is not a failure: an honest unknown costs one question, and a confident guess costs a wrong plan. Leave it empty only if it is genuinely empty.",
+      "items": {"type": "string"}
+    }
+  }
+}

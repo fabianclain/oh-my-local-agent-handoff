@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+"""dossier-verify — decide whether a survey is worth believing, without reading it.
+
+    tools/dossier-verify <dossier.json> --repo <dir> [--json <out>] [--timeout N]
+
+Exit 0 when the dossier is trustworthy, 1 when it is not, 2 when it could not be checked.
+
+WHY
+
+Delegating implementation to a local model was safe because implementation had a gate: acceptance
+criteria run mechanically, so a bad round is a detected bad round and a re-roll costs GPU time
+instead of correctness. Delegating READING has no such gate by default, and that asymmetry is the
+whole reason the obvious move — "let the local model plan too" — is not obviously safe. A dossier
+that is confidently wrong is worse than no dossier, because the planner decides on false premises
+and nothing downstream disagrees.
+
+What makes it gateable is that a dossier, unlike a decision, contains no judgement. Every claim in
+schemas/survey.schema.json is one of three shapes, and all three are checkable by machine:
+
+    a quote     ->  must appear byte-for-byte in the file it names
+    a search    ->  the literal command is re-run, and the files it returns are compared
+                    against the files the dossier says it returned
+    a path      ->  must exist, or must NOT exist when the dossier calls it new
+
+So fabrication becomes a detected failure with a cheap re-roll, which is the same trade that made
+the implementation half work. It is applied upstream here for the first time; nothing before this
+gated the reading.
+
+WHAT THIS CANNOT DO, STATED PLAINLY
+
+It catches invention. It does not catch OMISSION. A dossier that quotes six files perfectly and
+never finds the seventh verifies clean, and the plan built from it is silently incomplete —
+criteria and all, because the criteria are derived from the same incomplete reading. Search replay
+bounds this a little (a search that claims three hits where the tree returns seven is caught) but
+it does not close it. Recall is measured against real diffs by bench/survey-probe instead, and it
+is the number that decides whether this route is viable at all.
+
+WHY A VACUOUS PROVING COMMAND IS A WARNING AND NOT A FAILURE
+
+`verification_commands` are supposed to fail today — a command that already passes is measuring
+nothing, which is the rule bench/audit-criteria enforces on real plans. Here it is reported and
+not enforced, because a command in a disposable worktree also fails or passes for reasons that
+have nothing to do with the dossier: no database, an unseeded schema, a missing service. Making
+the verdict depend on it would mean failing honest dossiers for environment noise. The counts are
+printed so a human can see them; the verdict rests on fabrication alone.
+
+SAFETY
+
+Both the searches and the proving commands are model-written shell, and they are executed. They
+are filtered through tools/refuse-destructive first — the same guard that stands in front of
+acceptance criteria, written after `migrate:fresh` reached a plan whose database held 977,526
+crawled pages — and every command is run with a timeout. Run this against a disposable worktree.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import re
+import subprocess
+import sys
+
+HERE = pathlib.Path(__file__).resolve().parent
+
+
+def normalise(text: str) -> str:
+    """Whitespace-insensitive form, for telling a retyped quote from an invented one.
+
+    A model that copies a quote but loses one level of indentation has made a different and much
+    less serious mistake than one that produced the line from memory. Collapsing runs of
+    whitespace separates the two, and both are reported, because a dossier full of merely
+    approximate quotes is a dossier that is not really copying.
+    """
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def read_text(path: pathlib.Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def check_quote(repo: pathlib.Path, rel: str, quote: str) -> str:
+    """exact | normalised | absent | no-such-file"""
+    target = repo / rel
+    if not target.is_file():
+        return "no-such-file"
+    content = read_text(target)
+    if content is None:
+        return "no-such-file"
+    if quote in content:
+        return "exact"
+    if normalise(quote) and normalise(quote) in normalise(content):
+        return "normalised"
+    return "absent"
+
+
+PATH_RE = re.compile(r"^([^\s:]+):")
+
+
+def paths_from_output(repo: pathlib.Path, output: str) -> set[str]:
+    """The distinct repository files a search actually surfaced.
+
+    Handles the two shapes that matter: `file:line:text` from grep, and a bare path per line from
+    find or `grep -l`. Anything that does not resolve to a real file in the repo is dropped rather
+    than guessed at — the point is to compare file SETS, and a half-parsed line is noise in that
+    comparison, not evidence.
+    """
+    found: set[str] = set()
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        candidates = []
+        match = PATH_RE.match(line)
+        if match:
+            candidates.append(match.group(1))
+        candidates.append(line)
+        for candidate in candidates:
+            candidate = candidate.lstrip("./")
+            if candidate and (repo / candidate).is_file():
+                found.add(candidate)
+                break
+    return found
+
+
+def refuse_destructive(commands: list[str]) -> tuple[bool, str]:
+    guard = HERE / "refuse-destructive"
+    if not guard.is_file() or not commands:
+        return True, ""
+    proc = subprocess.run([str(guard), "--source", "dossier"],
+                          input="\n".join(commands) + "\n",
+                          capture_output=True, text=True)
+    return proc.returncode == 0, (proc.stdout + proc.stderr).strip()
+
+
+def run(command: str, repo: pathlib.Path, timeout: int) -> tuple[int | None, str]:
+    try:
+        proc = subprocess.run(command, shell=True, cwd=repo, capture_output=True,
+                              text=True, timeout=timeout, errors="replace")
+    except subprocess.TimeoutExpired:
+        return None, "(timed out)"
+    except OSError as exc:
+        return None, f"(could not run: {exc})"
+    return proc.returncode, proc.stdout + proc.stderr
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("dossier", type=pathlib.Path)
+    parser.add_argument("--repo", type=pathlib.Path, required=True)
+    parser.add_argument("--json", type=pathlib.Path)
+    parser.add_argument("--timeout", type=int, default=120)
+    parser.add_argument("--skip-commands", action="store_true",
+                        help="check quotes, paths and searches but do not run verification_commands")
+    args = parser.parse_args()
+
+    if not args.dossier.is_file():
+        print(f"dossier-verify: no dossier at {args.dossier}", file=sys.stderr)
+        return 2
+    if not args.repo.is_dir():
+        print(f"dossier-verify: no repo at {args.repo}", file=sys.stderr)
+        return 2
+    try:
+        dossier = json.loads(args.dossier.read_text())
+    except (OSError, ValueError) as exc:
+        print(f"dossier-verify: the dossier did not parse ({exc})", file=sys.stderr)
+        return 2
+    if isinstance(dossier, dict) and len(dossier) == 1:
+        # A provider may wrap the object; unwrap one level rather than failing on a shape
+        # difference, exactly as tools/consult does.
+        only = next(iter(dossier.values()))
+        if isinstance(only, dict) and "change_surface" in only:
+            dossier = only
+
+    repo = args.repo.resolve()
+    report: dict = {"quotes": [], "paths": [], "searches": [], "commands": [], "fatal": []}
+
+    # ---- quotes -----------------------------------------------------------------------------
+    quote_claims: list[tuple[str, str, str]] = []
+    for item in dossier.get("evidence") or []:
+        quote_claims.append(("evidence", item.get("path", ""), item.get("quote", "")))
+    for item in dossier.get("conventions") or []:
+        quote_claims.append(("convention", item.get("example_path", ""), item.get("example_quote", "")))
+    for item in dossier.get("existing_tests") or []:
+        quote_claims.append(("test", item.get("path", ""), item.get("quote", "")))
+
+    for kind, rel, quote in quote_claims:
+        verdict = "absent" if not (rel and quote) else check_quote(repo, rel, quote)
+        report["quotes"].append({"kind": kind, "path": rel, "verdict": verdict,
+                                 "quote": quote[:120]})
+        if verdict in ("absent", "no-such-file"):
+            report["fatal"].append(f"{kind} quote {verdict}: {rel}")
+
+    # ---- paths ------------------------------------------------------------------------------
+    for item in dossier.get("change_surface") or []:
+        rel, claimed_exists = item.get("path", ""), bool(item.get("exists"))
+        really = (repo / rel).is_file() if rel else False
+        ok = (claimed_exists == really)
+        report["paths"].append({"path": rel, "claimed_exists": claimed_exists,
+                                "actually_exists": really, "ok": ok})
+        if not ok:
+            report["fatal"].append(
+                f"change_surface claims {rel} "
+                f"{'exists' if claimed_exists else 'is new'} and it "
+                f"{'does not' if claimed_exists else 'already does'}")
+
+    # ---- searches ---------------------------------------------------------------------------
+    searches = dossier.get("searches") or []
+    commands = [s.get("command", "") for s in searches if s.get("command")]
+    safe, detail = refuse_destructive(commands)
+    if not safe:
+        print("dossier-verify: refusing to replay — a search is destructive\n" + detail,
+              file=sys.stderr)
+        return 2
+
+    for item in searches:
+        command = item.get("command", "")
+        claimed = {p.lstrip("./") for p in (item.get("result_paths") or [])}
+        truncated = bool(item.get("truncated"))
+        if not command:
+            continue
+        code, output = run(command, repo, args.timeout)
+        actual = paths_from_output(repo, output)
+        invented = sorted(claimed - actual)
+        missed = sorted(actual - claimed)
+        entry = {"command": command, "exit": code, "claimed": len(claimed),
+                 "returned": len(actual), "invented": invented,
+                 "unreported": len(missed), "truncated": truncated}
+        report["searches"].append(entry)
+        if invented:
+            report["fatal"].append(
+                f"search claims {len(invented)} file(s) it does not return: {command}")
+
+    # ---- proving commands -------------------------------------------------------------------
+    proving = [c for c in (dossier.get("verification_commands") or []) if c.strip()]
+    if proving and not args.skip_commands:
+        safe, detail = refuse_destructive(proving)
+        if not safe:
+            print("dossier-verify: refusing to run — a proving command is destructive\n" + detail,
+                  file=sys.stderr)
+            return 2
+        for command in proving:
+            code, _ = run(command, repo, args.timeout)
+            report["commands"].append({"command": command, "exit": code,
+                                       "vacuous": code == 0})
+
+    # ---- report -----------------------------------------------------------------------------
+    exact = sum(1 for q in report["quotes"] if q["verdict"] == "exact")
+    normalised = sum(1 for q in report["quotes"] if q["verdict"] == "normalised")
+    total_q = len(report["quotes"])
+    fidelity = (exact + normalised) / total_q if total_q else 1.0
+    report["summary"] = {
+        "quotes": total_q, "exact": exact, "normalised": normalised,
+        "absent": total_q - exact - normalised,
+        "fidelity": round(fidelity, 3),
+        "change_surface": len(report["paths"]),
+        "searches": len(report["searches"]),
+        "proving_commands": len(report["commands"]),
+        "vacuous_commands": sum(1 for c in report["commands"] if c["vacuous"]),
+        "unknowns": len(dossier.get("unknowns") or []),
+        "verdict": "trustworthy" if not report["fatal"] else "fabricated",
+    }
+
+    s = report["summary"]
+    print(f"quotes            {exact} exact, {normalised} normalised, {s['absent']} absent "
+          f"(fidelity {s['fidelity']:.0%})")
+    print(f"change surface    {s['change_surface']} files, "
+          f"{sum(1 for p in report['paths'] if not p['ok'])} misdescribed")
+    print(f"searches          {s['searches']} replayed, "
+          f"{sum(1 for x in report['searches'] if x['invented'])} claiming files they do not return")
+    if report["commands"]:
+        print(f"proving commands  {s['proving_commands']} run, {s['vacuous_commands']} already "
+              f"passing (warning only — see this file's header)")
+    print(f"unknowns declared {s['unknowns']}")
+    if report["fatal"]:
+        print("\nFABRICATED:")
+        for line in report["fatal"]:
+            print(f"  - {line}")
+
+    if args.json:
+        args.json.parent.mkdir(parents=True, exist_ok=True)
+        args.json.write_text(json.dumps(report, indent=2))
+
+    return 1 if report["fatal"] else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
