@@ -43,6 +43,21 @@ The reviewer wrote the same service by hand afterwards: 8/8 tests, 12/12 accepta
 Read that as scope guidance rather than as a verdict — the local model is worth reaching for on
 mechanical change to code that exists, and is currently a poor bet on greenfield design.
 
+**The same boundary has now been measured three separate ways, and it is the one thing to
+remember.** The figures above found it in implementation; a later feature found it *within* a
+single day's work — plan 6a, designing a Blade partial, lost three rolls and 2,450 seconds, while
+plan 6b, registering a section with a sibling already in the tree to copy, landed 14/14 on the
+first roll; and a survey probe found it in *reading* — asked what a feature would touch, across
+six samples the model proposed 20 files of which **1 was new**, where the real changes were 20
+files of which 7 were new (`docs/surveying.md`).
+
+    it modifies structure that exists.  it does not create structure that does not.
+
+Read that as the scoping rule. It cuts across frontend and backend, and across planning and
+implementing, and it predicts these results better than either of those distinctions does. When
+deciding whether to hand something over, the question worth asking is not "is this UI?" or "is
+this simple?" but **"is there a sibling in this repository to copy?"**
+
 **This is a specific slice, not a general coding agent.** It works for well-specified, mechanically
 checkable changes. It is unproven on ambiguous work, on design decisions, and on tasks where a
 plausible wrong answer looks identical to a right one. Section "Where this stops working" below is
